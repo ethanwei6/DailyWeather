@@ -1,0 +1,27 @@
+[project]
+name = "dailyweather"
+version = "0.1.0"
+description = "Weather-market probability scanner and paper-trading ledger for Polymarket daily-high temperature contracts."
+requires-python = ">=3.9"
+readme = "README.md"
+dependencies = []
+authors = [
+  { name = "Ethan Wei" }
+]
+keywords = ["prediction-markets", "weather", "polymarket", "forecasting", "paper-trading"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Atmospheric Science",
+  "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.scripts]
+dailyweather = "weather_strategy.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["weather_strategy*"]

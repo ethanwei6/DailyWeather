@@ -1,0 +1,14 @@
+[
+  {
+    "id": "fixture-nyc-2026-06-05",
+    "question": "What will be the highest temperature in New York on June 5?",
+    "slug": "highest-temperature-new-york-june-5",
+    "eventSlug": "weather-new-york-june-5",
+    "description": "Resolved according to the official weather station reading for New York.",
+    "outcomes": "[\"Under 75\", \"75-79\", \"80 or above\"]",
+    "clobTokenIds": "[\"tok-under\", \"tok-mid\", \"tok-over\"]",
+    "outcomePrices": "[\"0.10\", \"0.25\", \"0.35\"]",
+    "forecastSamplesF": [80.5, 81.0, 82.2, 83.1, 79.8, 84.0]
+  }
+]
+
