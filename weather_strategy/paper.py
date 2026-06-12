@@ -247,23 +247,48 @@ class PaperLedger:
         min_edge: float = 0.08,
         min_model_count: int = 3,
         min_model_agreement: float = 0.65,
+        high_confidence_price_threshold: float = 0.75,
+        high_confidence_min_kelly_edge: float = 0.02,
         min_price: float = 0.05,
         max_price: float = 0.95,
     ) -> int:
         scored = [outcome for outcome in scored_outcomes if outcome.token_id]
-        selected_entry_tokens = self._selected_entry_tokens(scored, min_edge, min_model_count, min_model_agreement, min_price, max_price)
+        selected_entry_tokens = self._selected_entry_tokens(
+            scored,
+            min_edge,
+            min_model_count,
+            min_model_agreement,
+            high_confidence_price_threshold,
+            high_confidence_min_kelly_edge,
+            min_price,
+            max_price,
+        )
         executions = 0
         with sqlite3.connect(str(self.path)) as conn:
             conn.row_factory = sqlite3.Row
             for outcome in scored:
                 assert outcome.token_id is not None
-                if outcome.token_id in selected_entry_tokens:
-                    target_notional = self._kelly_target_notional(outcome, bankroll_usd, kelly_fraction, max_position_usd)
-                else:
-                    target_notional = 0.0
                 current = conn.execute("SELECT * FROM paper_positions WHERE token_id = ?", (outcome.token_id,)).fetchone()
                 current_shares = float(current["shares"]) if current else 0.0
                 current_notional = current_shares * outcome.market_price
+                target_notional = 0.0
+                if outcome.token_id in selected_entry_tokens:
+                    target_notional = self._kelly_target_notional(outcome, bankroll_usd, kelly_fraction, max_position_usd)
+                elif current_shares > 0:
+                    if _is_expired_without_settlement(outcome):
+                        target_notional = current_notional
+                    elif not outcome.entry_eligible and self._is_hold_eligible(
+                        outcome,
+                        min_edge,
+                        min_model_count,
+                        min_model_agreement,
+                        high_confidence_price_threshold,
+                        high_confidence_min_kelly_edge,
+                        min_price,
+                        max_price,
+                    ):
+                        hold_target = self._kelly_target_notional(outcome, bankroll_usd, kelly_fraction, max_position_usd)
+                        target_notional = min(current_notional, hold_target)
                 delta_notional = target_notional - current_notional
                 if target_notional <= 0 and current_shares > 0:
                     self._sell(conn, outcome, current, current_shares)
@@ -384,12 +409,32 @@ class PaperLedger:
         min_edge: float,
         min_model_count: int,
         min_model_agreement: float,
+        high_confidence_price_threshold: float,
+        high_confidence_min_kelly_edge: float,
         min_price: float,
         max_price: float,
     ) -> bool:
         return (
             outcome.entry_eligible
-            and outcome.edge >= min_edge
+            and _passes_edge_gate(outcome.edge, outcome.market_price, min_edge, high_confidence_price_threshold, high_confidence_min_kelly_edge)
+            and outcome.model_count >= min_model_count
+            and outcome.model_agreement >= min_model_agreement
+            and min_price <= outcome.market_price <= max_price
+        )
+
+    @staticmethod
+    def _is_hold_eligible(
+        outcome: ScoredOutcome,
+        min_edge: float,
+        min_model_count: int,
+        min_model_agreement: float,
+        high_confidence_price_threshold: float,
+        high_confidence_min_kelly_edge: float,
+        min_price: float,
+        max_price: float,
+    ) -> bool:
+        return (
+            _passes_edge_gate(outcome.edge, outcome.market_price, min_edge, high_confidence_price_threshold, high_confidence_min_kelly_edge)
             and outcome.model_count >= min_model_count
             and outcome.model_agreement >= min_model_agreement
             and min_price <= outcome.market_price <= max_price
@@ -402,6 +447,8 @@ class PaperLedger:
         min_edge: float,
         min_model_count: int,
         min_model_agreement: float,
+        high_confidence_price_threshold: float,
+        high_confidence_min_kelly_edge: float,
         min_price: float,
         max_price: float,
     ) -> set[str]:
@@ -409,7 +456,16 @@ class PaperLedger:
         for outcome in scored:
             if outcome.token_id is None:
                 continue
-            if not cls._is_trade_eligible(outcome, min_edge, min_model_count, min_model_agreement, min_price, max_price):
+            if not cls._is_trade_eligible(
+                outcome,
+                min_edge,
+                min_model_count,
+                min_model_agreement,
+                high_confidence_price_threshold,
+                high_confidence_min_kelly_edge,
+                min_price,
+                max_price,
+            ):
                 continue
             group_key = (outcome.city, outcome.target_date.isoformat() if outcome.target_date else None)
             current = selected.get(group_key)
@@ -548,6 +604,25 @@ def _parse_position_date(value: object) -> Optional[date]:
         return date.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+def _passes_edge_gate(
+    edge: float,
+    market_price: float,
+    min_kelly_edge: float,
+    high_confidence_price_threshold: float,
+    high_confidence_min_kelly_edge: float,
+) -> bool:
+    required_kelly_edge = min_kelly_edge
+    if market_price >= high_confidence_price_threshold:
+        required_kelly_edge = min(required_kelly_edge, high_confidence_min_kelly_edge)
+    required_edge = required_kelly_edge * max(0.0001, 1.0 - market_price)
+    return edge >= required_edge
+
+
+def _is_expired_without_settlement(outcome: ScoredOutcome) -> bool:
+    reason = (outcome.entry_filter_reason or "").lower()
+    return "target date has passed" in reason
 
 
 def _local_date(timezone_name: str, current: datetime) -> date:

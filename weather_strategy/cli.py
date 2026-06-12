@@ -4,11 +4,12 @@ import argparse
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from weather_strategy.backtest import load_calibration_weights, run_backtest
 from weather_strategy.forecast import ConsensusForecastEngine
 from weather_strategy.models import ForecastDistribution, TradeSignal, WeatherMarket
 from weather_strategy.observations import ObservedHigh, ObservedHighClient
@@ -41,12 +42,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--min-trade-usd", type=float, default=1.0)
     paper.add_argument("--min-model-count", type=int, default=3)
     paper.add_argument("--min-model-agreement", type=float, default=0.65)
+    paper.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
+    paper.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
     paper.add_argument("--same-day-entry-start-hour", type=int, default=11)
     paper.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
     paper.add_argument("--allow-late-same-day", action="store_true")
     paper.add_argument("--disable-observations", action="store_true")
     paper.add_argument("--min-lead-days", type=int, default=0)
     paper.add_argument("--max-lead-days", type=int, default=2)
+    paper.add_argument("--weights-file", default="work/data/model_weights.json")
+    paper.add_argument("--run-log-dir", default="work/logs/paper_runs", help="Directory for detailed JSON paper-run logs")
+    paper.add_argument("--no-run-log", action="store_true", help="Disable detailed JSON paper-run log output")
 
     live = subparsers.add_parser("scan-live", help="Discover live active weather markets")
     live.add_argument("--limit", type=int, default=50)
@@ -65,6 +71,29 @@ def main(argv: Optional[list[str]] = None) -> int:
     calibration = subparsers.add_parser("calibration", help="Summarize recorded forecast calibration data")
     calibration.add_argument("--ledger", default="work/data/paper_trades.sqlite")
 
+    backtest = subparsers.add_parser("backtest", help="Backtest recorded forecast snapshots and fit model/source weights")
+    backtest.add_argument("--ledger", default="work/data/weather_kelly_paper.sqlite")
+    backtest.add_argument("--bankroll-usd", type=float, default=1000.0)
+    backtest.add_argument("--kelly-fraction", type=float, default=0.25)
+    backtest.add_argument("--max-position-usd", type=float, default=50.0)
+    backtest.add_argument("--min-trade-usd", type=float, default=1.0)
+    backtest.add_argument("--min-edge", type=float, default=0.08)
+    backtest.add_argument("--uncertainty-buffer", type=float, default=0.03)
+    backtest.add_argument("--min-model-count", type=int, default=3)
+    backtest.add_argument("--min-model-agreement", type=float, default=0.65)
+    backtest.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
+    backtest.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
+    backtest.add_argument("--min-price", type=float, default=0.05)
+    backtest.add_argument("--max-price", type=float, default=0.95)
+    backtest.add_argument("--train-fraction", type=float, default=0.70)
+    backtest.add_argument("--output-weights", default="work/data/model_weights.json")
+    backtest.add_argument("--no-fetch-observations", action="store_true")
+    backtest.add_argument("--max-observation-lookups", type=int, default=200)
+    backtest.add_argument("--min-weight-samples", type=int, default=20)
+    backtest.add_argument("--weight-prior-samples", type=int, default=50)
+    backtest.add_argument("--run-log-dir", default="work/logs/backtests", help="Directory for detailed JSON backtest logs")
+    backtest.add_argument("--no-run-log", action="store_true", help="Disable detailed JSON backtest log output")
+
     args = parser.parse_args(argv)
     if args.command == "paper-run":
         return run_paper(args)
@@ -76,6 +105,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_report(args)
     if args.command == "calibration":
         return run_calibration(args)
+    if args.command == "backtest":
+        return run_backtest_command(args)
     raise ValueError(args.command)
 
 
@@ -128,12 +159,49 @@ def run_calibration(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_backtest_command(args: argparse.Namespace) -> int:
+    settings = SignalSettings(
+        min_edge=args.min_edge,
+        uncertainty_buffer=args.uncertainty_buffer,
+        min_model_count=args.min_model_count,
+        min_model_agreement=args.min_model_agreement,
+        high_confidence_price_threshold=args.high_confidence_price_threshold,
+        high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
+        min_price=args.min_price,
+        max_price=args.max_price,
+        enforce_entry_timing_filter=False,
+    )
+    result = run_backtest(
+        args.ledger,
+        bankroll_usd=args.bankroll_usd,
+        kelly_fraction=args.kelly_fraction,
+        max_position_usd=args.max_position_usd,
+        min_trade_usd=args.min_trade_usd,
+        settings=settings,
+        train_fraction=args.train_fraction,
+        output_weights_path=args.output_weights,
+        fetch_observations=not args.no_fetch_observations,
+        max_observation_lookups=args.max_observation_lookups,
+        min_weight_samples=args.min_weight_samples,
+        weight_prior_samples=args.weight_prior_samples,
+    )
+    if not args.no_run_log:
+        run_log_path = _make_run_log_path(args.run_log_dir, "backtest")
+        result["run_log_path"] = str(run_log_path)
+        _write_json_log(run_log_path, result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def run_paper(args: argparse.Namespace) -> int:
     started = time.monotonic()
+    run_started_at = datetime.now(timezone.utc)
     deadline = None if args.max_runtime_seconds <= 0 else started + args.max_runtime_seconds
     fixture_mode = bool(args.fixture)
     ledger = PaperLedger(args.ledger)
-    forecast_engine = ConsensusForecastEngine()
+    source_weights, model_weights = load_calibration_weights(args.weights_file if not fixture_mode else None)
+    run_log_path = None if args.no_run_log else _make_run_log_path(args.run_log_dir, "paper-run")
+    forecast_engine = ConsensusForecastEngine(source_weights=source_weights, model_weights=model_weights)
     weather_client = OpenMeteoClient()
     observation_client = ObservedHighClient()
     clob_client = PolymarketClobClient()
@@ -162,6 +230,8 @@ def run_paper(args: argparse.Namespace) -> int:
         default_size_usd=args.size_usd,
         min_model_count=args.min_model_count,
         min_model_agreement=args.min_model_agreement,
+        high_confidence_price_threshold=args.high_confidence_price_threshold,
+        high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
         same_day_earliest_entry_hour_local=args.same_day_entry_start_hour,
         same_day_latest_entry_hour_local=args.same_day_entry_cutoff_hour,
         enforce_entry_timing_filter=not args.allow_late_same_day and not fixture_mode,
@@ -246,6 +316,8 @@ def run_paper(args: argparse.Namespace) -> int:
         min_edge=args.min_edge,
         min_model_count=args.min_model_count,
         min_model_agreement=args.min_model_agreement,
+        high_confidence_price_threshold=args.high_confidence_price_threshold,
+        high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
         min_price=signal_settings.min_price,
         max_price=signal_settings.max_price,
     )
@@ -258,6 +330,7 @@ def run_paper(args: argparse.Namespace) -> int:
             "processed_market_count": processed_markets,
             "skipped_market_count": len(skipped_markets),
             "model_consensus": True,
+            "weights_file": args.weights_file if source_weights or model_weights else None,
         },
     )
     equity = ledger.record_run(
@@ -277,41 +350,105 @@ def run_paper(args: argparse.Namespace) -> int:
             "settlement_error_count": settlement_error_count,
             "runtime_limited": runtime_limited,
             "elapsed_seconds": round(time.monotonic() - started, 2),
+            "weights_file": args.weights_file if source_weights or model_weights else None,
+            "run_log_path": str(run_log_path) if run_log_path is not None else None,
         },
     )
-    print(
-        json.dumps(
+    summary = {
+        "fixture_mode": fixture_mode,
+        "run_started_at": run_started_at.isoformat(),
+        "run_finished_at": datetime.now(timezone.utc).isoformat(),
+        "markets_discovered": len(markets),
+        "markets_scored": processed_markets,
+        "markets_skipped": len(skipped_markets),
+        "outcomes_scored": len(all_scored),
+        "signals": len(all_signals),
+        "paper_rows_inserted": rows,
+        "forecast_score_rows_inserted": score_rows,
+        "kelly_executions": executions,
+        "weather_error_count": weather_error_count,
+        "observation_error_count": observation_error_count,
+        "quote_error_count": quote_error_count,
+        "settled_expired_positions": settlement_count,
+        "settlement_error_count": settlement_error_count,
+        "runtime_limited": runtime_limited,
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "bankroll_usd": args.bankroll_usd,
+        "equity_usd": round(equity, 2),
+        "pnl_usd": round(equity - args.bankroll_usd, 2),
+        "open_positions": len(ledger.positions()),
+        "ledger": args.ledger,
+        "weights_file": args.weights_file if source_weights or model_weights else None,
+        "source_weights_loaded": len(source_weights),
+        "model_weights_loaded": len(model_weights),
+        "run_log_path": str(run_log_path) if run_log_path is not None else None,
+        "top_signals": [_signal_to_json(signal) for signal in all_signals[:10]],
+        "top_scored_outcomes": [_scored_to_json(outcome) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)[:10]],
+        "skipped_market_examples": skipped_markets[:10],
+    }
+    if run_log_path is not None:
+        _write_json_log(
+            run_log_path,
             {
-                "fixture_mode": fixture_mode,
-                "markets_discovered": len(markets),
-                "markets_scored": processed_markets,
-                "markets_skipped": len(skipped_markets),
-                "outcomes_scored": len(all_scored),
-                "signals": len(all_signals),
-                "paper_rows_inserted": rows,
-                "forecast_score_rows_inserted": score_rows,
-                "kelly_executions": executions,
-                "weather_error_count": weather_error_count,
-                "observation_error_count": observation_error_count,
-                "quote_error_count": quote_error_count,
-                "settled_expired_positions": settlement_count,
-                "settlement_error_count": settlement_error_count,
-                "runtime_limited": runtime_limited,
-                "elapsed_seconds": round(time.monotonic() - started, 2),
-                "bankroll_usd": args.bankroll_usd,
-                "equity_usd": round(equity, 2),
-                "pnl_usd": round(equity - args.bankroll_usd, 2),
-                "open_positions": len(ledger.positions()),
-                "ledger": args.ledger,
-                "top_signals": [_signal_to_json(signal) for signal in all_signals[:10]],
-                "top_scored_outcomes": [_scored_to_json(outcome) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)[:10]],
-                "skipped_market_examples": skipped_markets[:10],
+                **summary,
+                "signal_settings": _signal_settings_to_json(signal_settings),
+                "cli_args": _paper_args_to_json(args),
+                "source_weights": {key: round(value, 6) for key, value in sorted(source_weights.items())},
+                "model_weights": {key: round(value, 6) for key, value in sorted(model_weights.items())},
+                "signals_detail": [_signal_to_json(signal) for signal in all_signals],
+                "scored_outcomes_detail": [_scored_to_json(outcome) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)],
+                "skipped_markets_detail": skipped_markets,
+                "positions_after_run": ledger.positions(),
             },
-            indent=2,
-            sort_keys=True,
         )
-    )
+    print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
+
+
+def _make_run_log_path(log_dir: str, prefix: str) -> Path:
+    directory = Path(log_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return directory / f"{timestamp}-{prefix}.json"
+
+
+def _write_json_log(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=_json_default), encoding="utf-8")
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
+    return {
+        "min_edge": settings.min_edge,
+        "uncertainty_buffer": settings.uncertainty_buffer,
+        "max_spread": settings.max_spread,
+        "default_size_usd": settings.default_size_usd,
+        "max_price": settings.max_price,
+        "min_price": settings.min_price,
+        "min_model_count": settings.min_model_count,
+        "min_model_agreement": settings.min_model_agreement,
+        "high_confidence_price_threshold": settings.high_confidence_price_threshold,
+        "high_confidence_min_kelly_edge": settings.high_confidence_min_kelly_edge,
+        "enforce_entry_timing_filter": settings.enforce_entry_timing_filter,
+        "same_day_earliest_entry_hour_local": settings.same_day_earliest_entry_hour_local,
+        "same_day_latest_entry_hour_local": settings.same_day_latest_entry_hour_local,
+    }
+
+
+def _paper_args_to_json(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        key: _json_default(value) if isinstance(value, Path) else value
+        for key, value in sorted(vars(args).items())
+        if key != "command"
+    }
 
 
 def _deadline_exceeded(deadline: Optional[float]) -> bool:

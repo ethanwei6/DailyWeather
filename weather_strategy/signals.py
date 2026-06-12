@@ -19,6 +19,8 @@ class SignalSettings:
     min_price: float = 0.05
     min_model_count: int = 3
     min_model_agreement: float = 0.65
+    high_confidence_price_threshold: float = 0.75
+    high_confidence_min_kelly_edge: float = 0.02
     enforce_entry_timing_filter: bool = True
     same_day_earliest_entry_hour_local: int = 11
     same_day_latest_entry_hour_local: int = 17
@@ -48,8 +50,8 @@ def generate_signals(
             continue
         if market_price < settings.min_price or market_price > settings.max_price:
             continue
-        edge = fair_value - market_price - settings.uncertainty_buffer
-        if edge < settings.min_edge:
+        edge = fair_value - market_price - _price_adjusted_uncertainty_buffer(market_price, settings)
+        if not _passes_edge_gate(edge, market_price, settings):
             continue
         signals.append(
             TradeSignal(
@@ -63,7 +65,7 @@ def generate_signals(
                 market_price=round(market_price, 4),
                 edge=round(edge, 4),
                 size_usd=settings.default_size_usd,
-                reason=f"FV {fair_value:.2%} exceeds entry {market_price:.2%} after {settings.uncertainty_buffer:.2%} buffer",
+                reason=f"FV {fair_value:.2%} exceeds entry {market_price:.2%}; buffered Kelly edge gate passed",
                 generated_at=datetime.now(timezone.utc),
                 city=market.city.display_name if market.city else "unknown",
                 target_date=market.target_date,
@@ -93,8 +95,9 @@ def score_outcomes(
         spread = quote.spread if quote else None
         if spread is not None and spread > settings.max_spread:
             continue
-        model_agreement = consensus.agreement_above(market_price, settings.uncertainty_buffer)
-        edge = consensus.fair_value - market_price - settings.uncertainty_buffer
+        buffer = _price_adjusted_uncertainty_buffer(market_price, settings)
+        model_agreement = consensus.agreement_above(market_price, buffer)
+        edge = consensus.fair_value - market_price - buffer
         scored.append(
             ScoredOutcome(
                 market_id=market.id,
@@ -133,7 +136,7 @@ def signals_from_scored_outcomes(scored: list[ScoredOutcome], settings: Optional
             continue
         if outcome.market_price < settings.min_price or outcome.market_price > settings.max_price:
             continue
-        if outcome.edge < settings.min_edge:
+        if not _passes_edge_gate(outcome.edge, outcome.market_price, settings):
             continue
         if outcome.model_count < settings.min_model_count:
             continue
@@ -153,7 +156,8 @@ def signals_from_scored_outcomes(scored: list[ScoredOutcome], settings: Optional
                 size_usd=settings.default_size_usd,
                 reason=(
                     f"FV {outcome.fair_value:.2%} exceeds entry {outcome.market_price:.2%}; "
-                    f"{outcome.model_agreement:.0%} model agreement across {outcome.model_count} model views"
+                    f"{outcome.model_agreement:.0%} model agreement across {outcome.model_count} model views; "
+                    f"buffered Kelly edge gate passed"
                 ),
                 generated_at=outcome.generated_at,
                 city=outcome.city,
@@ -167,6 +171,21 @@ def signals_from_scored_outcomes(scored: list[ScoredOutcome], settings: Optional
         if group_key not in by_group:
             by_group[group_key] = signal
     return sorted(by_group.values(), key=lambda signal: signal.edge, reverse=True)
+
+
+def _price_adjusted_uncertainty_buffer(market_price: float, settings: SignalSettings) -> float:
+    return settings.uncertainty_buffer * max(0.05, 1.0 - market_price)
+
+
+def _required_buffered_edge(market_price: float, settings: SignalSettings) -> float:
+    min_kelly_edge = settings.min_edge
+    if market_price >= settings.high_confidence_price_threshold:
+        min_kelly_edge = min(min_kelly_edge, settings.high_confidence_min_kelly_edge)
+    return min_kelly_edge * max(0.0001, 1.0 - market_price)
+
+
+def _passes_edge_gate(edge: float, market_price: float, settings: SignalSettings) -> bool:
+    return edge >= _required_buffered_edge(market_price, settings)
 
 
 def market_entry_timing(

@@ -168,8 +168,39 @@ class FeatureAwareNormalModel(ProbabilityModel):
         return sigma
 
 
+class HourlyCurveMaxModel(ProbabilityModel):
+    name = "hourly_curve_max"
+
+    def __init__(self, sigma_floor_f: float = 2.5):
+        self.sigma_floor_f = sigma_floor_f
+
+    def probability_by_bucket(self, distribution: ForecastDistribution, buckets: tuple[TemperatureBucket, ...]) -> Mapping[str, float]:
+        features = distribution.model_metadata.get("features") or {}
+        hourly_max = features.get("hourly_temperature_2m_max")
+        if hourly_max is None:
+            return ParametricNormalModel(sigma_floor_f=self.sigma_floor_f, name=self.name).probability_by_bucket(distribution, buckets)
+        if len(distribution.samples_f) >= 2:
+            sigma = statistics.pstdev(distribution.samples_f)
+        else:
+            sigma = 0.0
+        sigma = max(self.sigma_floor_f, sigma)
+        raw = {bucket.label: _normal_interval_probability(float(hourly_max), sigma, bucket.lower_f, bucket.upper_f) for bucket in buckets}
+        if len(buckets) == 1:
+            return raw
+        total = sum(raw.values())
+        if total <= 0:
+            return {bucket.label: 0.0 for bucket in buckets}
+        return {label: probability / total for label, probability in raw.items()}
+
+
 class ConsensusForecastEngine:
-    def __init__(self, models: Optional[tuple[ProbabilityModel, ...]] = None, same_day_path: Optional[SameDayPathSettings] = None):
+    def __init__(
+        self,
+        models: Optional[tuple[ProbabilityModel, ...]] = None,
+        same_day_path: Optional[SameDayPathSettings] = None,
+        source_weights: Optional[Mapping[str, float]] = None,
+        model_weights: Optional[Mapping[str, float]] = None,
+    ):
         self.models = models or (
             EmpiricalEnsembleModel(),
             KernelSmoothingModel(sigma_floor_f=1.5, name="kernel_tight"),
@@ -177,12 +208,13 @@ class ConsensusForecastEngine:
             ParametricNormalModel(sigma_floor_f=2.0, sigma_multiplier=1.0, name="normal_parametric"),
             ParametricNormalModel(sigma_floor_f=4.0, sigma_multiplier=1.75, name="normal_conservative"),
             FeatureAwareNormalModel(sigma_floor_f=3.0),
+            HourlyCurveMaxModel(sigma_floor_f=2.5),
         )
         self.same_day_path = same_day_path or SameDayPathSettings()
         self.source_weights = {
             "open_meteo_ecmwf": 1.35,
             "open_meteo_best_match": 1.15,
-            "open_meteo_gfs_hrrr": 1.10,
+            "open_meteo_gfs_best_match": 1.00,
             "open_meteo_gfs_global": 0.95,
             "open_meteo_gfs_graphcast": 1.10,
             "open_meteo_ensemble_gfs_seamless": 1.20,
@@ -190,6 +222,9 @@ class ConsensusForecastEngine:
             "open_meteo_ensemble_ecmwf_ifs025": 1.35,
             "fixture": 1.0,
         }
+        if source_weights:
+            self.source_weights.update({key: float(value) for key, value in source_weights.items()})
+        self.model_weights = {key: float(value) for key, value in (model_weights or {}).items()}
 
     def consensus_by_bucket(
         self,
@@ -212,7 +247,7 @@ class ConsensusForecastEngine:
             probabilities = model_values[bucket.label]
             if not probabilities:
                 continue
-            source_probabilities = _source_probability_views(probabilities)
+            source_probabilities = _source_probability_views(probabilities, self.model_weights)
             values = list(source_probabilities.values())
             weighted_total = 0.0
             weight_sum = 0.0
@@ -238,6 +273,11 @@ class ConsensusForecastEngine:
     ) -> Mapping[str, ConsensusValue]:
         if observed is None or observed.max_temperature_f is None:
             return consensus_values
+        if not observed.is_actual and not observed.is_final:
+            return {
+                label: _with_observation(value, observed, observation_adjusted=False)
+                for label, value in consensus_values.items()
+            }
         observed_high = observed.max_temperature_f
         certain_label = _certain_label_from_observed_high(buckets, observed_high)
         impossible_labels = {
@@ -275,7 +315,7 @@ class ConsensusForecastEngine:
             probabilities = adjusted_by_label[bucket.label]
             if not probabilities:
                 continue
-            source_probabilities = _source_probability_views(probabilities)
+            source_probabilities = _source_probability_views(probabilities, self.model_weights)
             values = list(source_probabilities.values())
             weighted_total = 0.0
             weight_sum = 0.0
@@ -410,13 +450,26 @@ def _with_observation(value: ConsensusValue, observed: ObservedHigh, observation
     )
 
 
-def _source_probability_views(model_probabilities: Mapping[str, float]) -> dict[str, float]:
+def _source_probability_views(model_probabilities: Mapping[str, float], model_weights: Optional[Mapping[str, float]] = None) -> dict[str, float]:
     grouped: dict[str, list[float]] = {}
+    grouped_weights: dict[str, list[float]] = {}
     for key, probability in model_probabilities.items():
         source = key.rsplit(".", 1)[0] if "." in key else key
         grouped.setdefault(source, []).append(float(probability))
+        grouped_weights.setdefault(source, []).append(float((model_weights or {}).get(key, 1.0)))
     return {
-        source: sum(values) / len(values)
+        source: _weighted_mean(values, grouped_weights.get(source) or [])
         for source, values in grouped.items()
         if values
     }
+
+
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    if not values:
+        return 0.0
+    if not weights or len(weights) != len(values):
+        return sum(values) / len(values)
+    weight_sum = sum(max(0.0, weight) for weight in weights)
+    if weight_sum <= 0:
+        return sum(values) / len(values)
+    return sum(value * max(0.0, weight) for value, weight in zip(values, weights)) / weight_sum

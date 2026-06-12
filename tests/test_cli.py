@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -32,6 +33,36 @@ class CliTest(unittest.TestCase):
                 )
             self.assertEqual(exit_code, 0)
             self.assertEqual(len(PaperLedger(ledger_path).open_trades()), 1)
+
+    def test_fixture_paper_run_writes_detailed_run_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger_path = Path(directory) / "paper.sqlite"
+            log_dir = Path(directory) / "logs"
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "paper-run",
+                        "--fixture",
+                        "tests/fixtures/weather_markets.json",
+                        "--ledger",
+                        str(ledger_path),
+                        "--min-model-count",
+                        "1",
+                        "--run-log-dir",
+                        str(log_dir),
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            summary = json.loads(stdout.getvalue())
+            run_log_path = Path(summary["run_log_path"])
+            self.assertTrue(run_log_path.exists())
+            self.assertEqual(run_log_path.parent, log_dir)
+            detail = json.loads(run_log_path.read_text(encoding="utf-8"))
+            self.assertEqual(detail["forecast_score_rows_inserted"], summary["forecast_score_rows_inserted"])
+            self.assertIn("signal_settings", detail)
+            self.assertIn("scored_outcomes_detail", detail)
+            self.assertGreaterEqual(len(detail["scored_outcomes_detail"]), 1)
 
     def test_should_skip_late_same_day_market_without_position(self) -> None:
         market = parse_weather_market(

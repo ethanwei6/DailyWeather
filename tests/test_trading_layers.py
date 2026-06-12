@@ -24,7 +24,7 @@ class TradingLayersTest(unittest.TestCase):
         self.assertEqual(quote.best_ask, 0.46)
         self.assertAlmostEqual(quote.spread, 0.03)
 
-    def test_generate_signal_uses_ask_and_buffer(self) -> None:
+    def test_generate_signal_uses_ask_and_price_adjusted_buffer(self) -> None:
         market = parse_weather_market(
             {
                 "id": "123",
@@ -46,7 +46,7 @@ class TradingLayersTest(unittest.TestCase):
         )
         self.assertEqual(len(signals), 1)
         self.assertEqual(signals[0].bucket_label, "80 or above")
-        self.assertAlmostEqual(signals[0].edge, 0.27)
+        self.assertAlmostEqual(signals[0].edge, 0.282)
 
     def test_same_day_after_local_cutoff_is_not_entry_eligible(self) -> None:
         market = parse_weather_market(
@@ -239,6 +239,72 @@ class TradingLayersTest(unittest.TestCase):
             self.assertEqual(executions, 0)
             self.assertEqual(ledger.positions(), [])
 
+    def test_price_aware_edge_gate_accepts_high_probability_edge(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 80°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.90", "0.10"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        consensus = {
+            market.buckets[0].label: ConsensusValue(
+                bucket_label=market.buckets[0].label,
+                fair_value=0.95,
+                model_probabilities={"source_a.model": 0.95, "source_b.model": 0.94, "source_c.model": 0.96},
+                model_count=3,
+                probability_stdev=0.01,
+            )
+        }
+        settings = SignalSettings(min_edge=0.08, uncertainty_buffer=0.03, enforce_entry_timing_filter=False)
+        scored = score_outcomes(market, consensus, settings=settings)
+        signals = signals_from_scored_outcomes(scored, settings)
+        self.assertEqual(len(signals), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(scored, bankroll_usd=1000, kelly_fraction=0.25, max_position_usd=50, min_edge=0.08)
+            self.assertEqual(executions, 1)
+            self.assertEqual(len(ledger.positions()), 1)
+
+    def test_price_aware_edge_gate_rejects_low_probability_longshot_gap(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 100°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-100-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.01", "0.99"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        consensus = {
+            market.buckets[0].label: ConsensusValue(
+                bucket_label=market.buckets[0].label,
+                fair_value=0.06,
+                model_probabilities={"source_a.model": 0.06, "source_b.model": 0.07, "source_c.model": 0.05},
+                model_count=3,
+                probability_stdev=0.01,
+            )
+        }
+        settings = SignalSettings(min_edge=0.08, uncertainty_buffer=0.03, min_price=0.0, enforce_entry_timing_filter=False)
+        scored = score_outcomes(market, consensus, settings=settings)
+        self.assertGreater(scored[0].edge, 0.0)
+        self.assertEqual(signals_from_scored_outcomes(scored, settings), [])
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(scored, bankroll_usd=1000, kelly_fraction=0.25, max_position_usd=50, min_edge=0.08, min_price=0.0)
+            self.assertEqual(executions, 0)
+            self.assertEqual(ledger.positions(), [])
+
     def test_signals_keep_only_best_entry_per_city_date(self) -> None:
         market = parse_weather_market(
             {
@@ -289,6 +355,47 @@ class TradingLayersTest(unittest.TestCase):
             positions = ledger.positions()
             self.assertEqual(len(positions), 1)
             self.assertEqual(positions[0]["token_id"], "tok80")
+
+    def test_kelly_rebalance_holds_existing_position_when_new_entries_time_blocked(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 80°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.30", "0.70"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        consensus = {
+            market.buckets[0].label: ConsensusValue(
+                market.buckets[0].label,
+                0.70,
+                {"source_a.model": 0.70, "source_b.model": 0.72, "source_c.model": 0.71},
+                3,
+                0.01,
+            )
+        }
+        scored = score_outcomes(market, consensus, settings=SignalSettings(min_edge=0.05, uncertainty_buffer=0.01, enforce_entry_timing_filter=False))
+        blocked_scored = [
+            outcome.__class__(
+                **{
+                    **outcome.__dict__,
+                    "entry_eligible": False,
+                    "entry_filter_reason": "same-day market before 11:00 local observation-aware entry window",
+                }
+            )
+            for outcome in scored
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            self.assertEqual(ledger.rebalance_kelly(scored, bankroll_usd=1000, kelly_fraction=0.25, max_position_usd=50, min_edge=0.05), 1)
+            self.assertEqual(len(ledger.positions()), 1)
+            self.assertEqual(ledger.rebalance_kelly(blocked_scored, bankroll_usd=1000, kelly_fraction=0.25, max_position_usd=50, min_edge=0.05), 0)
+            self.assertEqual(len(ledger.positions()), 1)
 
     def test_kelly_rebalance_closes_zero_target_dust_position(self) -> None:
         market = parse_weather_market(

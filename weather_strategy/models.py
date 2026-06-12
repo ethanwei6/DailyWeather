@@ -20,6 +20,7 @@ class CityConfig:
     timezone: str
     nws_station: Optional[str] = None
     aliases: tuple[str, ...] = ()
+    metar_station: Optional[str] = None
 
     @property
     def display_name(self) -> str:

@@ -57,7 +57,7 @@ class OpenMeteoClient:
         ensemble = self._fetch_ensemble_source(city, target_date)
         if ensemble is not None:
             sources.append(ensemble)
-        return tuple(sources)
+        return tuple(_dedupe_temperature_sources(sources))
 
     def _source_requests(self, city: CityConfig) -> tuple[tuple[str, str, dict[str, object]], ...]:
         base_params = {
@@ -93,7 +93,7 @@ class OpenMeteoClient:
         }
         return (
             ("open_meteo_best_match", self.FORECAST_URL, dict(base_params)),
-            ("open_meteo_gfs_hrrr", self.GFS_URL, dict(base_params)),
+            ("open_meteo_gfs_best_match", self.GFS_URL, dict(base_params)),
             ("open_meteo_gfs_global", self.GFS_URL, {**base_params, "models": "gfs_global"}),
             ("open_meteo_gfs_graphcast", self.GFS_URL, {**base_params, "models": "gfs_graphcast025"}),
             ("open_meteo_ecmwf", self.ECMWF_URL, dict(base_params)),
@@ -209,6 +209,18 @@ def extract_daily_temperature_samples(payload: dict[str, Any], target_date: date
     # Some API responses expose a single aggregate. Keep it as one sample; the
     # forecast model will apply a minimum uncertainty floor.
     return [value for value in samples if value is not None]
+
+
+def _dedupe_temperature_sources(distributions: list[ForecastDistribution]) -> list[ForecastDistribution]:
+    deduped = []
+    seen = set()
+    for distribution in distributions:
+        signature = tuple(round(value, 2) for value in distribution.samples_f)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(distribution)
+    return deduped
 
 
 def extract_weather_features(payload: dict[str, Any], target_date: date) -> dict[str, float]:

@@ -23,7 +23,9 @@ class ObservedHigh:
 
 class ObservedHighClient:
     NWS_URL = "https://api.weather.gov"
+    AVIATION_WEATHER_URL = "https://aviationweather.gov/api/data/metar"
     OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+    OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
     def __init__(self, http: Optional[HttpClient] = None):
         self.http = http or HttpClient(user_agent="weather-polymarket-strategy/0.1 contact=local")
@@ -39,6 +41,21 @@ class ObservedHighClient:
                 nws = None
             if nws is not None:
                 return nws
+        metar_station = city.metar_station or city.nws_station
+        if metar_station:
+            try:
+                metar = self._fetch_metar_station_high(city, metar_station, target_date, local_now)
+            except RuntimeError:
+                metar = None
+            if metar is not None:
+                return metar
+        if target_date < local_now.date():
+            try:
+                archive = self._fetch_open_meteo_archive_high(city, target_date, local_now)
+            except RuntimeError:
+                archive = None
+            if archive is not None:
+                return archive
         try:
             return self._fetch_open_meteo_proxy_high(city, target_date, local_now)
         except RuntimeError:
@@ -75,6 +92,75 @@ class ObservedHighClient:
             is_actual=True,
             is_final=target_date < local_now.date(),
         )
+
+    def _fetch_metar_station_high(self, city: CityConfig, station_id: str, target_date: date, local_now: datetime) -> Optional[ObservedHigh]:
+        payload = self.http.get_json(
+            self.AVIATION_WEATHER_URL,
+            params={"ids": station_id, "format": "json", "hours": 48},
+        )
+        records = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+        temperatures: list[tuple[float, datetime]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            observed_at = _parse_metar_time(record)
+            temperature_f = _parse_metar_temperature_f(record)
+            if observed_at is None or temperature_f is None:
+                continue
+            observed_local = observed_at.astimezone(local_now.tzinfo)
+            if observed_local.date() != target_date or observed_local > local_now:
+                continue
+            temperatures.append((temperature_f, observed_at))
+        if not temperatures:
+            return None
+        max_temperature, observed_at = max(temperatures, key=lambda item: item[0])
+        return ObservedHigh(
+            city=city,
+            target_date=target_date,
+            max_temperature_f=max_temperature,
+            source=f"metar_{station_id}",
+            observed_at=observed_at,
+            sample_count=len(temperatures),
+            is_actual=True,
+            is_final=target_date < local_now.date(),
+        )
+
+    def _fetch_open_meteo_archive_high(self, city: CityConfig, target_date: date, local_now: datetime) -> Optional[ObservedHigh]:
+        payload = self.http.get_json(
+            self.OPEN_METEO_ARCHIVE_URL,
+            params={
+                "latitude": city.latitude,
+                "longitude": city.longitude,
+                "start_date": target_date.isoformat(),
+                "end_date": target_date.isoformat(),
+                "daily": "temperature_2m_max",
+                "temperature_unit": "fahrenheit",
+                "timezone": city.timezone,
+            },
+        )
+        daily = payload.get("daily") or {}
+        times = daily.get("time") or []
+        values = daily.get("temperature_2m_max") or []
+        for index, value in enumerate(values):
+            if index >= len(times) or value is None:
+                continue
+            try:
+                observed_date = date.fromisoformat(str(times[index]))
+            except ValueError:
+                continue
+            if observed_date != target_date:
+                continue
+            return ObservedHigh(
+                city=city,
+                target_date=target_date,
+                max_temperature_f=float(value),
+                source="open_meteo_archive_daily",
+                observed_at=datetime.combine(target_date, time.max, tzinfo=local_now.tzinfo),
+                sample_count=1,
+                is_actual=False,
+                is_final=True,
+            )
+        return None
 
     def _fetch_open_meteo_proxy_high(self, city: CityConfig, target_date: date, local_now: datetime) -> Optional[ObservedHigh]:
         payload = self.http.get_json(
@@ -116,6 +202,35 @@ class ObservedHighClient:
             is_actual=False,
             is_final=target_date < local_now.date(),
         )
+
+
+def _parse_metar_time(record: dict[str, Any]) -> Optional[datetime]:
+    for key in ("obsTime", "reportTime", "receiptTime"):
+        value = record.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _parse_metar_temperature_f(record: dict[str, Any]) -> Optional[float]:
+    for key in ("temp", "temp_c", "temperature"):
+        value = record.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value) * 9 / 5 + 32
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def observed_outcome_for_bucket(bucket: TemperatureBucket, observed_high_f: Optional[float], is_final: bool) -> Optional[int]:
