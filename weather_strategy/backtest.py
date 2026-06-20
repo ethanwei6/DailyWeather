@@ -14,7 +14,14 @@ from weather_strategy.http import HttpClient
 from weather_strategy.models import CityConfig
 from weather_strategy.observations import ObservedHighClient, observed_outcome_for_bucket
 from weather_strategy.parser import parse_temperature_bucket
-from weather_strategy.signals import SignalSettings, _passes_edge_gate, _price_adjusted_uncertainty_buffer
+from weather_strategy.signals import (
+    SignalSettings,
+    _fails_no_side_max_price_gate,
+    _passes_edge_gate,
+    _price_adjusted_uncertainty_buffer,
+    _required_no_side_min_edge,
+    no_side_counter_event_probability,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +100,10 @@ def run_backtest(
     max_position_usd: float,
     min_trade_usd: float,
     settings: SignalSettings,
+    max_position_fraction: Optional[float] = None,
+    kelly_market_blend: float = 0.0,
+    edge_position_full_cap_edge: float = 0.0,
+    edge_position_min_multiplier: float = 0.35,
     train_fraction: float,
     output_weights_path: Optional[str | Path] = None,
     fetch_observations: bool = True,
@@ -135,8 +146,34 @@ def run_backtest(
             "test": _prediction_report(test_rows, source_weights, model_weights),
         },
         "kelly_replay": {
-            "default_weights": _single_entry_kelly_replay(test_rows, {}, {}, bankroll_usd, kelly_fraction, max_position_usd, min_trade_usd, settings),
-            "calibrated_weights": _single_entry_kelly_replay(test_rows, source_weights, model_weights, bankroll_usd, kelly_fraction, max_position_usd, min_trade_usd, settings),
+            "default_weights": _single_entry_kelly_replay(
+                test_rows,
+                {},
+                {},
+                bankroll_usd,
+                kelly_fraction,
+                max_position_usd,
+                min_trade_usd,
+                settings,
+                max_position_fraction=max_position_fraction,
+                kelly_market_blend=kelly_market_blend,
+                edge_position_full_cap_edge=edge_position_full_cap_edge,
+                edge_position_min_multiplier=edge_position_min_multiplier,
+            ),
+            "calibrated_weights": _single_entry_kelly_replay(
+                test_rows,
+                source_weights,
+                model_weights,
+                bankroll_usd,
+                kelly_fraction,
+                max_position_usd,
+                min_trade_usd,
+                settings,
+                max_position_fraction=max_position_fraction,
+                kelly_market_blend=kelly_market_blend,
+                edge_position_full_cap_edge=edge_position_full_cap_edge,
+                edge_position_min_multiplier=edge_position_min_multiplier,
+            ),
         },
         "learned_weights": {
             "source_weights": _top_weights(source_weights),
@@ -353,6 +390,10 @@ def _single_entry_kelly_replay(
     max_position_usd: float,
     min_trade_usd: float,
     settings: SignalSettings,
+    max_position_fraction: Optional[float] = None,
+    kelly_market_blend: float = 0.0,
+    edge_position_full_cap_edge: float = 0.0,
+    edge_position_min_multiplier: float = 0.35,
 ) -> dict[str, Any]:
     sessions: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
@@ -366,11 +407,39 @@ def _single_entry_kelly_replay(
             continue
         if row.market_price < settings.min_price or row.market_price > settings.max_price:
             continue
+        if not _resolved_row_is_no_side(row) and row.market_price < settings.yes_side_min_price:
+            continue
+        if _resolved_row_is_no_side(row) and _fails_no_side_max_price_gate(row.market_price, settings):
+            continue
+        if fair_value < settings.min_signal_fair_value:
+            continue
         if len(source_views) < settings.min_model_count:
             continue
         if model_agreement < settings.min_model_agreement:
             continue
         if not _passes_edge_gate(edge, row.market_price, settings):
+            continue
+        if _resolved_row_is_no_side(row) and edge < _required_no_side_min_edge(row.market_price, settings):
+            continue
+        if _resolved_row_is_no_side(row) and _resolved_row_fails_no_side_counter_event_gate(row, settings):
+            continue
+        bucket = parse_temperature_bucket(row.bucket_label)
+        if not settings.allow_bounded_bucket_entries and bucket is not None and bucket.lower_f is not None and bucket.upper_f is not None:
+            continue
+        bucket_width = None if bucket is None or bucket.lower_f is None or bucket.upper_f is None else bucket.upper_f - bucket.lower_f
+        if (
+            row.market_price < settings.low_price_exact_bucket_threshold
+            and bucket_width is not None
+            and 0 < bucket_width <= settings.exact_bucket_max_width_f
+            and (fair_value < settings.low_price_exact_bucket_min_fair_value or edge < settings.low_price_exact_bucket_min_edge)
+        ):
+            continue
+        if (
+            row.market_price < settings.correlated_exact_bucket_max_price
+            and bucket_width is not None
+            and 0 < bucket_width <= settings.exact_bucket_max_width_f
+            and model_agreement >= settings.correlated_exact_bucket_min_agreement
+        ):
             continue
         sessions.setdefault(_session_key(row.generated_at), []).append(
             {
@@ -395,8 +464,19 @@ def _single_entry_kelly_replay(
             if group_key in positions:
                 continue
             row = candidate["row"]
-            raw_fraction = max(0.0, (candidate["fair_value"] - row.market_price) / max(0.0001, 1.0 - row.market_price))
-            target_notional = min(max_position_usd, bankroll_usd * kelly_fraction * raw_fraction * candidate["agreement"])
+            sizing_fair_value = _blend_probability_with_market(candidate["fair_value"], row.market_price, kelly_market_blend)
+            raw_fraction = max(0.0, (sizing_fair_value - row.market_price) / max(0.0001, 1.0 - row.market_price))
+            target_notional = min(
+                _effective_max_position_usd(
+                    bankroll_usd,
+                    max_position_usd,
+                    max_position_fraction,
+                    edge=candidate["edge"],
+                    edge_position_full_cap_edge=edge_position_full_cap_edge,
+                    edge_position_min_multiplier=edge_position_min_multiplier,
+                ),
+                bankroll_usd * kelly_fraction * raw_fraction * candidate["agreement"],
+            )
             if target_notional < min_trade_usd:
                 continue
             shares = target_notional / row.market_price
@@ -408,6 +488,7 @@ def _single_entry_kelly_replay(
                 "bucket": row.bucket_label,
                 "market_price": round(row.market_price, 4),
                 "fair_value": round(candidate["fair_value"], 4),
+                "sizing_fair_value": round(sizing_fair_value, 4),
                 "edge": round(candidate["edge"], 4),
                 "agreement": round(candidate["agreement"], 4),
                 "notional_usd": round(target_notional, 2),
@@ -433,6 +514,18 @@ def _single_entry_kelly_replay(
             for trade in sorted(trades, key=lambda item: abs(float(item["pnl_usd"])), reverse=True)[:10]
         ],
     }
+
+
+def _resolved_row_is_no_side(row: ResolvedForecastRow) -> bool:
+    return row.bucket_label.startswith("NO: ")
+
+
+def _resolved_row_fails_no_side_counter_event_gate(row: ResolvedForecastRow, settings: SignalSettings) -> bool:
+    threshold = settings.no_side_max_counter_event_probability
+    if threshold is None or threshold >= 1.0:
+        return False
+    counter_probability = no_side_counter_event_probability(row.model_probabilities)
+    return counter_probability is not None and counter_probability > threshold
 
 
 def _resolve_row_outcome(
@@ -557,6 +650,43 @@ def _metric_to_json(metric: AccuracyMetric) -> dict[str, Any]:
 def _top_weights(weights: Mapping[str, float], limit: int = 12) -> dict[str, float]:
     ranked = sorted(weights.items(), key=lambda item: abs(item[1] - 1.0), reverse=True)
     return {key: value for key, value in ranked[:limit]}
+
+
+def _effective_max_position_usd(
+    bankroll_usd: float,
+    max_position_usd: float,
+    max_position_fraction: Optional[float],
+    *,
+    edge: Optional[float] = None,
+    edge_position_full_cap_edge: float = 0.0,
+    edge_position_min_multiplier: float = 0.35,
+) -> float:
+    caps = [max(0.0, max_position_usd)]
+    if max_position_fraction is not None and max_position_fraction > 0:
+        caps.append(max(0.0, bankroll_usd * max_position_fraction))
+    base_cap = min(caps)
+    return _edge_scaled_position_cap(base_cap, edge, edge_position_full_cap_edge, edge_position_min_multiplier)
+
+
+def _edge_scaled_position_cap(
+    max_position_usd: float,
+    edge: Optional[float],
+    edge_position_full_cap_edge: float,
+    edge_position_min_multiplier: float,
+) -> float:
+    cap = max(0.0, max_position_usd)
+    if edge is None or edge_position_full_cap_edge <= 0:
+        return cap
+    edge_ratio = max(0.0, float(edge)) / max(0.0001, edge_position_full_cap_edge)
+    floor = max(0.0, min(1.0, edge_position_min_multiplier))
+    multiplier = max(floor, min(1.0, edge_ratio))
+    return cap * multiplier
+
+
+def _blend_probability_with_market(fair_value: float, market_price: float, market_blend: float) -> float:
+    blend = max(0.0, min(1.0, market_blend))
+    probability = fair_value * (1.0 - blend) + market_price * blend
+    return max(0.0, min(1.0, probability))
 
 
 def _write_weights(

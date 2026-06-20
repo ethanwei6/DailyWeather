@@ -2,21 +2,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
+from collections import Counter
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from weather_strategy.backtest import load_calibration_weights, run_backtest
+from weather_strategy.cities import city_with_station_coordinates, find_city
 from weather_strategy.forecast import ConsensusForecastEngine
-from weather_strategy.models import ForecastDistribution, TradeSignal, WeatherMarket
+from weather_strategy.long_backtest import run_long_historical_backtest
+from weather_strategy.models import ForecastDistribution, ScoredOutcome, TradeSignal, WeatherMarket
 from weather_strategy.observations import ObservedHigh, ObservedHighClient
 from weather_strategy.paper import PaperLedger
-from weather_strategy.parser import parse_weather_market
+from weather_strategy.parser import parse_jsonish_list, parse_weather_market
 from weather_strategy.polymarket import PolymarketClobClient, PolymarketGammaClient
-from weather_strategy.signals import SignalSettings, market_entry_timing, score_outcomes, signals_from_scored_outcomes
+from weather_strategy.signals import (
+    SignalSettings,
+    invert_binary_scored_outcome,
+    market_entry_timing,
+    score_outcomes,
+    signal_filter_reason,
+    signals_from_scored_outcomes,
+)
 from weather_strategy.weather import OpenMeteoClient
 
 
@@ -38,12 +50,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--size-usd", type=float, default=10.0)
     paper.add_argument("--bankroll-usd", type=float, default=1000.0)
     paper.add_argument("--kelly-fraction", type=float, default=0.25)
-    paper.add_argument("--max-position-usd", type=float, default=50.0)
+    paper.add_argument("--compound-kelly-sizing", action="store_true", help="Size Kelly targets from current paper equity instead of the starting bankroll")
+    paper.add_argument("--max-position-usd", type=float, default=1000.0)
+    paper.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll/equity; the stricter of this and --max-position-usd is used")
+    paper.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
+    paper.add_argument("--edge-position-full-cap-edge", type=float, default=0.25, help="If >0, scale max position by buffered edge; full max-position applies at this edge")
+    paper.add_argument("--edge-position-min-multiplier", type=float, default=0.35, help="Minimum max-position multiplier when edge-scaled sizing is enabled")
     paper.add_argument("--min-trade-usd", type=float, default=1.0)
     paper.add_argument("--min-model-count", type=int, default=3)
-    paper.add_argument("--min-model-agreement", type=float, default=0.65)
+    paper.add_argument("--min-model-agreement", type=float, default=1.0)
+    paper.add_argument("--hold-min-model-agreement", type=float, default=0.65)
+    paper.add_argument("--hold-min-fair-value", type=float, default=0.60)
+    paper.add_argument("--hold-market-confirmation-price", type=float, default=0.80)
+    paper.add_argument("--hold-market-confirmation-min-fair-value", type=float, default=0.50)
+    paper.add_argument("--trim-valid-holds-to-kelly-target", action="store_true")
     paper.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
     paper.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
+    paper.add_argument("--low-price-exact-bucket-threshold", type=float, default=0.20)
+    paper.add_argument("--low-price-exact-bucket-min-fair-value", type=float, default=0.22)
+    paper.add_argument("--low-price-exact-bucket-min-edge", type=float, default=0.08)
+    paper.add_argument("--correlated-exact-bucket-max-price", type=float, default=0.15)
+    paper.add_argument("--correlated-exact-bucket-min-agreement", type=float, default=0.95)
+    paper.add_argument("--exact-bucket-max-width-f", type=float, default=2.25)
+    paper.add_argument("--min-price", type=float, default=0.125)
+    paper.add_argument("--yes-side-min-price", type=float, default=0.20, help="Minimum entry price for YES-token entries; NO research entries use --min-price")
+    paper.add_argument("--allow-no-side-entries", action="store_true", help="Paper-trade explicit NO tokens for binary markets using real NO quotes")
+    paper.add_argument("--no-side-min-edge", type=float, default=0.10, help="Minimum absolute buffered edge required for NO-token paper entries")
+    paper.add_argument("--no-side-high-confidence-min-edge", type=float, default=0.02, help="Minimum absolute buffered edge for NO-token entries when the NO price is at or above --high-confidence-price-threshold")
+    paper.add_argument("--no-side-max-price", type=float, default=0.95, help="Maximum entry price for NO-token entries; set at or above --max-price to disable the side-specific cap")
+    paper.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For NO-token research rows, reject entries if any model view gives the opposite YES event more than this probability")
+    paper.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability")
+    paper.add_argument("--min-signal-fair-value", type=float, default=0.70)
+    paper.add_argument("--allow-bounded-bucket-entries", action="store_true")
+    paper.add_argument("--max-price", type=float, default=0.95)
     paper.add_argument("--same-day-entry-start-hour", type=int, default=11)
     paper.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
     paper.add_argument("--allow-late-same-day", action="store_true")
@@ -75,15 +114,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--ledger", default="work/data/weather_kelly_paper.sqlite")
     backtest.add_argument("--bankroll-usd", type=float, default=1000.0)
     backtest.add_argument("--kelly-fraction", type=float, default=0.25)
-    backtest.add_argument("--max-position-usd", type=float, default=50.0)
+    backtest.add_argument("--max-position-usd", type=float, default=1000.0)
+    backtest.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll; the stricter of this and --max-position-usd is used")
+    backtest.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
+    backtest.add_argument("--edge-position-full-cap-edge", type=float, default=0.25, help="If >0, scale max position by buffered edge; full max-position applies at this edge")
+    backtest.add_argument("--edge-position-min-multiplier", type=float, default=0.35, help="Minimum max-position multiplier when edge-scaled sizing is enabled")
     backtest.add_argument("--min-trade-usd", type=float, default=1.0)
     backtest.add_argument("--min-edge", type=float, default=0.08)
     backtest.add_argument("--uncertainty-buffer", type=float, default=0.03)
     backtest.add_argument("--min-model-count", type=int, default=3)
-    backtest.add_argument("--min-model-agreement", type=float, default=0.65)
+    backtest.add_argument("--min-model-agreement", type=float, default=1.0)
+    backtest.add_argument("--hold-min-model-agreement", type=float, default=0.65)
+    backtest.add_argument("--hold-min-fair-value", type=float, default=0.60)
+    backtest.add_argument("--hold-market-confirmation-price", type=float, default=0.80)
+    backtest.add_argument("--hold-market-confirmation-min-fair-value", type=float, default=0.50)
+    backtest.add_argument("--trim-valid-holds-to-kelly-target", action="store_true")
     backtest.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
     backtest.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
-    backtest.add_argument("--min-price", type=float, default=0.05)
+    backtest.add_argument("--low-price-exact-bucket-threshold", type=float, default=0.20)
+    backtest.add_argument("--low-price-exact-bucket-min-fair-value", type=float, default=0.22)
+    backtest.add_argument("--low-price-exact-bucket-min-edge", type=float, default=0.08)
+    backtest.add_argument("--correlated-exact-bucket-max-price", type=float, default=0.15)
+    backtest.add_argument("--correlated-exact-bucket-min-agreement", type=float, default=0.95)
+    backtest.add_argument("--exact-bucket-max-width-f", type=float, default=2.25)
+    backtest.add_argument("--min-price", type=float, default=0.125)
+    backtest.add_argument("--yes-side-min-price", type=float, default=0.20)
+    backtest.add_argument("--allow-no-side-entries", action="store_true")
+    backtest.add_argument("--no-side-min-edge", type=float, default=0.10)
+    backtest.add_argument("--no-side-high-confidence-min-edge", type=float, default=0.02)
+    backtest.add_argument("--no-side-max-price", type=float, default=0.95)
+    backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10)
+    backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15)
+    backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
+    backtest.add_argument("--allow-bounded-bucket-entries", action="store_true")
     backtest.add_argument("--max-price", type=float, default=0.95)
     backtest.add_argument("--train-fraction", type=float, default=0.70)
     backtest.add_argument("--output-weights", default="work/data/model_weights.json")
@@ -93,6 +156,79 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--weight-prior-samples", type=int, default=50)
     backtest.add_argument("--run-log-dir", default="work/logs/backtests", help="Directory for detailed JSON backtest logs")
     backtest.add_argument("--no-run-log", action="store_true", help="Disable detailed JSON backtest log output")
+
+    long_backtest = subparsers.add_parser("long-backtest", help="Run a historical live-compatible backtest using real Polymarket price history and historical forecasts")
+    long_backtest.add_argument("--bankroll-usd", type=float, default=100.0)
+    long_backtest.add_argument("--pages", type=int, default=10, help="Gamma public-search pages to scan")
+    long_backtest.add_argument("--limit-per-page", type=int, default=50)
+    long_backtest.add_argument("--max-markets", type=int, default=8000)
+    long_backtest.add_argument("--query", default="highest temperature")
+    long_backtest.add_argument("--entry-hours-utc", default="0,12", help="Comma-separated simulated run hours in UTC")
+    long_backtest.add_argument("--min-lead-days", type=int, default=1)
+    long_backtest.add_argument("--max-lead-days", type=int, default=2)
+    long_backtest.add_argument("--max-runtime-seconds", type=float, default=0.0)
+    long_backtest.add_argument("--max-price-staleness-minutes", type=int, default=90)
+    long_backtest.add_argument("--historical-price-slippage", type=float, default=0.01)
+    long_backtest.add_argument("--forecast-availability-lag-hours", type=int, default=6)
+    long_backtest.add_argument("--kelly-fraction", type=float, default=0.25)
+    long_backtest.add_argument("--compound-kelly-sizing", action="store_true", help="Size Kelly targets from current replay equity instead of the starting bankroll")
+    long_backtest.add_argument("--max-position-usd", type=float, default=100.0)
+    long_backtest.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll/equity; the stricter of this and --max-position-usd is used")
+    long_backtest.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
+    long_backtest.add_argument("--edge-position-full-cap-edge", type=float, default=0.25, help="If >0, scale max position by buffered edge; full max-position applies at this edge")
+    long_backtest.add_argument("--edge-position-min-multiplier", type=float, default=0.35, help="Minimum max-position multiplier when edge-scaled sizing is enabled")
+    long_backtest.add_argument("--min-trade-usd", type=float, default=1.0)
+    long_backtest.add_argument("--min-edge", type=float, default=0.08)
+    long_backtest.add_argument("--uncertainty-buffer", type=float, default=0.03)
+    long_backtest.add_argument("--min-model-count", type=int, default=3)
+    long_backtest.add_argument("--min-model-agreement", type=float, default=1.0)
+    long_backtest.add_argument("--hold-min-model-agreement", type=float, default=0.65)
+    long_backtest.add_argument("--hold-min-fair-value", type=float, default=0.60)
+    long_backtest.add_argument("--hold-market-confirmation-price", type=float, default=0.80)
+    long_backtest.add_argument("--hold-market-confirmation-min-fair-value", type=float, default=0.50)
+    long_backtest.add_argument("--trim-valid-holds-to-kelly-target", action="store_true")
+    long_backtest.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
+    long_backtest.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
+    long_backtest.add_argument("--low-price-exact-bucket-threshold", type=float, default=0.20)
+    long_backtest.add_argument("--low-price-exact-bucket-min-fair-value", type=float, default=0.22)
+    long_backtest.add_argument("--low-price-exact-bucket-min-edge", type=float, default=0.08)
+    long_backtest.add_argument("--correlated-exact-bucket-max-price", type=float, default=0.15)
+    long_backtest.add_argument("--correlated-exact-bucket-min-agreement", type=float, default=0.95)
+    long_backtest.add_argument("--exact-bucket-max-width-f", type=float, default=2.25)
+    long_backtest.add_argument("--min-price", type=float, default=0.125)
+    long_backtest.add_argument("--yes-side-min-price", type=float, default=0.20)
+    long_backtest.add_argument("--no-side-max-price", type=float, default=0.95, help="Maximum entry price for experimental NO-token entries; set at or above --max-price to disable the side-specific cap")
+    long_backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For experimental NO-token entries, reject rows if any model view gives the opposite YES event more than this probability; set >=1 to disable")
+    long_backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability; set >=1 to disable")
+    long_backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
+    long_backtest.add_argument("--allow-bounded-bucket-entries", action="store_true")
+    long_backtest.add_argument("--max-price", type=float, default=0.95)
+    long_backtest.add_argument(
+        "--allow-no-side-entries",
+        action="store_true",
+        help="Experimentally evaluate buying real NO tokens for binary markets using historical NO CLOB prices",
+    )
+    long_backtest.add_argument(
+        "--no-side-min-edge",
+        type=float,
+        default=0.10,
+        help="Minimum absolute buffered edge required for experimental NO-token entries",
+    )
+    long_backtest.add_argument(
+        "--no-side-high-confidence-min-edge",
+        type=float,
+        default=0.02,
+        help="Minimum absolute buffered edge for experimental NO entries when the NO price is at or above --high-confidence-price-threshold",
+    )
+    long_backtest.add_argument("--same-day-entry-start-hour", type=int, default=11)
+    long_backtest.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
+    long_backtest.add_argument("--min-volume-usd", type=float, default=0.0)
+    long_backtest.add_argument("--weights-file", default="work/data/model_weights.json")
+    long_backtest.add_argument("--cache-dir", default="work/cache/long_backtest")
+    long_backtest.add_argument("--run-log-dir", default="work/logs/long_backtests")
+    long_backtest.add_argument("--progress-every", type=int, default=50, help="Emit long-backtest progress every N prepared markets; <=0 disables")
+    long_backtest.add_argument("--http-hard-timeout-seconds", type=int, default=30, help="Abort one stalled live API request after N seconds; <=0 disables")
+    long_backtest.add_argument("--summary-only", action="store_true", help="Print a compact summary while preserving the full JSON run log")
 
     args = parser.parse_args(argv)
     if args.command == "paper-run":
@@ -107,6 +243,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_calibration(args)
     if args.command == "backtest":
         return run_backtest_command(args)
+    if args.command == "long-backtest":
+        return run_long_backtest_command(args)
     raise ValueError(args.command)
 
 
@@ -167,8 +305,28 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         min_model_agreement=args.min_model_agreement,
         high_confidence_price_threshold=args.high_confidence_price_threshold,
         high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
+        low_price_exact_bucket_threshold=args.low_price_exact_bucket_threshold,
+        low_price_exact_bucket_min_fair_value=args.low_price_exact_bucket_min_fair_value,
+        low_price_exact_bucket_min_edge=args.low_price_exact_bucket_min_edge,
+        correlated_exact_bucket_max_price=args.correlated_exact_bucket_max_price,
+        correlated_exact_bucket_min_agreement=args.correlated_exact_bucket_min_agreement,
+        exact_bucket_max_width_f=args.exact_bucket_max_width_f,
         min_price=args.min_price,
+        yes_side_min_price=args.yes_side_min_price,
+        allow_no_side_entries=args.allow_no_side_entries,
+        no_side_min_edge=args.no_side_min_edge,
+        no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
+        no_side_max_price=args.no_side_max_price,
+        no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        min_signal_fair_value=args.min_signal_fair_value,
+        allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
         max_price=args.max_price,
+        hold_min_model_agreement=args.hold_min_model_agreement,
+        hold_min_fair_value=args.hold_min_fair_value,
+        hold_market_confirmation_price=args.hold_market_confirmation_price,
+        hold_market_confirmation_min_fair_value=args.hold_market_confirmation_min_fair_value,
+        preserve_valid_holds=not args.trim_valid_holds_to_kelly_target,
         enforce_entry_timing_filter=False,
     )
     result = run_backtest(
@@ -176,6 +334,10 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         bankroll_usd=args.bankroll_usd,
         kelly_fraction=args.kelly_fraction,
         max_position_usd=args.max_position_usd,
+        max_position_fraction=args.max_position_fraction,
+        kelly_market_blend=args.kelly_market_blend,
+        edge_position_full_cap_edge=args.edge_position_full_cap_edge,
+        edge_position_min_multiplier=args.edge_position_min_multiplier,
         min_trade_usd=args.min_trade_usd,
         settings=settings,
         train_fraction=args.train_fraction,
@@ -191,6 +353,144 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         _write_json_log(run_log_path, result)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+def run_long_backtest_command(args: argparse.Namespace) -> int:
+    settings = SignalSettings(
+        min_edge=args.min_edge,
+        uncertainty_buffer=args.uncertainty_buffer,
+        min_model_count=args.min_model_count,
+        min_model_agreement=args.min_model_agreement,
+        high_confidence_price_threshold=args.high_confidence_price_threshold,
+        high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
+        low_price_exact_bucket_threshold=args.low_price_exact_bucket_threshold,
+        low_price_exact_bucket_min_fair_value=args.low_price_exact_bucket_min_fair_value,
+        low_price_exact_bucket_min_edge=args.low_price_exact_bucket_min_edge,
+        correlated_exact_bucket_max_price=args.correlated_exact_bucket_max_price,
+        correlated_exact_bucket_min_agreement=args.correlated_exact_bucket_min_agreement,
+        exact_bucket_max_width_f=args.exact_bucket_max_width_f,
+        min_price=args.min_price,
+        yes_side_min_price=args.yes_side_min_price,
+        min_signal_fair_value=args.min_signal_fair_value,
+        allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        allow_no_side_entries=args.allow_no_side_entries,
+        no_side_min_edge=args.no_side_min_edge,
+        no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
+        no_side_max_price=args.no_side_max_price,
+        no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        max_price=args.max_price,
+        hold_min_model_agreement=args.hold_min_model_agreement,
+        hold_min_fair_value=args.hold_min_fair_value,
+        hold_market_confirmation_price=args.hold_market_confirmation_price,
+        hold_market_confirmation_min_fair_value=args.hold_market_confirmation_min_fair_value,
+        preserve_valid_holds=not args.trim_valid_holds_to_kelly_target,
+        same_day_earliest_entry_hour_local=args.same_day_entry_start_hour,
+        same_day_latest_entry_hour_local=args.same_day_entry_cutoff_hour,
+        enforce_entry_timing_filter=True,
+    )
+    result = run_long_historical_backtest(
+        bankroll_usd=args.bankroll_usd,
+        pages=args.pages,
+        limit_per_page=args.limit_per_page,
+        max_markets=args.max_markets,
+        query=args.query,
+        entry_hours_utc=_parse_entry_hours(args.entry_hours_utc),
+        min_lead_days=args.min_lead_days,
+        max_lead_days=args.max_lead_days,
+        max_runtime_seconds=args.max_runtime_seconds,
+        max_price_staleness_minutes=args.max_price_staleness_minutes,
+        historical_price_slippage=args.historical_price_slippage,
+        forecast_availability_lag_hours=args.forecast_availability_lag_hours,
+        kelly_fraction=args.kelly_fraction,
+        compound_kelly_sizing=args.compound_kelly_sizing,
+        max_position_usd=args.max_position_usd,
+        max_position_fraction=args.max_position_fraction,
+        kelly_market_blend=args.kelly_market_blend,
+        edge_position_full_cap_edge=args.edge_position_full_cap_edge,
+        edge_position_min_multiplier=args.edge_position_min_multiplier,
+        min_trade_usd=args.min_trade_usd,
+        settings=settings,
+        min_volume_usd=args.min_volume_usd,
+        weights_file=args.weights_file,
+        cache_dir=args.cache_dir,
+        run_log_dir=args.run_log_dir,
+        progress_every=args.progress_every,
+        http_hard_timeout_seconds=args.http_hard_timeout_seconds,
+    )
+    print(json.dumps(_long_backtest_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
+    return 0
+
+
+def _parse_entry_hours(value: str) -> tuple[int, ...]:
+    hours = []
+    for item in value.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        hour = int(stripped)
+        if hour < 0 or hour > 23:
+            raise ValueError(f"Entry hour must be in [0, 23], got {hour}")
+        hours.append(hour)
+    if not hours:
+        raise ValueError("At least one entry hour is required")
+    return tuple(sorted(set(hours)))
+
+
+def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "bankroll_usd",
+        "ending_equity_usd",
+        "pnl_usd",
+        "return_pct",
+        "cash_usd",
+        "open_positions",
+        "markets_discovered_raw",
+        "markets_parsed",
+        "price_history_requests",
+        "markets_with_price_history",
+        "session_count",
+        "markets_scored",
+        "outcomes_scored",
+        "signals",
+        "executions",
+        "buys",
+        "sells",
+        "settlements",
+        "forecast_error_count",
+        "forecast_error_examples",
+        "price_error_count",
+        "no_side_price_error_count",
+        "no_side_price_history_count",
+        "no_side_session_count",
+        "resolution_error_count",
+        "weather_crosscheck_mismatches",
+        "weather_crosscheck_ambiguous_count",
+        "weather_crosscheck_checked_executions",
+        "weather_crosscheck_mismatch_executions",
+        "realized_pnl_crosscheck_mismatch_usd",
+        "realized_pnl_crosscheck_matched_or_unchecked_usd",
+        "runtime_limited",
+        "elapsed_seconds",
+        "scored_outcomes_detail_count",
+        "skipped_reason_counts",
+        "run_log_path",
+    )
+    return {
+        **{key: result.get(key) for key in keys},
+        "data_provenance": result.get("data_provenance"),
+        "settings": result.get("settings"),
+        "trade_diagnostics": result.get("trade_diagnostics"),
+        "score_calibration_diagnostics": result.get("score_calibration_diagnostics"),
+        "signal_filter_diagnostics": result.get("signal_filter_diagnostics"),
+        "strategy_sensitivity_diagnostics": result.get("strategy_sensitivity_diagnostics"),
+        "robustness_diagnostics": result.get("robustness_diagnostics"),
+        "strategy_recommendation_diagnostics": result.get("strategy_recommendation_diagnostics"),
+        "real_data_audit": result.get("real_data_audit"),
+        "top_trades": result.get("top_trades", [])[:10],
+        "top_scored_outcomes": result.get("scored_outcomes_detail", [])[:10],
+        "skipped_examples": result.get("skipped_examples", [])[:10],
+    }
 
 
 def run_paper(args: argparse.Namespace) -> int:
@@ -232,6 +532,28 @@ def run_paper(args: argparse.Namespace) -> int:
         min_model_agreement=args.min_model_agreement,
         high_confidence_price_threshold=args.high_confidence_price_threshold,
         high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
+        low_price_exact_bucket_threshold=args.low_price_exact_bucket_threshold,
+        low_price_exact_bucket_min_fair_value=args.low_price_exact_bucket_min_fair_value,
+        low_price_exact_bucket_min_edge=args.low_price_exact_bucket_min_edge,
+        correlated_exact_bucket_max_price=args.correlated_exact_bucket_max_price,
+        correlated_exact_bucket_min_agreement=args.correlated_exact_bucket_min_agreement,
+        exact_bucket_max_width_f=args.exact_bucket_max_width_f,
+        min_price=args.min_price,
+        yes_side_min_price=args.yes_side_min_price,
+        allow_no_side_entries=args.allow_no_side_entries,
+        no_side_min_edge=args.no_side_min_edge,
+        no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
+        no_side_max_price=args.no_side_max_price,
+        no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        min_signal_fair_value=args.min_signal_fair_value,
+        allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        max_price=args.max_price,
+        hold_min_model_agreement=args.hold_min_model_agreement,
+        hold_min_fair_value=args.hold_min_fair_value,
+        hold_market_confirmation_price=args.hold_market_confirmation_price,
+        hold_market_confirmation_min_fair_value=args.hold_market_confirmation_min_fair_value,
+        preserve_valid_holds=not args.trim_valid_holds_to_kelly_target,
         same_day_earliest_entry_hour_local=args.same_day_entry_start_hour,
         same_day_latest_entry_hour_local=args.same_day_entry_cutoff_hour,
         enforce_entry_timing_filter=not args.allow_late_same_day and not fixture_mode,
@@ -300,18 +622,37 @@ def run_paper(args: argparse.Namespace) -> int:
                         quote_error_count += 1
                         skipped_markets.append({"question": market.question, "reason": f"quote: {str(error)[:300]}"})
         scored = score_outcomes(market, consensus, quotes_by_token=quotes, settings=signal_settings)
+        if signal_settings.allow_no_side_entries:
+            no_scored, no_quote_errors = _no_side_scored_outcomes(
+                market,
+                raw,
+                scored,
+                clob_client=clob_client,
+                settings=signal_settings,
+                fixture_mode=fixture_mode,
+            )
+            quote_error_count += no_quote_errors
+            scored.extend(no_scored)
         all_scored.extend(scored)
         processed_markets += 1
         if args.progress_every > 0 and processed_markets % args.progress_every == 0:
             _progress(f"markets_scored={processed_markets} outcomes_scored={len(all_scored)} elapsed_seconds={time.monotonic() - started:.1f}")
     all_signals: list[TradeSignal] = signals_from_scored_outcomes(all_scored, settings=signal_settings)
+    scored_detail = [_scored_to_json(outcome, signal_settings) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)]
+    signal_filter_counts = _signal_filter_counts(all_scored, signal_settings)
+    coverage_diagnostics = _paper_coverage_diagnostics(all_scored, markets_to_process, skipped_markets)
 
     score_rows = ledger.record_forecast_scores(all_scored)
+    sizing_bankroll_usd = round(ledger.equity_usd(args.bankroll_usd), 2) if args.compound_kelly_sizing else args.bankroll_usd
     executions = ledger.rebalance_kelly(
         all_scored,
-        bankroll_usd=args.bankroll_usd,
+        bankroll_usd=sizing_bankroll_usd,
         kelly_fraction=args.kelly_fraction,
         max_position_usd=args.max_position_usd,
+        max_position_fraction=args.max_position_fraction,
+        kelly_market_blend=args.kelly_market_blend,
+        edge_position_full_cap_edge=args.edge_position_full_cap_edge,
+        edge_position_min_multiplier=args.edge_position_min_multiplier,
         min_trade_usd=args.min_trade_usd,
         min_edge=args.min_edge,
         min_model_count=args.min_model_count,
@@ -320,6 +661,7 @@ def run_paper(args: argparse.Namespace) -> int:
         high_confidence_min_kelly_edge=args.high_confidence_min_kelly_edge,
         min_price=signal_settings.min_price,
         max_price=signal_settings.max_price,
+        settings=signal_settings,
     )
     rows = ledger.record_signals(
         all_signals,
@@ -351,6 +693,12 @@ def run_paper(args: argparse.Namespace) -> int:
             "runtime_limited": runtime_limited,
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "weights_file": args.weights_file if source_weights or model_weights else None,
+            "compound_kelly_sizing": args.compound_kelly_sizing,
+            "sizing_bankroll_usd": sizing_bankroll_usd,
+            "max_position_fraction": args.max_position_fraction,
+            "kelly_market_blend": args.kelly_market_blend,
+            "edge_position_full_cap_edge": args.edge_position_full_cap_edge,
+            "edge_position_min_multiplier": args.edge_position_min_multiplier,
             "run_log_path": str(run_log_path) if run_log_path is not None else None,
         },
     )
@@ -374,6 +722,7 @@ def run_paper(args: argparse.Namespace) -> int:
         "runtime_limited": runtime_limited,
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "bankroll_usd": args.bankroll_usd,
+        "sizing_bankroll_usd": sizing_bankroll_usd,
         "equity_usd": round(equity, 2),
         "pnl_usd": round(equity - args.bankroll_usd, 2),
         "open_positions": len(ledger.positions()),
@@ -381,9 +730,16 @@ def run_paper(args: argparse.Namespace) -> int:
         "weights_file": args.weights_file if source_weights or model_weights else None,
         "source_weights_loaded": len(source_weights),
         "model_weights_loaded": len(model_weights),
+        "compound_kelly_sizing": args.compound_kelly_sizing,
+        "max_position_fraction": args.max_position_fraction,
+        "kelly_market_blend": args.kelly_market_blend,
+        "edge_position_full_cap_edge": args.edge_position_full_cap_edge,
+        "edge_position_min_multiplier": args.edge_position_min_multiplier,
         "run_log_path": str(run_log_path) if run_log_path is not None else None,
         "top_signals": [_signal_to_json(signal) for signal in all_signals[:10]],
-        "top_scored_outcomes": [_scored_to_json(outcome) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)[:10]],
+        "top_scored_outcomes": scored_detail[:10],
+        "signal_filter_counts": signal_filter_counts,
+        "coverage_diagnostics": coverage_diagnostics,
         "skipped_market_examples": skipped_markets[:10],
     }
     if run_log_path is not None:
@@ -393,11 +749,21 @@ def run_paper(args: argparse.Namespace) -> int:
                 **summary,
                 "signal_settings": _signal_settings_to_json(signal_settings),
                 "cli_args": _paper_args_to_json(args),
+                "run_log_schema_version": 2,
+                "data_provenance": {
+                    "polymarket_market_source": "Gamma active events plus public-search",
+                    "polymarket_quote_source": "CLOB live order book midpoint for YES and explicit NO tokens",
+                    "forecast_source": "Open-Meteo live forecast APIs via weather_strategy.weather.OpenMeteoClient",
+                    "observation_source": "ObservedHighClient current/final observations when enabled",
+                    "execution_mode": "paper-only Kelly ledger; no real orders are sent",
+                },
                 "source_weights": {key: round(value, 6) for key, value in sorted(source_weights.items())},
                 "model_weights": {key: round(value, 6) for key, value in sorted(model_weights.items())},
                 "signals_detail": [_signal_to_json(signal) for signal in all_signals],
-                "scored_outcomes_detail": [_scored_to_json(outcome) for outcome in sorted(all_scored, key=lambda item: item.edge, reverse=True)],
+                "scored_outcomes_detail": scored_detail,
                 "skipped_markets_detail": skipped_markets,
+                "signal_filter_counts": signal_filter_counts,
+                "coverage_diagnostics": coverage_diagnostics,
                 "positions_after_run": ledger.positions(),
             },
         )
@@ -409,7 +775,78 @@ def _make_run_log_path(log_dir: str, prefix: str) -> Path:
     directory = Path(log_dir)
     directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return directory / f"{timestamp}-{prefix}.json"
+    return directory / f"{timestamp}-{time.time_ns()}-{prefix}.json"
+
+
+def _signal_filter_counts(scored_outcomes: Iterable[ScoredOutcome], settings: SignalSettings) -> dict[str, int]:
+    counts = Counter()
+    for outcome in scored_outcomes:
+        counts[signal_filter_reason(outcome, settings) or "eligible"] += 1
+    return dict(sorted(counts.items()))
+
+
+def _paper_coverage_diagnostics(
+    scored_outcomes: Iterable[ScoredOutcome],
+    markets_to_process: Iterable[tuple[WeatherMarket, dict[str, Any]]],
+    skipped_markets: Iterable[dict[str, str]],
+) -> dict[str, Any]:
+    scored = list(scored_outcomes)
+    skipped = list(skipped_markets)
+    return {
+        "scored_by_city": _counter_dict(outcome.city for outcome in scored),
+        "scored_by_target_date": _counter_dict(outcome.target_date.isoformat() if outcome.target_date else "unknown" for outcome in scored),
+        "scored_by_local_lead_days": _counter_dict(_local_lead_days_for_outcome(outcome) for outcome in scored),
+        "skipped_reason_counts": _counter_dict(item.get("reason") or "unknown" for item in skipped),
+        "processed_market_contexts": [_market_context(market) for market, _ in markets_to_process],
+    }
+
+
+def _counter_dict(values: Iterable[Any]) -> dict[str, int]:
+    counts = Counter(str(value) for value in values if value is not None)
+    return dict(sorted(counts.items()))
+
+
+def _market_context(market: WeatherMarket, now: Optional[datetime] = None) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    context = _market_to_json(market)
+    context["run_time_utc"] = current.isoformat()
+    if market.city is None or market.target_date is None:
+        context["local_time"] = None
+        context["local_date"] = None
+        context["local_lead_days"] = None
+        return context
+    try:
+        timezone_info = ZoneInfo(market.city.timezone)
+    except ZoneInfoNotFoundError:
+        context["local_time"] = None
+        context["local_date"] = None
+        context["local_lead_days"] = None
+        return context
+    local_now = current.astimezone(timezone_info)
+    context["timezone"] = market.city.timezone
+    context["local_time"] = local_now.isoformat()
+    context["local_date"] = local_now.date().isoformat()
+    context["local_hour"] = round(local_now.hour + local_now.minute / 60 + local_now.second / 3600, 4)
+    context["local_lead_days"] = (market.target_date - local_now.date()).days
+    return context
+
+
+def _local_lead_days_for_outcome(outcome: ScoredOutcome, now: Optional[datetime] = None) -> Optional[int]:
+    if outcome.target_date is None:
+        return None
+    city = find_city(outcome.city)
+    if city is None:
+        return None
+    current = now or outcome.generated_at or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    try:
+        local_date = current.astimezone(ZoneInfo(city.timezone)).date()
+    except ZoneInfoNotFoundError:
+        return None
+    return (outcome.target_date - local_date).days
 
 
 def _write_json_log(path: Path, payload: dict[str, Any]) -> None:
@@ -433,10 +870,30 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "default_size_usd": settings.default_size_usd,
         "max_price": settings.max_price,
         "min_price": settings.min_price,
+        "yes_side_min_price": settings.yes_side_min_price,
+        "min_signal_fair_value": settings.min_signal_fair_value,
+        "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+        "allow_no_side_entries": settings.allow_no_side_entries,
+        "no_side_min_edge": settings.no_side_min_edge,
+        "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,
+        "no_side_max_price": settings.no_side_max_price,
+        "no_side_max_counter_event_probability": settings.no_side_max_counter_event_probability,
+        "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,
+        "hold_min_model_agreement": settings.hold_min_model_agreement,
+        "hold_min_fair_value": settings.hold_min_fair_value,
+        "hold_market_confirmation_price": settings.hold_market_confirmation_price,
+        "hold_market_confirmation_min_fair_value": settings.hold_market_confirmation_min_fair_value,
+        "preserve_valid_holds": settings.preserve_valid_holds,
         "high_confidence_price_threshold": settings.high_confidence_price_threshold,
         "high_confidence_min_kelly_edge": settings.high_confidence_min_kelly_edge,
+        "low_price_exact_bucket_threshold": settings.low_price_exact_bucket_threshold,
+        "low_price_exact_bucket_min_fair_value": settings.low_price_exact_bucket_min_fair_value,
+        "low_price_exact_bucket_min_edge": settings.low_price_exact_bucket_min_edge,
+        "correlated_exact_bucket_max_price": settings.correlated_exact_bucket_max_price,
+        "correlated_exact_bucket_min_agreement": settings.correlated_exact_bucket_min_agreement,
+        "exact_bucket_max_width_f": settings.exact_bucket_max_width_f,
         "enforce_entry_timing_filter": settings.enforce_entry_timing_filter,
         "same_day_earliest_entry_hour_local": settings.same_day_earliest_entry_hour_local,
         "same_day_latest_entry_hour_local": settings.same_day_latest_entry_hour_local,
@@ -457,6 +914,54 @@ def _deadline_exceeded(deadline: Optional[float]) -> bool:
 
 def _progress(message: str) -> None:
     print(f"[weather-paper-run] {message}", file=sys.stderr, flush=True)
+
+
+def _no_side_scored_outcomes(
+    market: WeatherMarket,
+    raw: dict[str, Any],
+    scored: list[ScoredOutcome],
+    *,
+    clob_client: PolymarketClobClient,
+    settings: SignalSettings,
+    fixture_mode: bool,
+) -> tuple[list[ScoredOutcome], int]:
+    if len(scored) != 1:
+        return [], 0
+    no_token_id, no_raw_price = _binary_no_token_and_price(raw)
+    if no_token_id is None:
+        return [], 0
+    no_price = no_raw_price
+    quote_errors = 0
+    if not fixture_mode:
+        try:
+            quote = clob_client.fetch_order_book_quote(no_token_id)
+            no_price = quote.mid if quote.mid is not None else no_price
+        except RuntimeError:
+            quote_errors += 1
+    if no_price is None:
+        return [], quote_errors
+    return [invert_binary_scored_outcome(scored[0], settings, token_id=no_token_id, market_price=no_price)], quote_errors
+
+
+def _binary_no_token_and_price(raw: dict[str, Any]) -> tuple[Optional[str], Optional[float]]:
+    try:
+        outcomes = [str(item).lower() for item in parse_jsonish_list(raw.get("outcomes"))]
+        token_ids = [str(item) if item is not None else None for item in parse_jsonish_list(raw.get("clobTokenIds") or raw.get("clob_token_ids"))]
+        prices = parse_jsonish_list(raw.get("outcomePrices") or raw.get("outcome_prices"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, None
+    if "yes" not in outcomes or "no" not in outcomes:
+        return None, None
+    no_index = outcomes.index("no")
+    if no_index >= len(token_ids):
+        return None, None
+    price = None
+    if no_index < len(prices):
+        try:
+            price = float(prices[no_index])
+        except (TypeError, ValueError):
+            price = None
+    return token_ids[no_index], price
 
 
 def _should_process_market(
@@ -509,7 +1014,34 @@ def _parse_markets(raw_markets: Iterable[Any], already_parsed: bool) -> Iterable
             continue
         market = parse_weather_market(raw)
         if market is not None:
+            market = _market_with_resolution_station(market, raw)
             yield market, raw
+
+
+def _market_with_resolution_station(market: WeatherMarket, raw: dict[str, Any]) -> WeatherMarket:
+    if market.city is None:
+        return market
+    station = _resolution_station(raw)
+    if station is None:
+        return market
+    return replace(market, city=city_with_station_coordinates(market.city, station))
+
+
+def _resolution_station(raw: dict[str, Any]) -> Optional[str]:
+    text = " ".join(
+        str(raw.get(key) or "")
+        for key in ("resolutionSource", "description", "rules", "eventDescription")
+    )
+    patterns = (
+        r"[?&]site=([A-Z0-9]{4})\b",
+        r"/history/daily/[^/\s]+/[^/\s]+/([A-Z0-9]{4})\b",
+        r"\b([A-Z]{4})\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return match.group(1).upper()
+    return None
 
 
 def _distributions_for_market(market: WeatherMarket, raw: dict[str, Any], weather_client: OpenMeteoClient) -> tuple[ForecastDistribution, ...]:
@@ -591,18 +1123,36 @@ def _signal_to_json(signal: TradeSignal) -> dict[str, Any]:
     }
 
 
-def _scored_to_json(outcome) -> dict[str, Any]:
+def _scored_to_json(outcome, settings: Optional[SignalSettings] = None) -> dict[str, Any]:
+    filter_reason = signal_filter_reason(outcome, settings)
     return {
+        "market_id": outcome.market_id,
+        "market_slug": outcome.market_slug,
+        "token_id": outcome.token_id,
         "question": outcome.question,
         "bucket": outcome.bucket_label,
+        "city": outcome.city,
+        "target_date": outcome.target_date.isoformat() if outcome.target_date else None,
+        "generated_at": outcome.generated_at.isoformat() if outcome.generated_at else None,
+        "side": "NO" if str(outcome.bucket_label).startswith("NO: ") else "YES",
+        "bucket_lower_f": outcome.bucket_lower_f,
+        "bucket_upper_f": outcome.bucket_upper_f,
+        "bucket_width_f": outcome.bucket_width_f,
+        "resolution_unit": outcome.resolution_unit,
+        "resolution_precision": outcome.resolution_precision,
         "fair_value_probability": outcome.fair_value,
         "market_probability": outcome.market_price,
         "edge_after_buffer": outcome.edge,
         "model_agreement": outcome.model_agreement,
         "model_count": outcome.model_count,
         "probability_stdev": outcome.probability_stdev,
+        "timing_entry_eligible": outcome.entry_eligible,
         "entry_eligible": outcome.entry_eligible,
         "entry_filter_reason": outcome.entry_filter_reason,
+        "passes_signal_filter": filter_reason is None,
+        "signal_eligible": filter_reason is None,
+        "trade_eligible": filter_reason is None,
+        "signal_filter_reason": filter_reason,
         "observed_high_f": outcome.observed_high_f,
         "observation_source": outcome.observation_source,
         "observation_final": outcome.observation_final,

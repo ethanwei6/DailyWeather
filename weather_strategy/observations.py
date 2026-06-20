@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
+import io
 from dataclasses import dataclass
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -24,6 +26,7 @@ class ObservedHigh:
 class ObservedHighClient:
     NWS_URL = "https://api.weather.gov"
     AVIATION_WEATHER_URL = "https://aviationweather.gov/api/data/metar"
+    IEM_ASOS_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
     OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -43,12 +46,20 @@ class ObservedHighClient:
                 return nws
         metar_station = city.metar_station or city.nws_station
         if metar_station:
-            try:
-                metar = self._fetch_metar_station_high(city, metar_station, target_date, local_now)
-            except RuntimeError:
-                metar = None
-            if metar is not None:
-                return metar
+            if target_date >= local_now.date() - timedelta(days=2):
+                try:
+                    metar = self._fetch_metar_station_high(city, metar_station, target_date, local_now)
+                except RuntimeError:
+                    metar = None
+                if metar is not None:
+                    return metar
+            if target_date < local_now.date():
+                try:
+                    historical_metar = self._fetch_historical_metar_station_high(city, metar_station, target_date, local_now)
+                except RuntimeError:
+                    historical_metar = None
+                if historical_metar is not None:
+                    return historical_metar
         if target_date < local_now.date():
             try:
                 archive = self._fetch_open_meteo_archive_high(city, target_date, local_now)
@@ -58,6 +69,24 @@ class ObservedHighClient:
                 return archive
         try:
             return self._fetch_open_meteo_proxy_high(city, target_date, local_now)
+        except RuntimeError:
+            return None
+
+    def fetch_historical_station_high(
+        self,
+        city: CityConfig,
+        station_id: str,
+        target_date: date,
+        now: Optional[datetime] = None,
+    ) -> Optional[ObservedHigh]:
+        local_now = _local_now(city, now)
+        if target_date >= local_now.date():
+            try:
+                return self._fetch_metar_station_high(city, station_id, target_date, local_now)
+            except RuntimeError:
+                return None
+        try:
+            return self._fetch_historical_metar_station_high(city, station_id, target_date, local_now)
         except RuntimeError:
             return None
 
@@ -119,6 +148,59 @@ class ObservedHighClient:
             target_date=target_date,
             max_temperature_f=max_temperature,
             source=f"metar_{station_id}",
+            observed_at=observed_at,
+            sample_count=len(temperatures),
+            is_actual=True,
+            is_final=target_date < local_now.date(),
+        )
+
+    def _fetch_historical_metar_station_high(self, city: CityConfig, station_id: str, target_date: date, local_now: datetime) -> Optional[ObservedHigh]:
+        end_date = target_date + timedelta(days=1)
+        payload = self.http.get_text(
+            self.IEM_ASOS_URL,
+            params={
+                "station": station_id,
+                "data": "tmpf",
+                "year1": target_date.year,
+                "month1": target_date.month,
+                "day1": target_date.day,
+                "year2": end_date.year,
+                "month2": end_date.month,
+                "day2": end_date.day,
+                "tz": city.timezone,
+                "format": "onlycomma",
+                "latlon": "no",
+                "elev": "no",
+                "missing": "M",
+                "trace": "T",
+                "direct": "no",
+                "report_type": ("1", "2"),
+            },
+            headers={"Accept": "text/csv,text/plain,*/*"},
+        )
+        timezone_info = _zoneinfo(city)
+        temperatures: list[tuple[float, datetime]] = []
+        for row in csv.DictReader(io.StringIO(payload)):
+            valid = row.get("valid")
+            value = row.get("tmpf")
+            if not valid or value in (None, "", "M"):
+                continue
+            try:
+                observed_local = datetime.fromisoformat(valid).replace(tzinfo=timezone_info)
+                temperature_f = float(value)
+            except ValueError:
+                continue
+            if observed_local.date() != target_date or observed_local > local_now:
+                continue
+            temperatures.append((temperature_f, observed_local.astimezone(timezone.utc)))
+        if not temperatures:
+            return None
+        max_temperature, observed_at = max(temperatures, key=lambda item: item[0])
+        return ObservedHigh(
+            city=city,
+            target_date=target_date,
+            max_temperature_f=max_temperature,
+            source=f"historical_metar_{station_id}",
             observed_at=observed_at,
             sample_count=len(temperatures),
             is_actual=True,

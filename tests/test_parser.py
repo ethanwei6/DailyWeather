@@ -63,6 +63,41 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(len(parsed.buckets), 1)
         self.assertEqual(parsed.buckets[0].lower_f, 80)
 
+    def test_resolution_precision_rounds_to_market_unit(self) -> None:
+        raw = {
+            "id": "123",
+            "question": "Will the highest temperature in Chicago be between 70-71°F on June 17?",
+            "slug": "highest-temperature-in-chicago-on-june-17-2026-70-71f",
+            "eventTitle": "Highest temperature in Chicago on June 17?",
+            "description": "The resolution source for this market measures temperatures to whole degrees Fahrenheit.",
+            "outcomes": '["Yes", "No"]',
+        }
+        parsed = parse_weather_market(raw, today=date(2026, 6, 4))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        bucket = parsed.buckets[0]
+        self.assertEqual(bucket.resolution_unit, "F")
+        self.assertEqual(bucket.resolution_precision, 1.0)
+        self.assertTrue(bucket.contains(69.98))
+        self.assertFalse(bucket.contains(72.49))
+
+    def test_celsius_resolution_precision_rounds_in_celsius(self) -> None:
+        raw = {
+            "id": "123",
+            "question": "Will the highest temperature in Shenzhen be 26°C on June 18?",
+            "slug": "highest-temperature-in-shenzhen-on-june-18-2026-26c",
+            "eventTitle": "Highest temperature in Shenzhen on June 18?",
+            "description": "The resolution source for this market measures temperatures to whole degrees Celsius.",
+            "outcomes": '["Yes", "No"]',
+        }
+        parsed = parse_weather_market(raw, today=date(2026, 6, 4))
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        bucket = parsed.buckets[0]
+        self.assertEqual(bucket.resolution_unit, "C")
+        self.assertTrue(bucket.contains(79.6))
+        self.assertFalse(bucket.contains(80.6))
+
     def test_short_city_alias_does_not_match_inside_words(self) -> None:
         raw = {
             "id": "beijing",

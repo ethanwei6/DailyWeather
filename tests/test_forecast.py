@@ -67,6 +67,13 @@ class ForecastTest(unittest.TestCase):
         self.assertEqual(consensus["80 or above"].model_count, 1)
         self.assertGreater(consensus["80 or above"].fair_value, 0.5)
 
+    def test_historical_single_run_source_weights_are_calibrated_for_long_replay(self) -> None:
+        weights = ConsensusForecastEngine().source_weights
+
+        self.assertEqual(weights["single_run_best_match"], 1.50)
+        self.assertEqual(weights["single_run_ecmwf_ifs025"], 1.30)
+        self.assertEqual(weights["single_run_gfs_global"], 0.70)
+
     def test_empirical_singleton_forecast_is_smoothed_not_point_mass(self) -> None:
         city = DEFAULT_CITIES[0]
         distribution = ForecastDistribution(
@@ -217,6 +224,63 @@ class ForecastTest(unittest.TestCase):
         self.assertTrue(observed.is_actual)
         self.assertAlmostEqual(observed.max_temperature_f, 77.0)
         self.assertEqual(observed.sample_count, 2)
+
+    def test_historical_metar_station_high_uses_station_archive(self) -> None:
+        city = DEFAULT_CITIES[17]
+
+        class FakeHttp:
+            def __init__(self):
+                self.params = None
+
+            def get_text(self, url, params=None, headers=None):
+                self.params = params
+                return "\n".join(
+                    (
+                        "station,valid,tmpf",
+                        "ZBAA,2026-06-04 00:00,62.60",
+                        "ZBAA,2026-06-04 14:00,82.40",
+                        "ZBAA,2026-06-05 00:00,90.00",
+                    )
+                )
+
+        fake_http = FakeHttp()
+        observed = ObservedHighClient(fake_http)._fetch_historical_metar_station_high(
+            city,
+            "ZBAA",
+            date(2026, 6, 4),
+            datetime(2026, 6, 5, 12, 0, tzinfo=timezone.utc),
+        )
+        assert observed is not None
+        self.assertTrue(observed.is_actual)
+        self.assertTrue(observed.is_final)
+        self.assertEqual(observed.source, "historical_metar_ZBAA")
+        self.assertAlmostEqual(observed.max_temperature_f, 82.4)
+        self.assertEqual(observed.sample_count, 2)
+        self.assertEqual(fake_http.params["tz"], "Asia/Shanghai")
+
+    def test_fetch_observed_high_prefers_historical_metar_over_archive_for_past_station_day(self) -> None:
+        city = DEFAULT_CITIES[17]
+
+        class FakeHttp:
+            def get_text(self, url, params=None, headers=None):
+                return "\n".join(
+                    (
+                        "station,valid,tmpf",
+                        "ZBAA,2026-06-04 06:00,82.40",
+                    )
+                )
+
+            def get_json(self, url, params=None, headers=None):
+                raise AssertionError("Open-Meteo archive should not be used when historical METAR is available")
+
+        observed = ObservedHighClient(FakeHttp()).fetch_observed_high(
+            city,
+            date(2026, 6, 4),
+            now=datetime(2026, 6, 7, 12, 0, tzinfo=timezone.utc),
+        )
+        assert observed is not None
+        self.assertEqual(observed.source, "historical_metar_ZBAA")
+        self.assertAlmostEqual(observed.max_temperature_f, 82.4)
 
     def test_archive_high_resolves_final_historical_day(self) -> None:
         city = DEFAULT_CITIES[0]

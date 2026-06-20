@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 from weather_strategy.http import HttpClient
 from weather_strategy.models import OrderBookQuote
 from weather_strategy.parser import looks_like_temperature_market, parse_weather_market
+
+
+@dataclass(frozen=True)
+class PriceHistoryPoint:
+    timestamp: datetime
+    price: float
 
 
 class PolymarketGammaClient:
@@ -34,11 +41,15 @@ class PolymarketGammaClient:
 
     def discover_temperature_markets(self, limit: int = 100, pages: int = 1, request_limit: int = 50) -> list[Any]:
         parsed = []
+        errors = []
+        successful_requests = 0
         request_limit = max(1, min(request_limit, 50))
         for page in range(pages):
             try:
                 events = self.fetch_active_events(limit=request_limit, offset=page * request_limit)
-            except RuntimeError:
+                successful_requests += 1
+            except RuntimeError as error:
+                errors.append(str(error))
                 events = []
             for raw_market in _iter_event_markets(events):
                 if raw_market.get("closed") is True:
@@ -51,8 +62,12 @@ class PolymarketGammaClient:
         for query in _temperature_search_queries():
             try:
                 parsed.extend(self.search_temperature_markets(query=query, limit=request_limit, pages=pages))
-            except RuntimeError:
+                successful_requests += 1
+            except RuntimeError as error:
+                errors.append(str(error))
                 continue
+        if successful_requests == 0 and errors:
+            raise RuntimeError(f"Polymarket Gamma discovery failed for all requests: {errors[0][:500]}")
         return _dedupe_markets(parsed)
 
     def public_search(self, query: str, limit: int = 50, page: int = 1) -> dict[str, Any]:
@@ -70,12 +85,12 @@ class PolymarketGammaClient:
             raise ValueError("Unexpected Gamma public-search response shape")
         return payload
 
-    def search_temperature_markets(self, query: str = "highest temperature", limit: int = 50, pages: int = 1) -> list[Any]:
+    def search_temperature_markets(self, query: str = "highest temperature", limit: int = 50, pages: int = 1, include_closed: bool = False) -> list[Any]:
         parsed = []
         for page in range(1, pages + 1):
             payload = self.public_search(query=query, limit=limit, page=page)
             for raw_market in _iter_event_markets(payload.get("events") or []):
-                if raw_market.get("closed") is True:
+                if raw_market.get("closed") is True and not include_closed:
                     continue
                 if not looks_like_temperature_market(raw_market):
                     continue
@@ -94,6 +109,40 @@ class PolymarketClobClient:
     def fetch_order_book_quote(self, token_id: str) -> OrderBookQuote:
         payload = self.http.get_json(f"{self.BASE_URL}/book", params={"token_id": token_id})
         return parse_orderbook_quote(token_id, payload)
+
+    def fetch_price_history(
+        self,
+        token_id: str,
+        *,
+        interval: str = "max",
+        fidelity: int = 60,
+        start_ts: Optional[int] = None,
+        end_ts: Optional[int] = None,
+    ) -> list[PriceHistoryPoint]:
+        params: dict[str, Any] = {"market": token_id, "interval": interval, "fidelity": fidelity}
+        if start_ts is not None:
+            params["startTs"] = int(start_ts)
+        if end_ts is not None:
+            params["endTs"] = int(end_ts)
+        payload = self.http.get_json(
+            f"{self.BASE_URL}/prices-history",
+            params=params,
+        )
+        history = payload.get("history") if isinstance(payload, dict) else None
+        if not isinstance(history, list):
+            raise ValueError("Unexpected CLOB price history response shape")
+        points: list[PriceHistoryPoint] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = datetime.fromtimestamp(float(item["t"]), tz=timezone.utc)
+                price = float(item["p"])
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
+            if 0.0 <= price <= 1.0:
+                points.append(PriceHistoryPoint(timestamp=timestamp, price=price))
+        return sorted(points, key=lambda point: point.timestamp)
 
 
 def parse_orderbook_quote(token_id: str, payload: dict[str, Any]) -> OrderBookQuote:

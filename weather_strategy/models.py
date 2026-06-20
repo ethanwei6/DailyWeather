@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
+import math
 from typing import Any, Optional
 
 
@@ -34,13 +35,26 @@ class TemperatureBucket:
     upper_f: Optional[float]
     token_id: Optional[str] = None
     market_price: Optional[float] = None
+    resolution_unit: Optional[str] = None
+    resolution_precision: Optional[float] = None
 
     def contains(self, value_f: float) -> bool:
-        if self.lower_f is not None and value_f < self.lower_f:
+        resolved_value = self.resolution_value_f(value_f)
+        if self.lower_f is not None and resolved_value < self.lower_f:
             return False
-        if self.upper_f is not None and value_f > self.upper_f:
+        if self.upper_f is not None and resolved_value > self.upper_f:
             return False
         return True
+
+    def resolution_value_f(self, value_f: float) -> float:
+        if self.resolution_precision is None or self.resolution_precision <= 0:
+            return value_f
+        unit = (self.resolution_unit or "F").upper()
+        if unit == "C":
+            value_c = (value_f - 32) * 5 / 9
+            rounded_c = _round_to_precision(value_c, self.resolution_precision)
+            return rounded_c * 9 / 5 + 32
+        return _round_to_precision(value_f, self.resolution_precision)
 
 
 @dataclass(frozen=True)
@@ -166,6 +180,11 @@ class ScoredOutcome:
     observation_final: bool = False
     observation_adjusted: bool = False
     observed_outcome: Optional[int] = None
+    bucket_lower_f: Optional[float] = None
+    bucket_upper_f: Optional[float] = None
+    bucket_width_f: Optional[float] = None
+    resolution_unit: Optional[str] = None
+    resolution_precision: Optional[float] = None
 
 
 def _source_probability_views(model_probabilities: dict[str, float]) -> dict[str, float]:
@@ -178,3 +197,10 @@ def _source_probability_views(model_probabilities: dict[str, float]) -> dict[str
         for source, values in grouped.items()
         if values
     }
+
+
+def _round_to_precision(value: float, precision: float) -> float:
+    scaled = value / precision
+    if scaled >= 0:
+        return math.floor(scaled + 0.5) * precision
+    return math.ceil(scaled - 0.5) * precision

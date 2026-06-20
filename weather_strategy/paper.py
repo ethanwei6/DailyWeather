@@ -12,6 +12,7 @@ from weather_strategy.cities import find_city
 from weather_strategy.models import ScoredOutcome, TradeSignal
 from weather_strategy.observations import ObservedHighClient
 from weather_strategy.parser import parse_temperature_bucket
+from weather_strategy.signals import SignalSettings, hold_filter_reason, signal_filter_reason
 
 
 SCHEMA = """
@@ -243,26 +244,41 @@ class PaperLedger:
         bankroll_usd: float,
         kelly_fraction: float = 0.25,
         max_position_usd: float = 50.0,
+        max_position_fraction: Optional[float] = None,
+        kelly_market_blend: float = 0.0,
+        edge_position_full_cap_edge: float = 0.0,
+        edge_position_min_multiplier: float = 0.35,
         min_trade_usd: float = 1.0,
         min_edge: float = 0.08,
         min_model_count: int = 3,
-        min_model_agreement: float = 0.65,
+        min_model_agreement: float = 1.0,
         high_confidence_price_threshold: float = 0.75,
         high_confidence_min_kelly_edge: float = 0.02,
-        min_price: float = 0.05,
+        min_price: float = 0.125,
+        yes_side_min_price: float = 0.20,
+        no_side_max_price: float = 0.95,
+        no_side_max_counter_event_probability: float = 0.10,
+        hold_no_side_max_counter_event_probability: float = 0.15,
+        min_signal_fair_value: float = 0.70,
         max_price: float = 0.95,
+        settings: Optional[SignalSettings] = None,
     ) -> int:
         scored = [outcome for outcome in scored_outcomes if outcome.token_id]
-        selected_entry_tokens = self._selected_entry_tokens(
-            scored,
-            min_edge,
-            min_model_count,
-            min_model_agreement,
-            high_confidence_price_threshold,
-            high_confidence_min_kelly_edge,
-            min_price,
-            max_price,
+        settings = settings or SignalSettings(
+            min_edge=min_edge,
+            min_model_count=min_model_count,
+            min_model_agreement=min_model_agreement,
+            high_confidence_price_threshold=high_confidence_price_threshold,
+            high_confidence_min_kelly_edge=high_confidence_min_kelly_edge,
+            min_price=min_price,
+            yes_side_min_price=yes_side_min_price,
+            no_side_max_price=no_side_max_price,
+            no_side_max_counter_event_probability=no_side_max_counter_event_probability,
+            hold_no_side_max_counter_event_probability=hold_no_side_max_counter_event_probability,
+            min_signal_fair_value=min_signal_fair_value,
+            max_price=max_price,
         )
+        selected_entry_tokens = self._selected_entry_tokens(scored, settings)
         executions = 0
         with sqlite3.connect(str(self.path)) as conn:
             conn.row_factory = sqlite3.Row
@@ -271,24 +287,26 @@ class PaperLedger:
                 current = conn.execute("SELECT * FROM paper_positions WHERE token_id = ?", (outcome.token_id,)).fetchone()
                 current_shares = float(current["shares"]) if current else 0.0
                 current_notional = current_shares * outcome.market_price
+                hold_eligible = current_shares > 0 and self._is_hold_eligible(outcome, settings)
                 target_notional = 0.0
                 if outcome.token_id in selected_entry_tokens:
-                    target_notional = self._kelly_target_notional(outcome, bankroll_usd, kelly_fraction, max_position_usd)
+                    target_notional = self._kelly_target_notional(
+                        outcome,
+                        bankroll_usd,
+                        kelly_fraction,
+                        max_position_usd,
+                        max_position_fraction,
+                        kelly_market_blend,
+                        edge_position_full_cap_edge,
+                        edge_position_min_multiplier,
+                    )
+                    if hold_eligible and settings.preserve_valid_holds:
+                        target_notional = max(target_notional, current_notional)
                 elif current_shares > 0:
                     if _is_expired_without_settlement(outcome):
                         target_notional = current_notional
-                    elif not outcome.entry_eligible and self._is_hold_eligible(
-                        outcome,
-                        min_edge,
-                        min_model_count,
-                        min_model_agreement,
-                        high_confidence_price_threshold,
-                        high_confidence_min_kelly_edge,
-                        min_price,
-                        max_price,
-                    ):
-                        hold_target = self._kelly_target_notional(outcome, bankroll_usd, kelly_fraction, max_position_usd)
-                        target_notional = min(current_notional, hold_target)
+                    elif hold_eligible:
+                        target_notional = current_notional
                 delta_notional = target_notional - current_notional
                 if target_notional <= 0 and current_shares > 0:
                     self._sell(conn, outcome, current, current_shares)
@@ -345,7 +363,8 @@ class PaperLedger:
             for position in positions:
                 city = find_city(str(position["city"]))
                 target = _parse_position_date(position["target_date"])
-                bucket = parse_temperature_bucket(str(position["bucket_label"]))
+                no_side = _is_no_side_position(position)
+                bucket = parse_temperature_bucket(_yes_bucket_label(str(position["bucket_label"])))
                 if city is None or target is None or bucket is None:
                     errors += 1
                     continue
@@ -358,7 +377,8 @@ class PaperLedger:
                 if observed is None or observed.max_temperature_f is None or not observed.is_final:
                     errors += 1
                     continue
-                payout_price = 1.0 if bucket.contains(observed.max_temperature_f) else 0.0
+                yes_payout = 1.0 if bucket.contains(observed.max_temperature_f) else 0.0
+                payout_price = 1.0 - yes_payout if no_side else yes_payout
                 shares = float(position["shares"])
                 cost_basis = float(position["cost_basis"])
                 notional = shares * payout_price
@@ -387,6 +407,7 @@ class PaperLedger:
                             {
                                 "observed_high_f": round(observed.max_temperature_f, 2),
                                 "observation_source": observed.source,
+                                "side": "NO" if no_side else "YES",
                                 "target_date": target.isoformat(),
                             },
                             sort_keys=True,
@@ -397,75 +418,57 @@ class PaperLedger:
         return settled, errors
 
     @staticmethod
-    def _kelly_target_notional(outcome: ScoredOutcome, bankroll_usd: float, kelly_fraction: float, max_position_usd: float) -> float:
+    def _kelly_target_notional(
+        outcome: ScoredOutcome,
+        bankroll_usd: float,
+        kelly_fraction: float,
+        max_position_usd: float,
+        max_position_fraction: Optional[float] = None,
+        kelly_market_blend: float = 0.0,
+        edge_position_full_cap_edge: float = 0.0,
+        edge_position_min_multiplier: float = 0.35,
+    ) -> float:
         price = max(0.0001, min(0.9999, outcome.market_price))
-        raw_fraction = max(0.0, (outcome.fair_value - price) / (1.0 - price))
+        sizing_fair_value = _blend_probability_with_market(outcome.fair_value, price, kelly_market_blend)
+        raw_fraction = max(0.0, (sizing_fair_value - price) / (1.0 - price))
         agreement_scaled = raw_fraction * max(0.0, min(1.0, outcome.model_agreement))
-        return min(max_position_usd, bankroll_usd * kelly_fraction * agreement_scaled)
+        return min(
+            _effective_max_position_usd(
+                bankroll_usd,
+                max_position_usd,
+                max_position_fraction,
+                edge=outcome.edge,
+                edge_position_full_cap_edge=edge_position_full_cap_edge,
+                edge_position_min_multiplier=edge_position_min_multiplier,
+            ),
+            bankroll_usd * kelly_fraction * agreement_scaled,
+        )
 
     @staticmethod
     def _is_trade_eligible(
         outcome: ScoredOutcome,
-        min_edge: float,
-        min_model_count: int,
-        min_model_agreement: float,
-        high_confidence_price_threshold: float,
-        high_confidence_min_kelly_edge: float,
-        min_price: float,
-        max_price: float,
+        settings: SignalSettings,
     ) -> bool:
-        return (
-            outcome.entry_eligible
-            and _passes_edge_gate(outcome.edge, outcome.market_price, min_edge, high_confidence_price_threshold, high_confidence_min_kelly_edge)
-            and outcome.model_count >= min_model_count
-            and outcome.model_agreement >= min_model_agreement
-            and min_price <= outcome.market_price <= max_price
-        )
+        return signal_filter_reason(outcome, settings) is None
 
     @staticmethod
     def _is_hold_eligible(
         outcome: ScoredOutcome,
-        min_edge: float,
-        min_model_count: int,
-        min_model_agreement: float,
-        high_confidence_price_threshold: float,
-        high_confidence_min_kelly_edge: float,
-        min_price: float,
-        max_price: float,
+        settings: SignalSettings,
     ) -> bool:
-        return (
-            _passes_edge_gate(outcome.edge, outcome.market_price, min_edge, high_confidence_price_threshold, high_confidence_min_kelly_edge)
-            and outcome.model_count >= min_model_count
-            and outcome.model_agreement >= min_model_agreement
-            and min_price <= outcome.market_price <= max_price
-        )
+        return hold_filter_reason(outcome, settings) is None
 
     @classmethod
     def _selected_entry_tokens(
         cls,
         scored: list[ScoredOutcome],
-        min_edge: float,
-        min_model_count: int,
-        min_model_agreement: float,
-        high_confidence_price_threshold: float,
-        high_confidence_min_kelly_edge: float,
-        min_price: float,
-        max_price: float,
+        settings: SignalSettings,
     ) -> set[str]:
         selected: dict[tuple[str, Optional[str]], ScoredOutcome] = {}
         for outcome in scored:
             if outcome.token_id is None:
                 continue
-            if not cls._is_trade_eligible(
-                outcome,
-                min_edge,
-                min_model_count,
-                min_model_agreement,
-                high_confidence_price_threshold,
-                high_confidence_min_kelly_edge,
-                min_price,
-                max_price,
-            ):
+            if not cls._is_trade_eligible(outcome, settings):
                 continue
             group_key = (outcome.city, outcome.target_date.isoformat() if outcome.target_date else None)
             current = selected.get(group_key)
@@ -544,6 +547,7 @@ class PaperLedger:
                         "observation_final": outcome.observation_final,
                         "observation_adjusted": outcome.observation_adjusted,
                         "observed_outcome": outcome.observed_outcome,
+                        "side": "NO" if _is_no_side_outcome(outcome) else "YES",
                         "model_probabilities": outcome.model_probabilities,
                     },
                     sort_keys=True,
@@ -597,6 +601,43 @@ def _log_loss(probability: float, outcome: int) -> float:
     return -math.log(1 - probability)
 
 
+def _effective_max_position_usd(
+    bankroll_usd: float,
+    max_position_usd: float,
+    max_position_fraction: Optional[float],
+    *,
+    edge: Optional[float] = None,
+    edge_position_full_cap_edge: float = 0.0,
+    edge_position_min_multiplier: float = 0.35,
+) -> float:
+    caps = [max(0.0, max_position_usd)]
+    if max_position_fraction is not None and max_position_fraction > 0:
+        caps.append(max(0.0, bankroll_usd * max_position_fraction))
+    base_cap = min(caps)
+    return _edge_scaled_position_cap(base_cap, edge, edge_position_full_cap_edge, edge_position_min_multiplier)
+
+
+def _edge_scaled_position_cap(
+    max_position_usd: float,
+    edge: Optional[float],
+    edge_position_full_cap_edge: float,
+    edge_position_min_multiplier: float,
+) -> float:
+    cap = max(0.0, max_position_usd)
+    if edge is None or edge_position_full_cap_edge <= 0:
+        return cap
+    edge_ratio = max(0.0, float(edge)) / max(0.0001, edge_position_full_cap_edge)
+    floor = max(0.0, min(1.0, edge_position_min_multiplier))
+    multiplier = max(floor, min(1.0, edge_ratio))
+    return cap * multiplier
+
+
+def _blend_probability_with_market(fair_value: float, market_price: float, market_blend: float) -> float:
+    blend = max(0.0, min(1.0, market_blend))
+    probability = fair_value * (1.0 - blend) + market_price * blend
+    return max(0.0, min(1.0, probability))
+
+
 def _parse_position_date(value: object) -> Optional[date]:
     if value is None:
         return None
@@ -606,18 +647,16 @@ def _parse_position_date(value: object) -> Optional[date]:
         return None
 
 
-def _passes_edge_gate(
-    edge: float,
-    market_price: float,
-    min_kelly_edge: float,
-    high_confidence_price_threshold: float,
-    high_confidence_min_kelly_edge: float,
-) -> bool:
-    required_kelly_edge = min_kelly_edge
-    if market_price >= high_confidence_price_threshold:
-        required_kelly_edge = min(required_kelly_edge, high_confidence_min_kelly_edge)
-    required_edge = required_kelly_edge * max(0.0001, 1.0 - market_price)
-    return edge >= required_edge
+def _is_no_side_outcome(outcome: ScoredOutcome) -> bool:
+    return outcome.bucket_label.startswith("NO: ") or outcome.question.startswith("NO: ")
+
+
+def _is_no_side_position(position: sqlite3.Row) -> bool:
+    return str(position["bucket_label"]).startswith("NO: ") or str(position["question"]).startswith("NO: ")
+
+
+def _yes_bucket_label(label: str) -> str:
+    return label.removeprefix("NO: ").strip()
 
 
 def _is_expired_without_settlement(outcome: ScoredOutcome) -> bool:

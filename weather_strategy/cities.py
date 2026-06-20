@@ -39,6 +39,57 @@ DEFAULT_CITIES: tuple[CityConfig, ...] = (
 )
 
 
+STATION_COORDINATES: dict[str, tuple[float, float]] = {
+    "KNYC": (40.7794, -73.9692),
+    "KLGA": (40.7769, -73.8740),
+    "KCQT": (34.0239, -118.2912),
+    "KMDW": (41.7868, -87.7522),
+    "KMIA": (25.7959, -80.2870),
+    "KAUS": (30.1945, -97.6699),
+    "KDAL": (32.8471, -96.8518),
+    "KHOU": (29.6454, -95.2789),
+    "KPHX": (33.4342, -112.0116),
+    "KPHL": (39.8744, -75.2424),
+    "KDCA": (38.8512, -77.0402),
+    "KBOS": (42.3656, -71.0096),
+    "KSFO": (37.6190, -122.3749),
+    "KSEA": (47.4502, -122.3088),
+    "KDEN": (39.8561, -104.6737),
+    "KLAS": (36.0840, -115.1537),
+    "RKSS": (37.5583, 126.7906),
+    "RKSI": (37.4602, 126.4407),
+    "RJTT": (35.5494, 139.7798),
+    "ZBAA": (40.0801, 116.5846),
+    "ZSSS": (31.1979, 121.3363),
+    "ZGGG": (23.3924, 113.2990),
+    "ZGSZ": (22.6393, 113.8107),
+    "RCSS": (25.0697, 121.5525),
+    "WSSS": (1.3644, 103.9915),
+    "UUEE": (55.9726, 37.4146),
+    "LFPG": (49.0097, 2.5479),
+    "EGLL": (51.4700, -0.4543),
+    "EDDB": (52.3667, 13.5033),
+    "LIRF": (41.8003, 12.2389),
+    "LEMD": (40.4983, -3.5676),
+    "YSSY": (-33.9399, 151.1753),
+}
+
+
+def city_with_station_coordinates(city: CityConfig, station: str) -> CityConfig:
+    station = station.upper()
+    latitude, longitude = STATION_COORDINATES.get(station, (city.latitude, city.longitude))
+    return CityConfig(
+        name=city.name,
+        state=city.state,
+        latitude=latitude,
+        longitude=longitude,
+        timezone=city.timezone,
+        nws_station=station if station.startswith("K") else city.nws_station,
+        aliases=city.aliases,
+        metar_station=station,
+    )
+
+
 def find_city(text: str, cities: tuple[CityConfig, ...] = DEFAULT_CITIES):
     lowered = text.lower()
     for city in cities:

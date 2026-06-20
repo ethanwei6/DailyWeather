@@ -13,6 +13,9 @@ class HttpClient:
         self.timeout_seconds = timeout_seconds
 
     def get_json(self, url: str, params: Optional[Mapping[str, Any]] = None, headers: Optional[Mapping[str, str]] = None) -> Any:
+        return json.loads(self.get_text(url, params=params, headers=headers))
+
+    def get_text(self, url: str, params: Optional[Mapping[str, Any]] = None, headers: Optional[Mapping[str, str]] = None) -> str:
         query = urlencode({key: value for key, value in (params or {}).items() if value is not None}, doseq=True)
         full_url = f"{url}?{query}" if query else url
         request_headers = {"User-Agent": self.user_agent, "Accept": "application/json"}
@@ -26,4 +29,4 @@ class HttpClient:
             raise RuntimeError(f"HTTP {error.code} for {full_url}: {body[:500]}") from error
         except (URLError, TimeoutError, OSError) as error:
             raise RuntimeError(f"Request failed for {full_url}: {error}") from error
-        return json.loads(payload)
+        return payload

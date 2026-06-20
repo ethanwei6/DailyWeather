@@ -220,6 +220,9 @@ class ConsensusForecastEngine:
             "open_meteo_ensemble_gfs_seamless": 1.20,
             "open_meteo_ensemble_gfs025": 1.15,
             "open_meteo_ensemble_ecmwf_ifs025": 1.35,
+            "single_run_best_match": 1.50,
+            "single_run_gfs_global": 0.70,
+            "single_run_ecmwf_ifs025": 1.30,
             "fixture": 1.0,
         }
         if source_weights:

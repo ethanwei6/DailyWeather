@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Optional
 
@@ -198,6 +199,7 @@ def parse_weather_market(raw: dict[str, Any], today: Optional[date] = None, citi
         buckets = parse_binary_temperature_bucket(question, outcomes, token_ids=token_ids, prices=prices)
     if city is None or target_date is None or not buckets:
         return None
+    buckets = _apply_resolution_precision(buckets, combined)
 
     return WeatherMarket(
         id=str(raw.get("id") or raw.get("conditionId") or raw.get("condition_id") or raw.get("slug") or ""),
@@ -231,3 +233,19 @@ def _to_fahrenheit(value: float, unit: str) -> float:
     if unit.upper() == "C":
         return value * 9 / 5 + 32
     return value
+
+
+def _apply_resolution_precision(buckets: tuple[TemperatureBucket, ...], text: str) -> tuple[TemperatureBucket, ...]:
+    unit = _resolution_precision_unit(text)
+    if unit is None:
+        return buckets
+    return tuple(replace(bucket, resolution_unit=unit, resolution_precision=1.0) for bucket in buckets)
+
+
+def _resolution_precision_unit(text: str) -> Optional[str]:
+    lowered = text.lower()
+    if "whole degrees celsius" in lowered or "whole degree celsius" in lowered:
+        return "C"
+    if "whole degrees fahrenheit" in lowered or "whole degree fahrenheit" in lowered:
+        return "F"
+    return None

@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
 
-from weather_strategy.cli import main
+from weather_strategy.cli import _make_run_log_path, main
 from weather_strategy.cli import _should_process_market
 from weather_strategy.paper import PaperLedger
 from weather_strategy.parser import parse_weather_market
@@ -61,8 +61,69 @@ class CliTest(unittest.TestCase):
             detail = json.loads(run_log_path.read_text(encoding="utf-8"))
             self.assertEqual(detail["forecast_score_rows_inserted"], summary["forecast_score_rows_inserted"])
             self.assertIn("signal_settings", detail)
+            self.assertEqual(detail["run_log_schema_version"], 2)
+            self.assertIn("data_provenance", detail)
+            self.assertEqual(detail["data_provenance"]["execution_mode"], "paper-only Kelly ledger; no real orders are sent")
+            self.assertIn("coverage_diagnostics", detail)
+            self.assertIn("signal_filter_counts", detail)
+            self.assertEqual(detail["edge_position_full_cap_edge"], 0.25)
             self.assertIn("scored_outcomes_detail", detail)
             self.assertGreaterEqual(len(detail["scored_outcomes_detail"]), 1)
+            first_score = detail["scored_outcomes_detail"][0]
+            self.assertIn("token_id", first_score)
+            self.assertIn("city", first_score)
+            self.assertIn("target_date", first_score)
+            self.assertIn("passes_signal_filter", first_score)
+
+    def test_run_log_paths_are_unique_for_quick_repeated_cli_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            first = _make_run_log_path(directory, "paper-run")
+            second = _make_run_log_path(directory, "paper-run")
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.name.endswith("-paper-run.json"))
+        self.assertTrue(second.name.endswith("-paper-run.json"))
+
+    def test_fixture_paper_run_can_record_explicit_no_token_position(self) -> None:
+        fixture = [
+            {
+                "id": "binary-no",
+                "question": "Will the highest temperature in New York City be 80°F or higher on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "eventTitle": "Highest temperature in New York City on June 5?",
+                "description": "Official weather station.",
+                "outcomes": "[\"Yes\", \"No\"]",
+                "clobTokenIds": "[\"tok-yes\", \"tok-no\"]",
+                "outcomePrices": "[\"0.80\", \"0.20\"]",
+                "forecastSamplesF": [65.0, 66.0, 67.0, 68.0, 69.0],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            fixture_path = Path(directory) / "binary.json"
+            ledger_path = Path(directory) / "paper.sqlite"
+            fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "paper-run",
+                        "--fixture",
+                        str(fixture_path),
+                        "--ledger",
+                        str(ledger_path),
+                        "--disable-observations",
+                        "--allow-no-side-entries",
+                        "--min-model-count",
+                        "1",
+                    ]
+                )
+            self.assertEqual(exit_code, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["signals"], 1)
+            positions = PaperLedger(ledger_path).positions()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0]["token_id"], "tok-no")
+            self.assertTrue(positions[0]["bucket_label"].startswith("NO: "))
 
     def test_should_skip_late_same_day_market_without_position(self) -> None:
         market = parse_weather_market(
