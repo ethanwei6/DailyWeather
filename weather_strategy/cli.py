@@ -1010,7 +1010,7 @@ def load_fixture(path: str) -> list[dict[str, Any]]:
 def _parse_markets(raw_markets: Iterable[Any], already_parsed: bool) -> Iterable[tuple[WeatherMarket, dict[str, Any]]]:
     for raw in raw_markets:
         if already_parsed:
-            yield raw, {}
+            yield raw, raw.raw if isinstance(raw, WeatherMarket) else {}
             continue
         market = parse_weather_market(raw)
         if market is not None:

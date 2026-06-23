@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
 
-from weather_strategy.cli import _make_run_log_path, main
+from weather_strategy.cli import _make_run_log_path, _parse_markets, main
 from weather_strategy.cli import _should_process_market
 from weather_strategy.paper import PaperLedger
 from weather_strategy.parser import parse_weather_market
@@ -124,6 +124,27 @@ class CliTest(unittest.TestCase):
             self.assertEqual(len(positions), 1)
             self.assertEqual(positions[0]["token_id"], "tok-no")
             self.assertTrue(positions[0]["bucket_label"].startswith("NO: "))
+
+    def test_already_parsed_markets_preserve_raw_payload_for_no_side_scoring(self) -> None:
+        raw = {
+            "id": "binary-no",
+            "question": "Will the highest temperature in New York City be 80°F or higher on June 5?",
+            "slug": "highest-temperature-new-york-june-5-80-or-above",
+            "eventTitle": "Highest temperature in New York City on June 5?",
+            "description": "Official weather station.",
+            "outcomes": "[\"Yes\", \"No\"]",
+            "clobTokenIds": "[\"tok-yes\", \"tok-no\"]",
+            "outcomePrices": "[\"0.80\", \"0.20\"]",
+        }
+        parsed = parse_weather_market(raw)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+
+        [(market, preserved_raw)] = list(_parse_markets([parsed], already_parsed=True))
+
+        self.assertEqual(market.id, "binary-no")
+        self.assertEqual(preserved_raw["clobTokenIds"], raw["clobTokenIds"])
+        self.assertEqual(preserved_raw["outcomes"], raw["outcomes"])
 
     def test_should_skip_late_same_day_market_without_position(self) -> None:
         market = parse_weather_market(
