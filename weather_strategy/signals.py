@@ -19,7 +19,11 @@ class SignalSettings:
     min_price: float = 0.125
     yes_side_min_price: float = 0.20
     min_signal_fair_value: float = 0.70
-    allow_bounded_bucket_entries: bool = False
+    allow_bounded_bucket_entries: bool = True
+    bounded_bucket_min_edge: float = 0.10
+    bounded_bucket_min_fair_value: float = 0.90
+    bounded_bucket_min_model_agreement: float = 1.0
+    bounded_bucket_min_price: float = 0.50
     min_model_count: int = 3
     min_model_agreement: float = 1.0
     hold_min_model_agreement: float = 0.65
@@ -79,6 +83,16 @@ def generate_signals(
         if fair_value < settings.min_signal_fair_value:
             continue
         edge = fair_value - market_price - _price_adjusted_uncertainty_buffer(market_price, settings)
+        if _fails_bounded_bucket_quality_gate(
+            fair_value=fair_value,
+            edge=edge,
+            market_price=market_price,
+            model_agreement=1.0,
+            lower_f=bucket.lower_f,
+            upper_f=bucket.upper_f,
+            settings=settings,
+        ):
+            continue
         if not _passes_edge_gate(edge, market_price, settings):
             continue
         if _fails_low_price_exact_bucket_gate(
@@ -226,6 +240,9 @@ def signal_filter_reason(outcome: ScoredOutcome, settings: Optional[SignalSettin
         return f"fair value below {settings.min_signal_fair_value:.2f}"
     if not _passes_edge_gate(outcome.edge, outcome.market_price, settings):
         return "buffered edge below price-aware Kelly threshold"
+    bounded_reason = _bounded_bucket_quality_filter_reason(outcome, settings)
+    if bounded_reason is not None:
+        return bounded_reason
     if _is_no_side_outcome(outcome):
         no_side_edge_floor = _required_no_side_min_edge(outcome.market_price, settings)
         if outcome.edge < no_side_edge_floor:
@@ -290,6 +307,44 @@ def _price_adjusted_uncertainty_buffer(market_price: float, settings: SignalSett
 
 def _fails_bounded_bucket_entry_gate(lower_f: Optional[float], upper_f: Optional[float], settings: SignalSettings) -> bool:
     return not settings.allow_bounded_bucket_entries and lower_f is not None and upper_f is not None
+
+
+def _bounded_bucket_quality_filter_reason(outcome: ScoredOutcome, settings: SignalSettings) -> Optional[str]:
+    if not _is_bounded_bucket(outcome.bucket_lower_f, outcome.bucket_upper_f):
+        return None
+    if outcome.market_price < settings.bounded_bucket_min_price:
+        return f"bounded exact/range bucket price below {_format_threshold(settings.bounded_bucket_min_price)}"
+    if outcome.fair_value < settings.bounded_bucket_min_fair_value:
+        return f"bounded exact/range bucket fair value below {settings.bounded_bucket_min_fair_value:.2f}"
+    if outcome.edge < settings.bounded_bucket_min_edge:
+        return f"bounded exact/range bucket edge below {settings.bounded_bucket_min_edge:.2f}"
+    if outcome.model_agreement < settings.bounded_bucket_min_model_agreement:
+        return f"bounded exact/range bucket agreement below {settings.bounded_bucket_min_model_agreement:.2f}"
+    return None
+
+
+def _fails_bounded_bucket_quality_gate(
+    *,
+    fair_value: float,
+    edge: float,
+    market_price: float,
+    model_agreement: float,
+    lower_f: Optional[float],
+    upper_f: Optional[float],
+    settings: SignalSettings,
+) -> bool:
+    if not _is_bounded_bucket(lower_f, upper_f):
+        return False
+    return (
+        market_price < settings.bounded_bucket_min_price
+        or fair_value < settings.bounded_bucket_min_fair_value
+        or edge < settings.bounded_bucket_min_edge
+        or model_agreement < settings.bounded_bucket_min_model_agreement
+    )
+
+
+def _is_bounded_bucket(lower_f: Optional[float], upper_f: Optional[float]) -> bool:
+    return lower_f is not None and upper_f is not None
 
 
 def _required_buffered_edge(market_price: float, settings: SignalSettings) -> float:

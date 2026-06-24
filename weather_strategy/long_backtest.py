@@ -33,6 +33,7 @@ from weather_strategy.signals import (
     signal_filter_reason,
     signals_from_scored_outcomes,
 )
+from weather_strategy.telonex import TelonexClient, TelonexConfigurationError, _load_parquet_records
 from weather_strategy.weather import extract_daily_temperature_samples, extract_weather_features
 
 
@@ -285,6 +286,8 @@ def run_long_historical_backtest(
     run_log_dir: str | Path = "work/logs/long_backtests",
     progress_every: int = 50,
     http_hard_timeout_seconds: int = 30,
+    price_source: str = "telonex",
+    market_source: str = "telonex",
 ) -> dict[str, Any]:
     started = time.monotonic()
     deadline = None if max_runtime_seconds <= 0 else started + max_runtime_seconds
@@ -292,12 +295,22 @@ def run_long_historical_backtest(
     http = CachedHttpClient(cache_dir, hard_timeout_seconds=http_hard_timeout_seconds)
     gamma = PolymarketGammaClient(http=http)
     clob = PolymarketClobClient(http=http)
+    price_source_name, telonex = _historical_price_source(price_source, cache_dir)
+    market_source_name, telonex = _historical_market_source(market_source, cache_dir, telonex)
     forecast_client = SingleRunForecastClient(http)
     observation_client = ObservedHighClient(http=http)
     source_weights, model_weights = load_calibration_weights(weights_file)
     forecast_engine = ConsensusForecastEngine(source_weights=source_weights, model_weights=model_weights)
 
-    raw_markets = _discover_raw_temperature_markets(gamma, query=query, pages=pages, limit_per_page=limit_per_page)
+    raw_markets = (
+        _discover_telonex_raw_temperature_markets(
+            telonex,
+            query=query,
+            max_candidates=max(max_markets * 3, pages * limit_per_page, 500),
+        )
+        if market_source_name == "telonex"
+        else _discover_raw_temperature_markets(gamma, query=query, pages=pages, limit_per_page=limit_per_page)
+    )
     parsed = _parse_historical_markets(raw_markets, max_markets=max_markets, min_volume_usd=min_volume_usd)
     _progress(
         progress_every,
@@ -315,7 +328,7 @@ def run_long_historical_backtest(
     weather_crosscheck_ambiguous_examples: list[dict[str, Any]] = []
     session_markets: dict[datetime, list[tuple[WeatherMarket, dict[str, Any], EntryPrice, dict[str, Any]]]] = {}
     price_history_cache: dict[str, list[PriceHistoryPoint]] = {}
-    observation_cache: dict[tuple[str, str, str], Optional[ObservedHigh]] = {}
+    observation_cache: dict[tuple[str, ...], Optional[ObservedHigh]] = {}
     nonempty_price_history_count = 0
     skipped: list[dict[str, str]] = []
 
@@ -350,6 +363,10 @@ def run_long_historical_backtest(
                 bucket.token_id,
                 start_ts=price_start_ts,
                 end_ts=price_end_ts,
+                price_source=price_source_name,
+                telonex=telonex,
+                market_slug=raw.get("slug") or market.slug,
+                outcome="Yes",
             )
         except (RuntimeError, ValueError) as error:
             price_error_count += 1
@@ -369,6 +386,10 @@ def run_long_historical_backtest(
                     no_token_id,
                     start_ts=price_start_ts,
                     end_ts=price_end_ts,
+                    price_source=price_source_name,
+                    telonex=telonex,
+                    market_slug=raw.get("slug") or market.slug,
+                    outcome="No",
                 )
                 if no_history:
                     no_side_price_history_count += 1
@@ -376,8 +397,10 @@ def run_long_historical_backtest(
                 no_side_price_error_count += 1
                 if len(skipped) < 50:
                     skipped.append({"question": market.question, "reason": f"no_side_price_history: {str(error)[:240]}"})
-        added_session = False
-        for decision_time in _candidate_entry_times(market, entry_hours_utc, min_lead_days, max_lead_days):
+        added_entry_session = False
+        for decision_time, maintenance_only in _candidate_replay_times(market, entry_hours_utc, min_lead_days, max_lead_days):
+            if maintenance_only and not added_entry_session:
+                continue
             if not _market_active_at(raw, decision_time):
                 continue
             entry = select_entry_price(
@@ -403,10 +426,12 @@ def run_long_historical_backtest(
                         "weather_ambiguous": resolution.get("weather_ambiguous", False),
                         "observed_high_f": resolution["observed_high_f"],
                         "settlement_source": resolution["settlement_source"],
+                        "maintenance_only": maintenance_only,
                     },
                 )
             )
-            added_session = True
+            if not maintenance_only:
+                added_entry_session = True
             if no_token_id and no_history:
                 no_entry = select_entry_price(
                     no_history,
@@ -432,11 +457,12 @@ def run_long_historical_backtest(
                             "weather_ambiguous": resolution.get("weather_ambiguous", False),
                             "observed_high_f": resolution["observed_high_f"],
                             "settlement_source": resolution["settlement_source"],
+                            "maintenance_only": maintenance_only,
                         },
                     )
                 )
                 no_side_session_count += 1
-        if not added_session:
+        if not added_entry_session:
             skipped.append({"question": market.question, "reason": "no usable historical price at configured entry sessions"})
         if progress_every > 0 and market_index % progress_every == 0:
             _progress(
@@ -506,9 +532,27 @@ def run_long_historical_backtest(
                 forecast_cache[forecast_key] = (distributions, run_time)
             distributions, run_time = forecast_cache[forecast_key]
             consensus = forecast_engine.consensus_by_bucket(distributions, market.buckets)
+            observed = _historical_observed_high_for_session(
+                market,
+                raw,
+                observation_client,
+                observation_cache,
+                session_time,
+            )
+            if observed is not None:
+                consensus = forecast_engine.apply_observed_high(consensus, market.buckets, observed, now=session_time)
             scored_rows = score_outcomes(market, consensus, settings=settings, now=session_time)
             if settlement.get("side") == "NO":
                 scored_rows = [_invert_binary_scored_outcome(outcome, settings) for outcome in scored_rows]
+            if settlement.get("maintenance_only"):
+                scored_rows = [
+                    replace(
+                        outcome,
+                        entry_eligible=False,
+                        entry_filter_reason="target-day maintenance only; new entries disabled by lead window",
+                    )
+                    for outcome in scored_rows
+                ]
             markets_scored += 1
             outcomes_scored += len(scored_rows)
             for outcome in scored_rows:
@@ -676,19 +720,23 @@ def run_long_historical_backtest(
             "weights_file": str(weights_file),
             "progress_every": progress_every,
             "http_hard_timeout_seconds": http_hard_timeout_seconds,
+            "price_source": price_source_name,
+            "market_source": market_source_name,
             "source_weights_loaded": len(source_weights),
             "model_weights_loaded": len(model_weights),
             "signal_settings": _signal_settings_to_json(settings),
         },
         "data_provenance": {
-            "polymarket_market_source": "Gamma public-search",
-            "polymarket_price_source": "CLOB prices-history with market-lifetime startTs/endTs bounds when available",
-            "polymarket_no_price_source": "CLOB prices-history for explicit NO clobTokenIds when allow_no_side_entries is enabled",
+            "polymarket_market_source": "Telonex Polymarket markets dataset filtered to resolved markets with quote availability" if market_source_name == "telonex" else "Gamma public-search",
+            "polymarket_price_source": _price_source_description(price_source_name, "YES"),
+            "polymarket_no_price_source": _price_source_description(price_source_name, "NO"),
             "forecast_source": "Open-Meteo Single Runs API",
             "settlement_preference": "Polymarket resolved YES payout, station METAR/ASOS weather cross-check when the market names a station",
             "cache_dir": str(cache_dir),
             "cache_hits": http.hits,
             "cache_misses": http.misses,
+            "telonex_download_hits": telonex.download_hits if telonex is not None else 0,
+            "telonex_download_misses": telonex.download_misses if telonex is not None else 0,
         },
         "data_quality_diagnostics": data_quality_diagnostics,
         "settlement_quality_diagnostics": settlement_quality_diagnostics,
@@ -719,6 +767,133 @@ def _discover_raw_temperature_markets(gamma: PolymarketGammaClient, *, query: st
     return raw_markets
 
 
+def _discover_telonex_raw_temperature_markets(
+    telonex: Optional[TelonexClient],
+    *,
+    query: str,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    if telonex is None:
+        raise TelonexConfigurationError("Telonex market source selected but no Telonex client is configured")
+    dataset_path = telonex.download_dataset_parquet(exchange="polymarket", dataset="markets")
+    records = _load_telonex_market_records(dataset_path, query=query, max_candidates=max_candidates)
+    raw_markets = []
+    seen = set()
+    for record in records:
+        raw = _telonex_market_record_to_raw(record)
+        if raw is None or not looks_like_temperature_market(raw):
+            continue
+        key = raw.get("id") or raw.get("conditionId") or raw.get("slug")
+        if key in seen:
+            continue
+        seen.add(key)
+        raw_markets.append(raw)
+    return raw_markets
+
+
+def _load_telonex_market_records(path: Path, *, query: str, max_candidates: int) -> list[Mapping[str, Any]]:
+    limit = max(1, max_candidates)
+    try:
+        import polars as pl  # type: ignore
+
+        text_columns = ("question", "description", "slug", "event_slug", "event_title")
+        text_filter = pl.any_horizontal(
+            [
+                pl.col(column).fill_null("").cast(pl.String).str.to_lowercase().str.contains("highest temperature")
+                for column in text_columns
+            ]
+        )
+        query_filter = pl.lit(True)
+        cleaned_query = query.strip().lower()
+        if cleaned_query and cleaned_query != "highest temperature":
+            query_filter = pl.any_horizontal(
+                [
+                    pl.col(column).fill_null("").cast(pl.String).str.to_lowercase().str.contains(cleaned_query, literal=True)
+                    for column in text_columns
+                ]
+            )
+        df = (
+            pl.scan_parquet(path)
+            .filter(text_filter & query_filter)
+            .filter(pl.col("status").fill_null("") == "resolved")
+            .filter(pl.col("quotes_from").fill_null("") >= "2026-01-19")
+            .filter(pl.col("quotes_to").fill_null("") != "")
+            .sort("end_date_us")
+            .limit(limit)
+            .collect()
+        )
+        return [dict(row) for row in df.to_dicts()]
+    except ModuleNotFoundError:
+        records = []
+        for record in _load_parquet_records(path):
+            raw = _telonex_market_record_to_raw(record)
+            if raw is None or not looks_like_temperature_market(raw):
+                continue
+            if str(record.get("status") or "") != "resolved":
+                continue
+            if not record.get("quotes_from") or str(record.get("quotes_from")) < "2026-01-19" or not record.get("quotes_to"):
+                continue
+            records.append(record)
+            if len(records) >= limit:
+                break
+        return records
+
+
+def _telonex_market_record_to_raw(record: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    outcome_0 = record.get("outcome_0")
+    outcome_1 = record.get("outcome_1")
+    asset_id_0 = record.get("asset_id_0")
+    asset_id_1 = record.get("asset_id_1")
+    if outcome_0 is None or outcome_1 is None or asset_id_0 is None or asset_id_1 is None:
+        return None
+    outcomes = [str(outcome_0), str(outcome_1)]
+    token_ids = [str(asset_id_0), str(asset_id_1)]
+    return {
+        "id": str(record.get("market_id") or record.get("slug") or ""),
+        "conditionId": str(record.get("market_id") or ""),
+        "slug": str(record.get("slug") or ""),
+        "eventSlug": str(record.get("event_slug") or ""),
+        "eventTitle": str(record.get("event_title") or ""),
+        "question": str(record.get("question") or ""),
+        "description": str(record.get("description") or ""),
+        "rules": str(record.get("description") or ""),
+        "resolutionSource": str(record.get("resolution_source") or ""),
+        "outcomes": json.dumps(outcomes),
+        "clobTokenIds": json.dumps(token_ids),
+        "outcomePrices": json.dumps(_telonex_settled_prices(record.get("result_id"))),
+        "status": str(record.get("status") or ""),
+        "startDate": _iso_from_epoch_us(record.get("start_date_us")),
+        "endDate": _iso_from_epoch_us(record.get("end_date_us")),
+        "createdAt": _iso_from_epoch_us(record.get("created_at_us")),
+        "closedTime": _iso_from_epoch_us(record.get("settled_at_us")),
+        "acceptingOrdersTimestamp": _iso_from_epoch_us(record.get("prepared_at_us")),
+        "telonex_quotes_from": record.get("quotes_from"),
+        "telonex_quotes_to": record.get("quotes_to"),
+    }
+
+
+def _telonex_settled_prices(result_id: Any) -> list[str]:
+    try:
+        winner = int(str(result_id))
+    except (TypeError, ValueError):
+        return ["0.5", "0.5"]
+    if winner == 0:
+        return ["1", "0"]
+    if winner == 1:
+        return ["0", "1"]
+    return ["0.5", "0.5"]
+
+
+def _iso_from_epoch_us(value: Any) -> Optional[str]:
+    numeric = _numeric(value)
+    if numeric <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(numeric / 1_000_000, tz=timezone.utc).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
 def _cached_price_history(
     cache: dict[str, list[PriceHistoryPoint]],
     clob: PolymarketClobClient,
@@ -726,18 +901,72 @@ def _cached_price_history(
     *,
     start_ts: Optional[int],
     end_ts: Optional[int],
+    price_source: str = "clob",
+    telonex: Optional[TelonexClient] = None,
+    market_slug: Optional[str] = None,
+    outcome: str = "Yes",
 ) -> list[PriceHistoryPoint]:
-    if token_id in cache:
-        return cache[token_id]
-    history = clob.fetch_price_history(
-        token_id,
-        interval="max",
-        fidelity=60,
-        start_ts=start_ts,
-        end_ts=end_ts,
-    )
-    cache[token_id] = history
+    cache_key = f"{price_source}:{token_id}:{market_slug or ''}:{outcome}:{start_ts}:{end_ts}"
+    if cache_key in cache:
+        return cache[cache_key]
+    if price_source == "telonex":
+        if telonex is None:
+            raise TelonexConfigurationError("Telonex price source selected but no Telonex client is configured")
+        history = telonex.fetch_quote_price_history(
+            slug=market_slug or "",
+            outcome=outcome,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            token_id=token_id,
+        )
+    else:
+        history = clob.fetch_price_history(
+            token_id,
+            interval="max",
+            fidelity=60,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    cache[cache_key] = history
     return history
+
+
+def _historical_price_source(price_source: str, cache_dir: str | Path) -> tuple[str, Optional[TelonexClient]]:
+    normalized = price_source.strip().lower()
+    if normalized not in {"telonex", "clob", "auto"}:
+        raise ValueError(f"Unsupported historical price source: {price_source}")
+    if normalized == "clob":
+        return "clob", None
+    try:
+        client = TelonexClient(cache_dir=Path(cache_dir) / "telonex")
+    except TelonexConfigurationError:
+        if normalized == "auto":
+            return "clob", None
+        raise
+    return "telonex", client
+
+
+def _historical_market_source(
+    market_source: str,
+    cache_dir: str | Path,
+    telonex: Optional[TelonexClient],
+) -> tuple[str, Optional[TelonexClient]]:
+    normalized = market_source.strip().lower()
+    if normalized not in {"telonex", "gamma"}:
+        raise ValueError(f"Unsupported historical market source: {market_source}")
+    if normalized == "gamma":
+        return "gamma", telonex
+    if telonex is not None:
+        return "telonex", telonex
+    return "telonex", TelonexClient(cache_dir=Path(cache_dir) / "telonex")
+
+
+def _price_source_description(price_source: str, side: str) -> str:
+    if price_source == "telonex":
+        return f"Telonex Polymarket quotes daily Parquet filtered by {side} asset_id/token when available, otherwise market slug and outcome"
+    if side == "NO":
+        return "CLOB prices-history for explicit NO clobTokenIds when allow_no_side_entries is enabled"
+    return "CLOB prices-history with market-lifetime startTs/endTs bounds when available"
 
 
 def _iter_event_markets(events: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
@@ -766,13 +995,21 @@ def _parse_historical_markets(raw_markets: Iterable[dict[str, Any]], *, max_mark
             break
         if _numeric(raw.get("volumeNum") or raw.get("volume") or 0.0) < min_volume_usd:
             continue
-        market = parse_weather_market(raw)
+        market = parse_weather_market(raw, today=_market_parse_today(raw))
         if market is None or market.target_date is None:
             continue
         if market.target_date >= current:
             continue
         parsed.append((market, raw))
     return parsed
+
+
+def _market_parse_today(raw: Mapping[str, Any]) -> Optional[date]:
+    for key in ("endDate", "closedTime", "startDate", "createdAt"):
+        timestamp = _parse_dt(raw.get(key))
+        if timestamp is not None:
+            return date(timestamp.year, 1, 1)
+    return None
 
 
 def _single_bucket(market: WeatherMarket) -> Optional[TemperatureBucket]:
@@ -830,7 +1067,7 @@ def _resolve_market_outcome(
     raw: dict[str, Any],
     bucket: TemperatureBucket,
     observation_client: ObservedHighClient,
-    observation_cache: Optional[dict[tuple[str, str, str], Optional[ObservedHigh]]] = None,
+    observation_cache: Optional[dict[tuple[str, ...], Optional[ObservedHigh]]] = None,
 ) -> dict[str, Any]:
     polymarket_payout = _polymarket_yes_payout(raw)
     observed_high_f = None
@@ -1000,6 +1237,71 @@ def _candidate_entry_times(market: WeatherMarket, entry_hours_utc: tuple[int, ..
     return sorted(set(candidates))
 
 
+def _candidate_replay_times(
+    market: WeatherMarket,
+    entry_hours_utc: tuple[int, ...],
+    min_lead_days: int,
+    max_lead_days: int,
+) -> list[tuple[datetime, bool]]:
+    entry_times = _candidate_entry_times(market, entry_hours_utc, min_lead_days, max_lead_days)
+    replay_times = {entry_time: False for entry_time in entry_times}
+    for maintenance_time in _candidate_target_day_maintenance_times(market, entry_hours_utc):
+        replay_times.setdefault(maintenance_time, True)
+    return sorted(replay_times.items())
+
+
+def _candidate_target_day_maintenance_times(market: WeatherMarket, entry_hours_utc: tuple[int, ...]) -> list[datetime]:
+    if market.city is None or market.target_date is None:
+        return []
+    candidates = []
+    timezone_info = _zoneinfo_or_utc(market.city)
+    current = market.target_date - timedelta(days=1)
+    end_date = market.target_date + timedelta(days=1)
+    while current <= end_date:
+        for hour in entry_hours_utc:
+            candidate = datetime.combine(current, datetime_time(hour, 0), tzinfo=timezone.utc)
+            if candidate.astimezone(timezone_info).date() == market.target_date:
+                candidates.append(candidate)
+        current += timedelta(days=1)
+    return sorted(set(candidates))
+
+
+def _historical_observed_high_for_session(
+    market: WeatherMarket,
+    raw: dict[str, Any],
+    observation_client: ObservedHighClient,
+    observation_cache: dict[tuple[str, str, str, str], Optional[ObservedHigh]],
+    session_time: datetime,
+) -> Optional[ObservedHigh]:
+    if market.city is None or market.target_date is None:
+        return None
+    local_session_date = session_time.astimezone(_zoneinfo_or_utc(market.city)).date()
+    if market.target_date != local_session_date:
+        return None
+    station = _resolution_station(raw) or market.city.metar_station or market.city.nws_station
+    if station is None:
+        return None
+    cache_key = (
+        market.city.display_name,
+        station,
+        market.target_date.isoformat(),
+        session_time.isoformat(),
+    )
+    if cache_key in observation_cache:
+        return observation_cache[cache_key]
+    try:
+        observed = observation_client.fetch_partial_historical_high(
+            market.city,
+            station,
+            market.target_date,
+            now=session_time,
+        )
+    except (RuntimeError, ValueError):
+        observed = None
+    observation_cache[cache_key] = observed
+    return observed
+
+
 def _market_active_at(raw: dict[str, Any], decision_time: datetime) -> bool:
     created = _parse_dt(raw.get("acceptingOrdersTimestamp") or raw.get("startDate") or raw.get("createdAt") or raw.get("creationDate"))
     closed = _parse_dt(raw.get("closedTime") or raw.get("endDate"))
@@ -1011,6 +1313,12 @@ def _market_active_at(raw: dict[str, Any], decision_time: datetime) -> bool:
 
 
 def _price_history_bounds(raw: dict[str, Any], *, padding_hours: int = 12) -> tuple[Optional[int], Optional[int]]:
+    telonex_from = _parse_date(raw.get("telonex_quotes_from"))
+    telonex_to = _parse_date(raw.get("telonex_quotes_to"))
+    if telonex_from is not None and telonex_to is not None:
+        opened = datetime.combine(telonex_from, datetime_time(0, 0), tzinfo=timezone.utc)
+        closed = datetime.combine(telonex_to + timedelta(days=1), datetime_time(0, 0), tzinfo=timezone.utc)
+        return int(opened.timestamp()), int(closed.timestamp())
     opened_candidates = (
         _parse_dt(raw.get("acceptingOrdersTimestamp")),
         _parse_dt(raw.get("startDate")),
@@ -1034,6 +1342,15 @@ def _price_history_bounds(raw: dict[str, Any], *, padding_hours: int = 12) -> tu
     start_ts = int(opened.timestamp()) if opened is not None else None
     end_ts = int(closed.timestamp()) if closed is not None else None
     return start_ts, end_ts
+
+
+def _parse_date(value: Any) -> Optional[date]:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _rebalance_session(
@@ -1060,6 +1377,9 @@ def _rebalance_session(
             continue
         token = outcome.token_id
         current = positions.get(token)
+        token_metadata = metadata.get(token, {})
+        if current is None and token_metadata.get("maintenance_only"):
+            continue
         current_shares = current.shares if current else 0.0
         current_notional = current_shares * outcome.market_price
         hold_eligible = current is not None and hold_filter_reason(outcome, settings) is None
@@ -1087,13 +1407,13 @@ def _rebalance_session(
                 continue
             shares = notional / outcome.market_price
             cash_ref["cash"] -= notional
-            _upsert_historical_position(positions, outcome, shares, notional, metadata.get(token, {}))
-            executions.append(_execution_json("BUY", outcome, shares, outcome.market_price, notional, 0.0, metadata.get(token, {})))
+            _upsert_historical_position(positions, outcome, shares, notional, token_metadata)
+            executions.append(_execution_json("BUY", outcome, shares, outcome.market_price, notional, 0.0, token_metadata))
         elif delta < 0 and current is not None and abs(delta) >= min_trade_usd:
             shares = min(current.shares, abs(delta) / outcome.market_price)
-            _sell_historical_position(positions, executions, cash_ref, outcome, shares, metadata.get(token, {}))
+            _sell_historical_position(positions, executions, cash_ref, outcome, shares, token_metadata)
         elif current is not None:
-            current.last_price = _exit_price(outcome, metadata.get(token, {}))
+            current.last_price = _exit_price(outcome, token_metadata)
 
 
 def _historical_portfolio_equity(cash: float, positions: Mapping[str, HistoricalPosition]) -> float:
@@ -1310,6 +1630,11 @@ def _scored_to_json(outcome: ScoredOutcome, metadata: Mapping[str, Any], setting
         "timing_entry_eligible": outcome.entry_eligible,
         "entry_eligible": outcome.entry_eligible,
         "entry_filter_reason": outcome.entry_filter_reason,
+        "model_observed_high_f": outcome.observed_high_f,
+        "model_observation_source": outcome.observation_source,
+        "model_observation_final": outcome.observation_final,
+        "model_observation_adjusted": outcome.observation_adjusted,
+        "model_observed_outcome": outcome.observed_outcome,
         "passes_signal_filter": filter_reason is None,
         "signal_eligible": filter_reason is None,
         "trade_eligible": filter_reason is None,
@@ -1599,7 +1924,7 @@ def _real_data_audit(
     return {
         "passed": not failures,
         "method": (
-            "Strict real-data audit for the historical replay. It verifies CLOB price timestamps, "
+            "Strict real-data audit for the historical replay. It verifies historical price timestamps, "
             "forecast run-time lag, Open-Meteo Single Runs forecast sources, explicit NO-token attribution, "
             "and weather-matched settlement for signal-eligible and traded rows."
         ),
@@ -2274,6 +2599,23 @@ def _counterfactual_kelly_replays(
         ("looser_entry_agreement_0.65", replace(settings, min_model_agreement=0.65)),
         ("looser_fair_value_0.60", replace(settings, min_signal_fair_value=0.60)),
         ("stricter_fair_value_0.80", replace(settings, min_signal_fair_value=0.80)),
+        ("allow_bounded_bucket_entries", replace(settings, allow_bounded_bucket_entries=True)),
+        (
+            "allow_bounded_strict_fv_0.80",
+            replace(settings, allow_bounded_bucket_entries=True, min_signal_fair_value=0.80),
+        ),
+        (
+            "allow_bounded_strict_price_0.20",
+            replace(settings, allow_bounded_bucket_entries=True, min_price=0.20, yes_side_min_price=0.20),
+        ),
+        (
+            "allow_bounded_strict_fv_0.80_price_0.20",
+            replace(settings, allow_bounded_bucket_entries=True, min_signal_fair_value=0.80, min_price=0.20, yes_side_min_price=0.20),
+        ),
+        (
+            "allow_bounded_strict_edge_0.15",
+            replace(settings, allow_bounded_bucket_entries=True, min_edge=0.15),
+        ),
         ("looser_min_price_0.10", replace(settings, min_price=0.10)),
         ("stricter_min_price_0.20", replace(settings, min_price=0.20)),
         ("stricter_min_price_0.35", replace(settings, min_price=0.35)),
@@ -2730,6 +3072,10 @@ def _json_kelly_replay(
             "hold_market_confirmation_min_fair_value": settings.hold_market_confirmation_min_fair_value,
             "preserve_valid_holds": settings.preserve_valid_holds,
             "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+            "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
+            "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
+            "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
+            "bounded_bucket_min_price": settings.bounded_bucket_min_price,
             "compound_kelly_sizing": compound_kelly_sizing,
             "max_position_usd": max_position_usd,
             "max_position_fraction": max_position_fraction,
@@ -2981,6 +3327,8 @@ def _json_signal_candidate(
         return False
     if edge < _json_required_buffered_edge(price, settings):
         return False
+    if _json_fails_bounded_bucket_quality_gate(row, settings):
+        return False
     if _json_is_no_side_row(row):
         no_side_edge_floor = min(active_no_side_min_edge, _required_no_side_min_edge(price, settings))
         if edge < no_side_edge_floor:
@@ -3007,6 +3355,24 @@ def _json_signal_candidate(
     ):
         return False
     return True
+
+
+def _json_fails_bounded_bucket_quality_gate(row: Mapping[str, Any], settings: SignalSettings) -> bool:
+    if row.get("bucket_lower_f") is None or row.get("bucket_upper_f") is None:
+        return False
+    try:
+        price = float(row.get("market_price"))
+        fair_value = float(row.get("fair_value"))
+        edge = float(row.get("edge"))
+        agreement = float(row.get("model_agreement") or 0.0)
+    except (TypeError, ValueError):
+        return True
+    return (
+        price < settings.bounded_bucket_min_price
+        or fair_value < settings.bounded_bucket_min_fair_value
+        or edge < settings.bounded_bucket_min_edge
+        or agreement < settings.bounded_bucket_min_model_agreement
+    )
 
 
 def _json_is_no_side_row(row: Mapping[str, Any]) -> bool:
@@ -3335,6 +3701,10 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "yes_side_min_price": settings.yes_side_min_price,
         "min_signal_fair_value": settings.min_signal_fair_value,
         "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+        "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
+        "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
+        "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
+        "bounded_bucket_min_price": settings.bounded_bucket_min_price,
         "allow_no_side_entries": settings.allow_no_side_entries,
         "no_side_min_edge": settings.no_side_min_edge,
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,

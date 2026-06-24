@@ -19,6 +19,9 @@ classifiers = [
 [project.scripts]
 dailyweather = "weather_strategy.cli:main"
 
+[project.optional-dependencies]
+telonex = ["polars>=1.0.0"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

@@ -81,7 +81,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For NO-token research rows, reject entries if any model view gives the opposite YES event more than this probability")
     paper.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability")
     paper.add_argument("--min-signal-fair-value", type=float, default=0.70)
-    paper.add_argument("--allow-bounded-bucket-entries", action="store_true")
+    paper.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
+    paper.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    paper.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
+    paper.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
+    paper.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
+    paper.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
     paper.add_argument("--max-price", type=float, default=0.95)
     paper.add_argument("--same-day-entry-start-hour", type=int, default=11)
     paper.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
@@ -146,7 +151,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10)
     backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15)
     backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
-    backtest.add_argument("--allow-bounded-bucket-entries", action="store_true")
+    backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
+    backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    backtest.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
+    backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
+    backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
+    backtest.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
     backtest.add_argument("--max-price", type=float, default=0.95)
     backtest.add_argument("--train-fraction", type=float, default=0.70)
     backtest.add_argument("--output-weights", default="work/data/model_weights.json")
@@ -167,6 +177,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--min-lead-days", type=int, default=1)
     long_backtest.add_argument("--max-lead-days", type=int, default=2)
     long_backtest.add_argument("--max-runtime-seconds", type=float, default=0.0)
+    long_backtest.add_argument(
+        "--price-source",
+        choices=("telonex", "clob", "auto"),
+        default="telonex",
+        help="Historical Polymarket pricing source. Telonex uses tick-level quote Parquet; clob is the legacy prices-history fallback.",
+    )
+    long_backtest.add_argument(
+        "--market-source",
+        choices=("telonex", "gamma"),
+        default="telonex",
+        help="Historical market universe source. Telonex uses the markets dataset with actual quote availability; gamma uses public-search.",
+    )
     long_backtest.add_argument("--max-price-staleness-minutes", type=int, default=90)
     long_backtest.add_argument("--historical-price-slippage", type=float, default=0.01)
     long_backtest.add_argument("--forecast-availability-lag-hours", type=int, default=6)
@@ -201,7 +223,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For experimental NO-token entries, reject rows if any model view gives the opposite YES event more than this probability; set >=1 to disable")
     long_backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability; set >=1 to disable")
     long_backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
-    long_backtest.add_argument("--allow-bounded-bucket-entries", action="store_true")
+    long_backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
+    long_backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    long_backtest.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
+    long_backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
+    long_backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
+    long_backtest.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
     long_backtest.add_argument("--max-price", type=float, default=0.95)
     long_backtest.add_argument(
         "--allow-no-side-entries",
@@ -321,6 +348,10 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        bounded_bucket_min_edge=args.bounded_bucket_min_edge,
+        bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
+        bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
+        bounded_bucket_min_price=args.bounded_bucket_min_price,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
         hold_min_fair_value=args.hold_min_fair_value,
@@ -373,6 +404,10 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         yes_side_min_price=args.yes_side_min_price,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        bounded_bucket_min_edge=args.bounded_bucket_min_edge,
+        bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
+        bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
+        bounded_bucket_min_price=args.bounded_bucket_min_price,
         allow_no_side_entries=args.allow_no_side_entries,
         no_side_min_edge=args.no_side_min_edge,
         no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
@@ -417,6 +452,8 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         run_log_dir=args.run_log_dir,
         progress_every=args.progress_every,
         http_hard_timeout_seconds=args.http_hard_timeout_seconds,
+        price_source=args.price_source,
+        market_source=args.market_source,
     )
     print(json.dumps(_long_backtest_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
     return 0
@@ -548,6 +585,10 @@ def run_paper(args: argparse.Namespace) -> int:
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        bounded_bucket_min_edge=args.bounded_bucket_min_edge,
+        bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
+        bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
+        bounded_bucket_min_price=args.bounded_bucket_min_price,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
         hold_min_fair_value=args.hold_min_fair_value,
@@ -873,6 +914,10 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "yes_side_min_price": settings.yes_side_min_price,
         "min_signal_fair_value": settings.min_signal_fair_value,
         "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+        "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
+        "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
+        "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
+        "bounded_bucket_min_price": settings.bounded_bucket_min_price,
         "allow_no_side_entries": settings.allow_no_side_entries,
         "no_side_min_edge": settings.no_side_min_edge,
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,

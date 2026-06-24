@@ -8,6 +8,7 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from weather_strategy.backtest import (
     ResolvedForecastRow,
@@ -20,15 +21,19 @@ from weather_strategy.long_backtest import (
     HistoricalPosition,
     _binary_no_token,
     _cached_price_history,
+    _candidate_replay_times,
     _data_quality_diagnostics,
     _effective_max_position_usd as long_effective_max_position_usd,
     _finalize_positions_for_result,
+    _historical_observed_high_for_session,
     _invert_binary_scored_outcome,
     _json_kelly_replay,
     _make_run_log_path,
+    _market_parse_today,
     _pnl_concentration,
     _polymarket_yes_payout,
     _price_history_bounds,
+    _rebalance_session,
     _resolve_market_outcome,
     _real_data_audit,
     _robustness_diagnostics,
@@ -36,6 +41,7 @@ from weather_strategy.long_backtest import (
     _settlement_quality_diagnostics,
     _strategy_recommendation_diagnostics,
     _strategy_sensitivity_diagnostics,
+    _telonex_market_record_to_raw,
     _trade_performance_diagnostics,
     forecast_run_time,
     run_long_historical_backtest,
@@ -50,6 +56,116 @@ from weather_strategy.signals import SignalSettings
 
 
 class BacktestTest(unittest.TestCase):
+    def test_replay_times_mark_target_day_as_maintenance_only(self) -> None:
+        raw = {
+            "id": "m1",
+            "question": "Will the highest temperature in Seattle be between 84-85°F on June 24?",
+            "slug": "highest-temperature-in-seattle-on-june-24-2026-84-85f",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0.35","0.65"]',
+            "clobTokenIds": '["yes-token","no-token"]',
+        }
+        market = parse_weather_market(raw, today=date(2026, 6, 1))
+        assert market is not None
+
+        replay_times = _candidate_replay_times(market, (0, 12), min_lead_days=1, max_lead_days=2)
+        maintenance_times = [timestamp for timestamp, maintenance_only in replay_times if maintenance_only]
+        entry_times = [timestamp for timestamp, maintenance_only in replay_times if not maintenance_only]
+
+        self.assertTrue(maintenance_times)
+        self.assertTrue(entry_times)
+        city_zone = ZoneInfo(market.city.timezone)
+        self.assertTrue(all(timestamp.astimezone(city_zone).date() == market.target_date for timestamp in maintenance_times))
+        self.assertTrue(all((market.target_date - timestamp.astimezone(city_zone).date()).days >= 1 for timestamp in entry_times))
+
+    def test_historical_observed_high_for_session_uses_target_day_partial_station_high(self) -> None:
+        raw = {
+            "id": "m2",
+            "question": "Will the highest temperature in New York City be between 82-83°F on June 24?",
+            "slug": "highest-temperature-in-nyc-on-june-24-2026-82-83f",
+            "description": "Resolution source: https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
+            "resolutionSource": "https://www.wunderground.com/history/daily/us/ny/new-york-city/KLGA",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0.45","0.55"]',
+            "clobTokenIds": '["yes-token","no-token"]',
+        }
+        market = parse_weather_market(raw, today=date(2026, 6, 1))
+        assert market is not None
+        session_time = datetime(2026, 6, 24, 17, 0, tzinfo=timezone.utc)
+
+        class FakeObservationClient:
+            def fetch_partial_historical_high(self, city, station_id, target_date, now):
+                return ObservedHigh(
+                    city=city,
+                    target_date=target_date,
+                    max_temperature_f=82.0,
+                    source=f"historical_metar_{station_id}",
+                    observed_at=now,
+                    sample_count=7,
+                    is_actual=True,
+                    is_final=False,
+                )
+
+        observed = _historical_observed_high_for_session(
+            market,
+            raw,
+            FakeObservationClient(),
+            {},
+            session_time,
+        )
+
+        assert observed is not None
+        self.assertEqual(observed.max_temperature_f, 82.0)
+        self.assertFalse(observed.is_final)
+        self.assertEqual(observed.source, "historical_metar_KLGA")
+
+    def test_maintenance_only_rows_do_not_open_new_positions(self) -> None:
+        generated_at = datetime(2026, 6, 24, 17, 0, tzinfo=timezone.utc)
+        outcome = ScoredOutcome(
+            market_id="market",
+            market_slug="market-slug",
+            question="Will the highest temperature in Seattle be 90°F or higher on June 24?",
+            bucket_label="90°F or higher",
+            token_id="token",
+            fair_value=0.9,
+            market_price=0.5,
+            edge=0.39,
+            model_count=1,
+            model_agreement=1.0,
+            probability_stdev=0.0,
+            generated_at=generated_at,
+            city="Seattle, WA",
+            target_date=date(2026, 6, 24),
+            rule_excerpt="",
+            model_probabilities={"fixture.model": 0.9},
+        )
+        positions: dict[str, HistoricalPosition] = {}
+        executions: list[dict[str, object]] = []
+        cash_ref = {"cash": 100.0}
+
+        _rebalance_session(
+            [outcome],
+            {"token"},
+            {"token": {"maintenance_only": True}},
+            positions,
+            executions,
+            cash_ref,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            compound_kelly_sizing=True,
+            max_position_usd=100.0,
+            max_position_fraction=0.25,
+            kelly_market_blend=0.0,
+            edge_position_full_cap_edge=0.25,
+            edge_position_min_multiplier=0.35,
+            min_trade_usd=1.0,
+            settings=SignalSettings(),
+        )
+
+        self.assertEqual({}, positions)
+        self.assertEqual([], executions)
+        self.assertEqual(100.0, cash_ref["cash"])
+
     def test_load_calibration_weights_aliases_legacy_gfs_source(self) -> None:
         payload = {
             "source_weights": {"open_meteo_gfs_hrrr": 0.62},
@@ -342,6 +458,7 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(signature.parameters["max_markets"].default, 8000)
         self.assertEqual(signature.parameters["max_runtime_seconds"].default, 0.0)
         self.assertEqual(signature.parameters["max_price_staleness_minutes"].default, 90)
+        self.assertEqual(signature.parameters["price_source"].default, "telonex")
 
     def test_long_backtest_run_log_paths_are_unique_for_parameter_sweeps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -872,6 +989,19 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(start_ts, 1775664525)
         self.assertEqual(end_ts, 1776176520)
 
+    def test_price_history_bounds_use_telonex_quote_availability_without_padding(self) -> None:
+        start_ts, end_ts = _price_history_bounds(
+            {
+                "startDate": "2026-01-01T00:00:00+00:00",
+                "endDate": "2026-02-01T00:00:00+00:00",
+                "telonex_quotes_from": "2026-01-19",
+                "telonex_quotes_to": "2026-01-21",
+            }
+        )
+
+        self.assertEqual(start_ts, 1768780800)
+        self.assertEqual(end_ts, 1769040000)
+
     def test_cached_price_history_does_not_refetch_existing_token(self) -> None:
         class FakeClob:
             def __init__(self) -> None:
@@ -889,6 +1019,92 @@ class BacktestTest(unittest.TestCase):
 
         self.assertIs(first, second)
         self.assertEqual(clob.calls, 1)
+
+    def test_cached_price_history_can_use_telonex_quote_source(self) -> None:
+        class FakeClob:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def fetch_price_history(self, token_id, *, interval, fidelity, start_ts, end_ts):
+                self.calls += 1
+                return []
+
+        class FakeTelonex:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def fetch_quote_price_history(self, *, slug, outcome, start_ts, end_ts, token_id=None):
+                self.calls.append(
+                    {"slug": slug, "outcome": outcome, "start_ts": start_ts, "end_ts": end_ts, "token_id": token_id}
+                )
+                return [PriceHistoryPoint(datetime(2026, 6, 18, 12, tzinfo=timezone.utc), 0.43)]
+
+        clob = FakeClob()
+        telonex = FakeTelonex()
+        cache = {}
+
+        first = _cached_price_history(
+            cache,
+            clob,
+            "token-1",
+            start_ts=1,
+            end_ts=2,
+            price_source="telonex",
+            telonex=telonex,
+            market_slug="market-slug",
+            outcome="Yes",
+        )
+        second = _cached_price_history(
+            cache,
+            clob,
+            "token-1",
+            start_ts=1,
+            end_ts=2,
+            price_source="telonex",
+            telonex=telonex,
+            market_slug="market-slug",
+            outcome="Yes",
+        )
+
+        self.assertIs(first, second)
+        self.assertEqual(clob.calls, 0)
+        self.assertEqual(len(telonex.calls), 1)
+        self.assertEqual(telonex.calls[0]["slug"], "market-slug")
+        self.assertEqual(telonex.calls[0]["outcome"], "Yes")
+
+    def test_telonex_market_record_converts_to_parseable_weather_raw(self) -> None:
+        record = {
+            "market_id": "0xabc",
+            "slug": "will-the-highest-temperature-in-london-be-68f-or-below-on-august-16",
+            "event_slug": "weather",
+            "event_title": "Highest temperature in London",
+            "question": "Will the highest temperature in London be 68°F or below on August 16?",
+            "description": "Resolved by official station.",
+            "resolution_source": "station",
+            "outcome_0": "Yes",
+            "outcome_1": "No",
+            "asset_id_0": "yes-token",
+            "asset_id_1": "no-token",
+            "status": "resolved",
+            "result_id": "1",
+            "start_date_us": 1755086400000000,
+            "end_date_us": 1755345600000000,
+            "created_at_us": 1755080000000000,
+            "settled_at_us": 1755350000000000,
+            "prepared_at_us": 1755086400000000,
+            "quotes_from": "2025-08-13",
+            "quotes_to": "2025-08-16",
+        }
+
+        raw = _telonex_market_record_to_raw(record)
+        assert raw is not None
+        parsed = parse_weather_market(raw, today=_market_parse_today(raw))
+
+        self.assertEqual(json.loads(raw["outcomePrices"]), ["0", "1"])
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.target_date, date(2025, 8, 16))
+        self.assertEqual(parsed.buckets[0].token_id, "yes-token")
 
     def test_runtime_limited_backtest_marks_open_positions_instead_of_force_settling(self) -> None:
         positions = {

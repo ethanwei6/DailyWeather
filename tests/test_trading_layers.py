@@ -860,13 +860,17 @@ class TradingLayersTest(unittest.TestCase):
             min_signal_fair_value=0.0,
             min_model_agreement=0.65,
             allow_bounded_bucket_entries=True,
+            bounded_bucket_min_edge=0.0,
+            bounded_bucket_min_fair_value=0.0,
+            bounded_bucket_min_model_agreement=0.0,
+            bounded_bucket_min_price=0.0,
             enforce_entry_timing_filter=False,
         )
         scored = score_outcomes(market, consensus, settings=settings)
         signals = signals_from_scored_outcomes(scored, settings)
         self.assertEqual(len(signals), 1)
 
-    def test_bounded_temperature_bucket_rejected_by_default(self) -> None:
+    def test_bounded_temperature_bucket_rejected_by_default_quality_gate(self) -> None:
         market = parse_weather_market(
             {
                 "id": "123",
@@ -893,7 +897,7 @@ class TradingLayersTest(unittest.TestCase):
         scored = score_outcomes(market, consensus, settings=settings)
 
         self.assertEqual(signals_from_scored_outcomes(scored, settings), [])
-        self.assertEqual("bounded exact/range bucket entries disabled", signal_filter_reason(scored[0], settings))
+        self.assertEqual("bounded exact/range bucket price below 0.5", signal_filter_reason(scored[0], settings))
 
     def test_correlated_exact_temperature_bucket_rejects_full_source_agreement(self) -> None:
         market = parse_weather_market(
@@ -923,6 +927,10 @@ class TradingLayersTest(unittest.TestCase):
             uncertainty_buffer=0.03,
             min_signal_fair_value=0.0,
             allow_bounded_bucket_entries=True,
+            bounded_bucket_min_edge=0.0,
+            bounded_bucket_min_fair_value=0.0,
+            bounded_bucket_min_model_agreement=0.0,
+            bounded_bucket_min_price=0.0,
             enforce_entry_timing_filter=False,
         )
         scored = score_outcomes(market, consensus, settings=settings)

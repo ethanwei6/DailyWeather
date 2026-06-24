@@ -90,6 +90,21 @@ class ObservedHighClient:
         except RuntimeError:
             return None
 
+    def fetch_partial_historical_high(
+        self,
+        city: CityConfig,
+        station_id: str,
+        target_date: date,
+        now: datetime,
+    ) -> Optional[ObservedHigh]:
+        local_now = _local_now(city, now)
+        if target_date > local_now.date():
+            return None
+        try:
+            return self._fetch_historical_metar_station_high(city, station_id, target_date, local_now)
+        except RuntimeError:
+            return None
+
     def _fetch_nws_station_high(self, city: CityConfig, target_date: date, local_now: datetime) -> Optional[ObservedHigh]:
         start, end = _target_window(city, target_date, local_now)
         payload = self.http.get_json(
