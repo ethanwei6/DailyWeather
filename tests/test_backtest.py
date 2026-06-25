@@ -6,7 +6,7 @@ import tempfile
 import time
 import unittest
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -33,12 +33,14 @@ from weather_strategy.long_backtest import (
     _pnl_concentration,
     _polymarket_yes_payout,
     _price_history_bounds,
+    _price_history_bounds_for_replay_times,
     _rebalance_session,
     _resolve_market_outcome,
     _real_data_audit,
     _robustness_diagnostics,
     _scored_to_json,
     _settlement_quality_diagnostics,
+    _signal_opportunity_diagnostics,
     _strategy_recommendation_diagnostics,
     _strategy_sensitivity_diagnostics,
     _telonex_market_record_to_raw,
@@ -1002,6 +1004,21 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(start_ts, 1768780800)
         self.assertEqual(end_ts, 1769040000)
 
+    def test_price_history_bounds_for_replay_times_only_cover_decision_window(self) -> None:
+        replay_times = [
+            (datetime(2026, 1, 20, 0, 0, tzinfo=timezone.utc), False),
+            (datetime(2026, 1, 20, 12, 0, tzinfo=timezone.utc), False),
+            (datetime(2026, 1, 21, 18, 0, tzinfo=timezone.utc), True),
+        ]
+
+        start_ts, end_ts = _price_history_bounds_for_replay_times(
+            replay_times,
+            max_staleness_minutes=90,
+        )
+
+        self.assertEqual(start_ts, int((replay_times[0][0] - timedelta(minutes=90)).timestamp()))
+        self.assertEqual(end_ts, int((replay_times[-1][0] + timedelta(seconds=1)).timestamp()))
+
     def test_cached_price_history_does_not_refetch_existing_token(self) -> None:
         class FakeClob:
             def __init__(self) -> None:
@@ -1460,15 +1477,120 @@ class BacktestTest(unittest.TestCase):
         self.assertIn("legacy_no_side_counter_event_0.08", replay_by_variant)
         self.assertIn("legacy_no_side_counter_event_0.09", replay_by_variant)
         self.assertIn("selected_no_side_counter_event_0.10", replay_by_variant)
+        self.assertIn("looser_no_side_counter_event_0.30", replay_by_variant)
         self.assertIn("max_position_fraction_0.05", replay_by_variant)
         self.assertIn("max_position_fraction_0.10", replay_by_variant)
         self.assertIn("entry_hours_utc_12_only", replay_by_variant)
         self.assertIn("entry_hours_utc_12_no_side_counter_event_0.13", replay_by_variant)
         self.assertIn("entry_hours_utc_12_no_side_counter_event_0.20", replay_by_variant)
+        self.assertIn("utc12_relaxed_no_side_counter_event_0.15", replay_by_variant)
+        self.assertIn("utc12_relaxed_no_side_counter_event_0.20", replay_by_variant)
+        self.assertIn("utc12_relaxed_no_side_counter_event_0.30", replay_by_variant)
         self.assertIn("disabled_no_side_counter_event_gate", replay_by_variant)
+        self.assertIn("disable_bounded_no_side_entries", replay_by_variant)
         self.assertIn("high_price_low_edge_damped_cap_0.85_edge_0.12_x0.35_full_0.25", replay_by_variant)
         self.assertIn("by_no_side_max_counter_event_probability", diagnostics)
         self.assertIn("max_drawdown_usd", replay_by_variant["current"])
+        self.assertIn("top_1_pnl_share", replay_by_variant["current"])
+
+    def test_json_kelly_replay_respects_time_conditioned_no_side_tail(self) -> None:
+        base_row = {
+            "city": "Miami, FL",
+            "target_date": "2026-01-22",
+            "market_price": 0.70,
+            "fair_value": 0.86,
+            "edge": 0.151,
+            "model_count": 3,
+            "model_agreement": 1.0,
+            "entry_eligible": True,
+            "bucket": "NO: 86°F or higher",
+            "side": "NO",
+            "bucket_width_f": None,
+            "model_probabilities": {"a.model": 0.85, "b.model": 0.88, "c.model": 0.90},
+            "polymarket_payout": 1,
+            "weather_outcome": 1,
+        }
+        rows = [
+            {**base_row, "generated_at": "2026-01-20T06:00:00+00:00", "token_id": "outside-hour"},
+            {**base_row, "generated_at": "2026-01-20T12:00:00+00:00", "token_id": "relaxed-hour"},
+        ]
+        settings = SignalSettings(
+            min_signal_fair_value=0.70,
+            allow_no_side_entries=True,
+            no_side_relaxed_counter_event_probability=0.20,
+            no_side_relaxed_counter_event_hours_utc=(12,),
+        )
+
+        replay = _json_kelly_replay(
+            "time-aware",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=0.75,
+            compound_kelly_sizing=True,
+            max_position_usd=100,
+            max_position_fraction=0.25,
+            edge_position_full_cap_edge=0.25,
+            edge_position_min_multiplier=0.35,
+            min_trade_usd=1,
+        )
+
+        self.assertEqual(replay["signals"], 1)
+        self.assertEqual(replay["trade_count"], 1)
+        self.assertEqual(replay["settings"]["no_side_relaxed_counter_event_probability"], 0.20)
+        self.assertEqual(replay["settings"]["no_side_relaxed_counter_event_hours_utc"], [12])
+
+    def test_signal_opportunity_diagnostics_explain_selected_and_rejected_cohorts(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-01-20T12:00:00+00:00",
+                "city": "Miami, FL",
+                "target_date": "2026-01-22",
+                "question": "Will the highest temperature in Miami be 86°F or higher on January 22?",
+                "bucket": "NO: 86°F or higher",
+                "side": "NO",
+                "token_id": "selected",
+                "market_price": 0.70,
+                "fair_value": 0.86,
+                "edge": 0.151,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "signal_filter_reason": None,
+                "model_probabilities": {"a.model": 0.91, "b.model": 0.92, "c.model": 0.93},
+                "polymarket_payout": 1,
+                "weather_outcome": 1,
+            },
+            {
+                "generated_at": "2026-01-20T12:00:00+00:00",
+                "city": "Miami, FL",
+                "target_date": "2026-01-22",
+                "question": "Will the highest temperature in Miami be 87°F or higher on January 22?",
+                "bucket": "87°F or higher",
+                "side": "YES",
+                "token_id": "rejected",
+                "market_price": 0.40,
+                "fair_value": 0.65,
+                "edge": 0.232,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "signal_filter_reason": "fair value below 0.70",
+                "model_probabilities": {"a.model": 0.65, "b.model": 0.66, "c.model": 0.64},
+                "polymarket_payout": 0,
+                "weather_outcome": 0,
+            },
+        ]
+
+        diagnostics = _signal_opportunity_diagnostics(rows, SignalSettings(min_signal_fair_value=0.70, allow_no_side_entries=True))
+
+        self.assertEqual(diagnostics["selected_candidate_rows"], 1)
+        self.assertEqual(diagnostics["selected_candidate_calibration"]["actual_rate"], 1.0)
+        self.assertEqual(diagnostics["selected_candidate_by_entry_hour_utc"][0]["group"], 12)
+        self.assertEqual(diagnostics["selected_candidate_by_lead_days"][0]["group"], 2)
+        self.assertEqual(diagnostics["selected_candidate_by_no_side_counter_event_probability"][0]["group"], 0.05)
+        self.assertEqual(diagnostics["rejected_by_signal_filter_reason"][0]["group"], "fair value below 0.70")
+        self.assertEqual(diagnostics["top_rejected_losers_by_edge"][0]["token_id"], "rejected")
 
     def test_strategy_recommendation_promotes_highest_clean_cap_only(self) -> None:
         sensitivity = {
@@ -1833,6 +1955,9 @@ class BacktestTest(unittest.TestCase):
                 "fair_value": 0.75,
                 "edge": 0.235,
                 "model_agreement": 1.0,
+                "bucket_lower_f": 80.0,
+                "bucket_upper_f": None,
+                "bucket_shape": "upper_tail",
             },
             {
                 "action": "SETTLE",
@@ -1847,6 +1972,9 @@ class BacktestTest(unittest.TestCase):
                 "realized_pnl_usd": 10.0,
                 "polymarket_payout": 1,
                 "weather_outcome": 1,
+                "bucket_lower_f": 80.0,
+                "bucket_upper_f": None,
+                "bucket_shape": "upper_tail",
             },
             {
                 "action": "BUY",
@@ -1863,6 +1991,9 @@ class BacktestTest(unittest.TestCase):
                 "fair_value": 0.80,
                 "edge": 0.5275,
                 "model_agreement": 1.0,
+                "bucket_lower_f": 50.0,
+                "bucket_upper_f": None,
+                "bucket_shape": "upper_tail",
             },
             {
                 "action": "SETTLE",
@@ -1877,6 +2008,9 @@ class BacktestTest(unittest.TestCase):
                 "realized_pnl_usd": -5.0,
                 "polymarket_payout": 0,
                 "weather_outcome": 0,
+                "bucket_lower_f": 50.0,
+                "bucket_upper_f": None,
+                "bucket_shape": "upper_tail",
             },
         ]
 
@@ -1890,6 +2024,7 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(diagnostics["event_loss_pnl_usd"], -5.0)
         self.assertEqual(diagnostics["profitable_event_loser_trades"], 0)
         self.assertEqual({row["group"] for row in diagnostics["by_event_outcome"]}, {"event_win", "event_loss"})
+        self.assertEqual({row["group"] for row in diagnostics["by_bucket_shape"]}, {"upper_tail"})
         self.assertEqual({row["group"] for row in diagnostics["by_entry_hour_utc"]}, {0, 12})
         self.assertEqual({row["group"] for row in diagnostics["by_entry_month"]}, {"2026-06"})
         self.assertEqual({row["group"] for row in diagnostics["by_city"]}, {"Dallas, TX", "New York, NY"})

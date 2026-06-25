@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -125,6 +126,35 @@ class TelonexTest(unittest.TestCase):
 
         self.assertEqual(fake_http.calls, 1)
         self.assertIn("cached missing file", str(second_error.exception))
+
+    def test_download_parquet_hard_timeout_interrupts_stalled_http(self) -> None:
+        class SlowHttp:
+            def get_redirect_location(self, url, params=None, headers=None):
+                time.sleep(0.2)
+                return "https://s3.example.test/file.parquet?signature=abc"
+
+            def get_bytes(self, url, params=None, headers=None):
+                return b"PAR1fake-parquet"
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = TelonexClient(
+                api_key="secret-key",
+                base_url="https://api.telonex.test/v1",
+                cache_dir=directory,
+                http=SlowHttp(),
+                env_path=Path(directory) / ".env-missing",
+                hard_timeout_seconds=0.01,
+            )
+
+            with self.assertRaises(RuntimeError) as error:
+                client.download_parquet(
+                    exchange="polymarket",
+                    channel="quotes",
+                    day=date(2026, 1, 20),
+                    params={"asset_id": "123"},
+                )
+
+        self.assertIn("hard-timeout", str(error.exception))
 
     def test_quote_records_to_price_history_uses_buy_ask_and_filters(self) -> None:
         records = [

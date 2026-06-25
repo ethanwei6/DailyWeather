@@ -20,6 +20,7 @@ class SignalSettings:
     yes_side_min_price: float = 0.20
     min_signal_fair_value: float = 0.70
     allow_bounded_bucket_entries: bool = True
+    allow_bounded_no_side_entries: bool = True
     bounded_bucket_min_edge: float = 0.10
     bounded_bucket_min_fair_value: float = 0.90
     bounded_bucket_min_model_agreement: float = 1.0
@@ -36,6 +37,8 @@ class SignalSettings:
     no_side_high_confidence_min_edge: float = 0.02
     no_side_max_price: Optional[float] = 0.95
     no_side_max_counter_event_probability: Optional[float] = 0.10
+    no_side_relaxed_counter_event_probability: Optional[float] = None
+    no_side_relaxed_counter_event_hours_utc: tuple[int, ...] = ()
     hold_no_side_max_counter_event_probability: Optional[float] = 0.15
     high_confidence_price_threshold: float = 0.75
     high_confidence_min_kelly_edge: float = 0.02
@@ -236,6 +239,12 @@ def signal_filter_reason(outcome: ScoredOutcome, settings: Optional[SignalSettin
         return f"NO-side market price above {_format_threshold(settings.no_side_max_price or 0.0)}"
     if _fails_bounded_bucket_entry_gate(outcome.bucket_lower_f, outcome.bucket_upper_f, settings):
         return "bounded exact/range bucket entries disabled"
+    if (
+        _is_no_side_outcome(outcome)
+        and not settings.allow_bounded_no_side_entries
+        and _is_bounded_bucket(outcome.bucket_lower_f, outcome.bucket_upper_f)
+    ):
+        return "bounded NO-side exact/range bucket entries disabled"
     if outcome.fair_value < settings.min_signal_fair_value:
         return f"fair value below {settings.min_signal_fair_value:.2f}"
     if not _passes_edge_gate(outcome.edge, outcome.market_price, settings):
@@ -247,8 +256,13 @@ def signal_filter_reason(outcome: ScoredOutcome, settings: Optional[SignalSettin
         no_side_edge_floor = _required_no_side_min_edge(outcome.market_price, settings)
         if outcome.edge < no_side_edge_floor:
             return f"NO-side edge below {no_side_edge_floor:.2f}"
-    if _is_no_side_outcome(outcome) and _fails_no_side_counter_event_gate(outcome.model_probabilities, settings):
-        return f"NO-side counter-event probability above {_format_threshold(settings.no_side_max_counter_event_probability or 0.0)}"
+    no_side_counter_threshold = _active_no_side_counter_event_threshold(settings, outcome.generated_at)
+    if _is_no_side_outcome(outcome) and _fails_no_side_counter_event_gate(
+        outcome.model_probabilities,
+        settings,
+        threshold=no_side_counter_threshold,
+    ):
+        return f"NO-side counter-event probability above {_format_threshold(no_side_counter_threshold or 0.0)}"
     if outcome.model_count < settings.min_model_count:
         return f"model count below {settings.min_model_count}"
     if outcome.model_agreement < settings.min_model_agreement:
@@ -428,6 +442,16 @@ def _fails_no_side_counter_event_gate(
         return False
     counter_probability = no_side_counter_event_probability(model_probabilities)
     return counter_probability is not None and counter_probability > threshold
+
+
+def _active_no_side_counter_event_threshold(settings: SignalSettings, generated_at: Optional[datetime]) -> Optional[float]:
+    threshold = settings.no_side_max_counter_event_probability
+    relaxed_threshold = settings.no_side_relaxed_counter_event_probability
+    relaxed_hours = settings.no_side_relaxed_counter_event_hours_utc
+    if relaxed_threshold is None or not relaxed_hours or generated_at is None:
+        return threshold
+    current = generated_at if generated_at.tzinfo is not None else generated_at.replace(tzinfo=timezone.utc)
+    return relaxed_threshold if current.astimezone(timezone.utc).hour in set(relaxed_hours) else threshold
 
 
 def _fails_low_price_exact_bucket_gate(

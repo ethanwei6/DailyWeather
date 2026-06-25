@@ -32,11 +32,84 @@ from weather_strategy.signals import (
 from weather_strategy.weather import OpenMeteoClient
 
 
+STRATEGY_PROFILE_CHOICES = (
+    "manual",
+    "live-forward-strict-100",
+    "live-forward-utc12-relaxed-no-tail-0.20",
+)
+
+LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
+    "min_edge": 0.08,
+    "min_model_agreement": 1.0,
+    "hold_min_model_agreement": 0.65,
+    "hold_min_fair_value": 0.60,
+    "hold_market_confirmation_price": 0.80,
+    "hold_market_confirmation_min_fair_value": 0.50,
+    "min_signal_fair_value": 0.70,
+    "min_price": 0.125,
+    "yes_side_min_price": 0.20,
+    "allow_no_side_entries": True,
+    "no_side_min_edge": 0.10,
+    "no_side_high_confidence_min_edge": 0.02,
+    "no_side_max_price": 0.95,
+    "no_side_max_counter_event_probability": 0.10,
+    "no_side_relaxed_counter_event_probability": None,
+    "no_side_relaxed_counter_event_hours_utc": "",
+    "hold_no_side_max_counter_event_probability": 0.15,
+    "high_confidence_price_threshold": 0.75,
+    "high_confidence_min_kelly_edge": 0.02,
+    "bankroll_usd": 100.0,
+    "kelly_fraction": 0.75,
+    "compound_kelly_sizing": True,
+    "max_position_usd": 100.0,
+    "max_position_fraction": 0.25,
+    "kelly_market_blend": 0.0,
+    "edge_position_full_cap_edge": 0.25,
+    "edge_position_min_multiplier": 0.35,
+    "min_trade_usd": 1.0,
+    "min_lead_days": 1,
+    "max_lead_days": 2,
+}
+
+STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
+    "manual": {},
+    "live-forward-strict-100": LIVE_FORWARD_PROFILE_SETTINGS,
+    "live-forward-utc12-relaxed-no-tail-0.20": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "no_side_relaxed_counter_event_probability": 0.20,
+        "no_side_relaxed_counter_event_hours_utc": "12",
+    },
+}
+
+
+def _add_strategy_profile_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--strategy-profile",
+        choices=STRATEGY_PROFILE_CHOICES,
+        default="manual",
+        help=(
+            "Optional named strategy preset. 'manual' leaves explicit flags unchanged; "
+            "live-forward-* presets apply the backtest/live-aligned paper settings."
+        ),
+    )
+
+
+def _apply_strategy_profile(args: argparse.Namespace) -> None:
+    profile = getattr(args, "strategy_profile", "manual") or "manual"
+    values = STRATEGY_PROFILE_SETTINGS.get(profile)
+    if values is None:
+        raise ValueError(f"Unknown strategy profile: {profile}")
+    for key, value in values.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Weather Polymarket strategy tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     paper = subparsers.add_parser("paper-run", help="Generate and record paper-trade signals")
+    _add_strategy_profile_argument(paper)
     paper.add_argument("--fixture", help="Explicit fixture JSON file for deterministic local runs")
     paper.add_argument("--ledger", default="work/data/paper_trades.sqlite", help="SQLite paper-trade ledger path")
     paper.add_argument("--limit", type=int, default=50, help="Maximum eligible live markets to score when no fixture is supplied")
@@ -79,10 +152,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--no-side-high-confidence-min-edge", type=float, default=0.02, help="Minimum absolute buffered edge for NO-token entries when the NO price is at or above --high-confidence-price-threshold")
     paper.add_argument("--no-side-max-price", type=float, default=0.95, help="Maximum entry price for NO-token entries; set at or above --max-price to disable the side-specific cap")
     paper.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For NO-token research rows, reject entries if any model view gives the opposite YES event more than this probability")
+    paper.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None, help="Optional relaxed NO counter-event cap used only during --no-side-relaxed-counter-event-hours-utc")
+    paper.add_argument("--no-side-relaxed-counter-event-hours-utc", default="", help="Comma-separated UTC hours that may use --no-side-relaxed-counter-event-probability")
     paper.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability")
     paper.add_argument("--min-signal-fair-value", type=float, default=0.70)
     paper.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     paper.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    paper.add_argument("--allow-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_true", default=True)
+    paper.add_argument("--disable-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_false")
     paper.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
     paper.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     paper.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
@@ -116,6 +193,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     calibration.add_argument("--ledger", default="work/data/paper_trades.sqlite")
 
     backtest = subparsers.add_parser("backtest", help="Backtest recorded forecast snapshots and fit model/source weights")
+    _add_strategy_profile_argument(backtest)
     backtest.add_argument("--ledger", default="work/data/weather_kelly_paper.sqlite")
     backtest.add_argument("--bankroll-usd", type=float, default=1000.0)
     backtest.add_argument("--kelly-fraction", type=float, default=0.25)
@@ -149,10 +227,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--no-side-high-confidence-min-edge", type=float, default=0.02)
     backtest.add_argument("--no-side-max-price", type=float, default=0.95)
     backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10)
+    backtest.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None)
+    backtest.add_argument("--no-side-relaxed-counter-event-hours-utc", default="")
     backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15)
     backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
     backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    backtest.add_argument("--allow-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_true", default=True)
+    backtest.add_argument("--disable-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_false")
     backtest.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
     backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
@@ -168,6 +250,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--no-run-log", action="store_true", help="Disable detailed JSON backtest log output")
 
     long_backtest = subparsers.add_parser("long-backtest", help="Run a historical live-compatible backtest using real Polymarket price history and historical forecasts")
+    _add_strategy_profile_argument(long_backtest)
     long_backtest.add_argument("--bankroll-usd", type=float, default=100.0)
     long_backtest.add_argument("--pages", type=int, default=10, help="Gamma public-search pages to scan")
     long_backtest.add_argument("--limit-per-page", type=int, default=50)
@@ -221,10 +304,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--yes-side-min-price", type=float, default=0.20)
     long_backtest.add_argument("--no-side-max-price", type=float, default=0.95, help="Maximum entry price for experimental NO-token entries; set at or above --max-price to disable the side-specific cap")
     long_backtest.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For experimental NO-token entries, reject rows if any model view gives the opposite YES event more than this probability; set >=1 to disable")
+    long_backtest.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None, help="Optional relaxed NO counter-event cap used only during --no-side-relaxed-counter-event-hours-utc")
+    long_backtest.add_argument("--no-side-relaxed-counter-event-hours-utc", default="", help="Comma-separated UTC hours that may use --no-side-relaxed-counter-event-probability")
     long_backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability; set >=1 to disable")
     long_backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
     long_backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     long_backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    long_backtest.add_argument("--allow-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_true", default=True)
+    long_backtest.add_argument("--disable-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_false")
     long_backtest.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
     long_backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     long_backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
@@ -258,6 +345,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--summary-only", action="store_true", help="Print a compact summary while preserving the full JSON run log")
 
     args = parser.parse_args(argv)
+    _apply_strategy_profile(args)
     if args.command == "paper-run":
         return run_paper(args)
     if args.command == "scan-live":
@@ -345,9 +433,12 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
         no_side_max_price=args.no_side_max_price,
         no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
+        no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        allow_bounded_no_side_entries=args.allow_bounded_no_side_entries,
         bounded_bucket_min_edge=args.bounded_bucket_min_edge,
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
@@ -378,6 +469,7 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         min_weight_samples=args.min_weight_samples,
         weight_prior_samples=args.weight_prior_samples,
     )
+    result["strategy_profile"] = args.strategy_profile
     if not args.no_run_log:
         run_log_path = _make_run_log_path(args.run_log_dir, "backtest")
         result["run_log_path"] = str(run_log_path)
@@ -404,6 +496,7 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         yes_side_min_price=args.yes_side_min_price,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        allow_bounded_no_side_entries=args.allow_bounded_no_side_entries,
         bounded_bucket_min_edge=args.bounded_bucket_min_edge,
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
@@ -413,6 +506,8 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
         no_side_max_price=args.no_side_max_price,
         no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
+        no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
@@ -454,6 +549,7 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         http_hard_timeout_seconds=args.http_hard_timeout_seconds,
         price_source=args.price_source,
         market_source=args.market_source,
+        strategy_profile=args.strategy_profile,
     )
     print(json.dumps(_long_backtest_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
     return 0
@@ -472,6 +568,12 @@ def _parse_entry_hours(value: str) -> tuple[int, ...]:
     if not hours:
         raise ValueError("At least one entry hour is required")
     return tuple(sorted(set(hours)))
+
+
+def _parse_optional_entry_hours(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    return _parse_entry_hours(value)
 
 
 def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
@@ -512,6 +614,7 @@ def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
         "scored_outcomes_detail_count",
         "skipped_reason_counts",
         "run_log_path",
+        "run_log_write_error",
     )
     return {
         **{key: result.get(key) for key in keys},
@@ -520,6 +623,7 @@ def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
         "trade_diagnostics": result.get("trade_diagnostics"),
         "score_calibration_diagnostics": result.get("score_calibration_diagnostics"),
         "signal_filter_diagnostics": result.get("signal_filter_diagnostics"),
+        "signal_opportunity_diagnostics": result.get("signal_opportunity_diagnostics"),
         "strategy_sensitivity_diagnostics": result.get("strategy_sensitivity_diagnostics"),
         "robustness_diagnostics": result.get("robustness_diagnostics"),
         "strategy_recommendation_diagnostics": result.get("strategy_recommendation_diagnostics"),
@@ -582,9 +686,12 @@ def run_paper(args: argparse.Namespace) -> int:
         no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
         no_side_max_price=args.no_side_max_price,
         no_side_max_counter_event_probability=args.no_side_max_counter_event_probability,
+        no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
+        no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
+        allow_bounded_no_side_entries=args.allow_bounded_no_side_entries,
         bounded_bucket_min_edge=args.bounded_bucket_min_edge,
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
@@ -709,6 +816,7 @@ def run_paper(args: argparse.Namespace) -> int:
         metadata={
             "fixture_mode": fixture_mode,
             "run_at": datetime.now(timezone.utc).isoformat(),
+            "strategy_profile": args.strategy_profile,
             "market_count": len(markets),
             "processed_market_count": processed_markets,
             "skipped_market_count": len(skipped_markets),
@@ -734,6 +842,7 @@ def run_paper(args: argparse.Namespace) -> int:
             "runtime_limited": runtime_limited,
             "elapsed_seconds": round(time.monotonic() - started, 2),
             "weights_file": args.weights_file if source_weights or model_weights else None,
+            "strategy_profile": args.strategy_profile,
             "compound_kelly_sizing": args.compound_kelly_sizing,
             "sizing_bankroll_usd": sizing_bankroll_usd,
             "max_position_fraction": args.max_position_fraction,
@@ -768,6 +877,7 @@ def run_paper(args: argparse.Namespace) -> int:
         "pnl_usd": round(equity - args.bankroll_usd, 2),
         "open_positions": len(ledger.positions()),
         "ledger": args.ledger,
+        "strategy_profile": args.strategy_profile,
         "weights_file": args.weights_file if source_weights or model_weights else None,
         "source_weights_loaded": len(source_weights),
         "model_weights_loaded": len(model_weights),
@@ -914,6 +1024,7 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "yes_side_min_price": settings.yes_side_min_price,
         "min_signal_fair_value": settings.min_signal_fair_value,
         "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+        "allow_bounded_no_side_entries": settings.allow_bounded_no_side_entries,
         "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
         "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
         "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
@@ -923,6 +1034,8 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,
         "no_side_max_price": settings.no_side_max_price,
         "no_side_max_counter_event_probability": settings.no_side_max_counter_event_probability,
+        "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
+        "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
         "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,

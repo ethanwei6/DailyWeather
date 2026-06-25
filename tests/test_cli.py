@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -8,7 +9,7 @@ from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
 
-from weather_strategy.cli import _make_run_log_path, _parse_markets, main
+from weather_strategy.cli import _apply_strategy_profile, _make_run_log_path, _parse_markets, main
 from weather_strategy.cli import _should_process_market
 from weather_strategy.paper import PaperLedger
 from weather_strategy.parser import parse_weather_market
@@ -16,6 +17,50 @@ from weather_strategy.signals import SignalSettings
 
 
 class CliTest(unittest.TestCase):
+    def test_strategy_profile_applies_utc12_relaxed_live_forward_settings(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-utc12-relaxed-no-tail-0.20",
+            allow_no_side_entries=False,
+            no_side_max_counter_event_probability=0.05,
+            no_side_relaxed_counter_event_probability=None,
+            no_side_relaxed_counter_event_hours_utc="",
+            bankroll_usd=1000.0,
+            kelly_fraction=0.25,
+            compound_kelly_sizing=False,
+            max_position_usd=1000.0,
+            max_position_fraction=0.15,
+            min_lead_days=0,
+            max_lead_days=7,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.10)
+        self.assertEqual(args.no_side_relaxed_counter_event_probability, 0.20)
+        self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "12")
+        self.assertEqual(args.bankroll_usd, 100.0)
+        self.assertEqual(args.kelly_fraction, 0.75)
+        self.assertTrue(args.compound_kelly_sizing)
+        self.assertEqual(args.max_position_usd, 100.0)
+        self.assertEqual(args.max_position_fraction, 0.25)
+        self.assertEqual(args.min_lead_days, 1)
+        self.assertEqual(args.max_lead_days, 2)
+
+    def test_manual_strategy_profile_leaves_explicit_settings_unchanged(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="manual",
+            allow_no_side_entries=False,
+            no_side_relaxed_counter_event_probability=None,
+            bankroll_usd=250.0,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertFalse(args.allow_no_side_entries)
+        self.assertIsNone(args.no_side_relaxed_counter_event_probability)
+        self.assertEqual(args.bankroll_usd, 250.0)
+
     def test_fixture_paper_run_records_trade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             ledger_path = Path(directory) / "paper.sqlite"

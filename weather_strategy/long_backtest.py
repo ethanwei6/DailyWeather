@@ -288,6 +288,7 @@ def run_long_historical_backtest(
     http_hard_timeout_seconds: int = 30,
     price_source: str = "telonex",
     market_source: str = "telonex",
+    strategy_profile: str = "manual",
 ) -> dict[str, Any]:
     started = time.monotonic()
     deadline = None if max_runtime_seconds <= 0 else started + max_runtime_seconds
@@ -295,8 +296,8 @@ def run_long_historical_backtest(
     http = CachedHttpClient(cache_dir, hard_timeout_seconds=http_hard_timeout_seconds)
     gamma = PolymarketGammaClient(http=http)
     clob = PolymarketClobClient(http=http)
-    price_source_name, telonex = _historical_price_source(price_source, cache_dir)
-    market_source_name, telonex = _historical_market_source(market_source, cache_dir, telonex)
+    price_source_name, telonex = _historical_price_source(price_source, cache_dir, hard_timeout_seconds=http_hard_timeout_seconds)
+    market_source_name, telonex = _historical_market_source(market_source, cache_dir, telonex, hard_timeout_seconds=http_hard_timeout_seconds)
     forecast_client = SingleRunForecastClient(http)
     observation_client = ObservedHighClient(http=http)
     source_weights, model_weights = load_calibration_weights(weights_file)
@@ -355,7 +356,18 @@ def run_long_historical_backtest(
             weather_crosscheck_ambiguous_count += 1
             if len(weather_crosscheck_ambiguous_examples) < 50:
                 weather_crosscheck_ambiguous_examples.append(_resolution_example(market, bucket, raw, resolution))
-        price_start_ts, price_end_ts = _price_history_bounds(raw)
+        replay_times = [
+            (decision_time, maintenance_only)
+            for decision_time, maintenance_only in _candidate_replay_times(market, entry_hours_utc, min_lead_days, max_lead_days)
+            if _market_active_at(raw, decision_time)
+        ]
+        if not replay_times:
+            skipped.append({"question": market.question, "reason": "no configured replay sessions while market active"})
+            continue
+        price_start_ts, price_end_ts = _price_history_bounds_for_replay_times(
+            replay_times,
+            max_staleness_minutes=max_price_staleness_minutes,
+        )
         try:
             history = _cached_price_history(
                 price_history_cache,
@@ -398,10 +410,8 @@ def run_long_historical_backtest(
                 if len(skipped) < 50:
                     skipped.append({"question": market.question, "reason": f"no_side_price_history: {str(error)[:240]}"})
         added_entry_session = False
-        for decision_time, maintenance_only in _candidate_replay_times(market, entry_hours_utc, min_lead_days, max_lead_days):
+        for decision_time, maintenance_only in replay_times:
             if maintenance_only and not added_entry_session:
-                continue
-            if not _market_active_at(raw, decision_time):
                 continue
             entry = select_entry_price(
                 history,
@@ -609,6 +619,7 @@ def run_long_historical_backtest(
     trade_diagnostics = _trade_performance_diagnostics(executions)
     score_calibration_diagnostics = _score_calibration_diagnostics(scored_detail)
     signal_filter_diagnostics = _signal_filter_diagnostics(scored_detail)
+    signal_opportunity_diagnostics = _signal_opportunity_diagnostics(scored_detail, settings)
     data_quality_diagnostics = _data_quality_diagnostics(
         executions,
         scored_detail,
@@ -671,6 +682,7 @@ def run_long_historical_backtest(
         "trade_diagnostics": trade_diagnostics,
         "score_calibration_diagnostics": score_calibration_diagnostics,
         "signal_filter_diagnostics": signal_filter_diagnostics,
+        "signal_opportunity_diagnostics": signal_opportunity_diagnostics,
         "strategy_sensitivity_diagnostics": strategy_sensitivity_diagnostics,
         "robustness_diagnostics": robustness_diagnostics,
         "strategy_recommendation_diagnostics": strategy_recommendation_diagnostics,
@@ -722,6 +734,7 @@ def run_long_historical_backtest(
             "http_hard_timeout_seconds": http_hard_timeout_seconds,
             "price_source": price_source_name,
             "market_source": market_source_name,
+            "strategy_profile": strategy_profile,
             "source_weights_loaded": len(source_weights),
             "model_weights_loaded": len(model_weights),
             "signal_settings": _signal_settings_to_json(settings),
@@ -748,7 +761,10 @@ def run_long_historical_backtest(
         "skipped_examples": skipped[:50],
         "run_log_path": str(run_log_path),
     }
-    _write_json_log(run_log_path, result)
+    try:
+        _write_json_log(run_log_path, result)
+    except OSError as exc:
+        result["run_log_write_error"] = f"{type(exc).__name__}: {exc}"
     return result
 
 
@@ -931,14 +947,14 @@ def _cached_price_history(
     return history
 
 
-def _historical_price_source(price_source: str, cache_dir: str | Path) -> tuple[str, Optional[TelonexClient]]:
+def _historical_price_source(price_source: str, cache_dir: str | Path, *, hard_timeout_seconds: float = 30) -> tuple[str, Optional[TelonexClient]]:
     normalized = price_source.strip().lower()
     if normalized not in {"telonex", "clob", "auto"}:
         raise ValueError(f"Unsupported historical price source: {price_source}")
     if normalized == "clob":
         return "clob", None
     try:
-        client = TelonexClient(cache_dir=Path(cache_dir) / "telonex")
+        client = TelonexClient(cache_dir=Path(cache_dir) / "telonex", hard_timeout_seconds=hard_timeout_seconds)
     except TelonexConfigurationError:
         if normalized == "auto":
             return "clob", None
@@ -950,6 +966,8 @@ def _historical_market_source(
     market_source: str,
     cache_dir: str | Path,
     telonex: Optional[TelonexClient],
+    *,
+    hard_timeout_seconds: float = 30,
 ) -> tuple[str, Optional[TelonexClient]]:
     normalized = market_source.strip().lower()
     if normalized not in {"telonex", "gamma"}:
@@ -958,7 +976,7 @@ def _historical_market_source(
         return "gamma", telonex
     if telonex is not None:
         return "telonex", telonex
-    return "telonex", TelonexClient(cache_dir=Path(cache_dir) / "telonex")
+    return "telonex", TelonexClient(cache_dir=Path(cache_dir) / "telonex", hard_timeout_seconds=hard_timeout_seconds)
 
 
 def _price_source_description(price_source: str, side: str) -> str:
@@ -1344,6 +1362,22 @@ def _price_history_bounds(raw: dict[str, Any], *, padding_hours: int = 12) -> tu
     return start_ts, end_ts
 
 
+def _price_history_bounds_for_replay_times(
+    replay_times: Iterable[tuple[datetime, bool]],
+    *,
+    max_staleness_minutes: int,
+) -> tuple[Optional[int], Optional[int]]:
+    timestamps = sorted(
+        (timestamp if timestamp.tzinfo else timestamp.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+        for timestamp, _maintenance_only in replay_times
+    )
+    if not timestamps:
+        return None, None
+    start = timestamps[0] - timedelta(minutes=max(0, max_staleness_minutes))
+    end = timestamps[-1] + timedelta(seconds=1)
+    return int(start.timestamp()), int(end.timestamp())
+
+
 def _parse_date(value: Any) -> Optional[date]:
     if not value:
         return None
@@ -1576,6 +1610,10 @@ def _execution_json(action: str, outcome: ScoredOutcome, shares: float, price: f
         "fair_value": outcome.fair_value,
         "edge": outcome.edge,
         "model_agreement": outcome.model_agreement,
+        "bucket_lower_f": outcome.bucket_lower_f,
+        "bucket_upper_f": outcome.bucket_upper_f,
+        "bucket_width_f": outcome.bucket_width_f,
+        "bucket_shape": _bucket_shape(outcome.bucket_lower_f, outcome.bucket_upper_f),
         **dict(metadata),
     }
 
@@ -1625,6 +1663,7 @@ def _scored_to_json(outcome: ScoredOutcome, metadata: Mapping[str, Any], setting
         "bucket_lower_f": outcome.bucket_lower_f,
         "bucket_upper_f": outcome.bucket_upper_f,
         "bucket_width_f": outcome.bucket_width_f,
+        "bucket_shape": _bucket_shape(outcome.bucket_lower_f, outcome.bucket_upper_f),
         "resolution_unit": outcome.resolution_unit,
         "resolution_precision": outcome.resolution_precision,
         "timing_entry_eligible": outcome.entry_eligible,
@@ -1690,6 +1729,9 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
                 "realized_pnl_usd": 0.0,
                 "polymarket_payout": execution.get("polymarket_payout"),
                 "weather_outcome": execution.get("weather_outcome"),
+                "bucket_lower_f": execution.get("bucket_lower_f"),
+                "bucket_upper_f": execution.get("bucket_upper_f"),
+                "bucket_shape": execution.get("bucket_shape"),
             },
         )
         if execution.get("side") is not None:
@@ -1727,6 +1769,8 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         trade["edge_bucket"] = _bucket_float(trade.get("first_buy_edge"), 0.05)
         trade["agreement_bucket"] = _bucket_float(trade.get("first_buy_model_agreement"), 0.25)
         trade["event_outcome"] = _event_outcome_label(trade.get("polymarket_payout"))
+        if trade.get("bucket_shape") is None:
+            trade["bucket_shape"] = _bucket_shape(trade.get("bucket_lower_f"), trade.get("bucket_upper_f"))
 
     return {
         "trade_count": len(trades),
@@ -1738,6 +1782,7 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         "by_entry_month": _aggregate_trade_groups(trades, "entry_month"),
         "by_target_month": _aggregate_trade_groups(trades, "target_month"),
         "by_side": _aggregate_trade_groups(trades, "side"),
+        "by_bucket_shape": _aggregate_trade_groups(trades, "bucket_shape"),
         "by_event_outcome": _aggregate_trade_groups(trades, "event_outcome"),
         "by_edge_bucket": _aggregate_trade_groups(trades, "edge_bucket"),
         "by_model_agreement_bucket": _aggregate_trade_groups(trades, "agreement_bucket"),
@@ -2148,6 +2193,123 @@ def _signal_filter_diagnostics(scored: list[dict[str, Any]]) -> dict[str, Any]:
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
+def _signal_opportunity_diagnostics(scored: list[dict[str, Any]], settings: SignalSettings) -> dict[str, Any]:
+    resolved = [row for row in scored if row.get("polymarket_payout") in (0, 1)]
+    entry_eligible = [row for row in resolved if row.get("entry_eligible", True)]
+    signal_eligible = [row for row in resolved if row.get("signal_filter_reason") is None]
+    selected_candidates = _selected_candidate_rows(scored, settings)
+    rejected_entry_rows = [
+        row
+        for row in entry_eligible
+        if row.get("signal_filter_reason") is not None
+    ]
+    selected_rows = _score_cohort_rows(selected_candidates)
+    signal_rows = _score_cohort_rows(signal_eligible)
+    rejected_rows = _score_cohort_rows(rejected_entry_rows)
+    return {
+        "method": (
+            "Resolved scored-row diagnostics. Selected candidates use the same one-token-per-city/date/session "
+            "selection as the replay. Rejected rows are not trade recommendations; they show which gates filtered "
+            "rows that later resolved true or false."
+        ),
+        "resolved_rows": len(resolved),
+        "entry_eligible_rows": len(entry_eligible),
+        "signal_eligible_rows": len(signal_eligible),
+        "selected_candidate_rows": len(selected_candidates),
+        "selected_candidate_calibration": _calibration_metrics(selected_rows),
+        "selected_candidate_by_side": _aggregate_opportunity_groups(selected_rows, "side", None),
+        "selected_candidate_by_entry_hour_utc": _aggregate_opportunity_groups(selected_rows, "entry_hour_utc", None),
+        "selected_candidate_by_lead_days": _aggregate_opportunity_groups(selected_rows, "lead_days", None),
+        "selected_candidate_by_bucket_shape": _aggregate_opportunity_groups(selected_rows, "bucket_shape", None),
+        "selected_candidate_by_market_price_bucket": _aggregate_opportunity_groups(selected_rows, "market_price", 0.10),
+        "selected_candidate_by_edge_bucket": _aggregate_opportunity_groups(selected_rows, "edge", 0.10),
+        "selected_candidate_by_no_side_counter_event_probability": _aggregate_opportunity_groups(
+            [row for row in selected_rows if row.get("side") == "NO"],
+            "no_side_counter_event_probability",
+            0.05,
+        ),
+        "signal_eligible_by_side": _aggregate_opportunity_groups(signal_rows, "side", None),
+        "signal_eligible_by_entry_hour_utc": _aggregate_opportunity_groups(signal_rows, "entry_hour_utc", None),
+        "rejected_by_signal_filter_reason": _rejected_reason_quality(rejected_rows),
+        "top_rejected_winners_by_edge": _top_rejected_examples(rejected_rows, payout=1),
+        "top_rejected_losers_by_edge": _top_rejected_examples(rejected_rows, payout=0),
+    }
+
+
+def _score_cohort_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{**row, **_score_cohort_fields(row)} for row in rows]
+
+
+def _score_cohort_fields(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "entry_hour_utc": _score_entry_hour_utc(row),
+        "lead_days": _score_lead_days(row),
+        "target_month": _month_key(row.get("target_date")),
+        "entry_month": _month_key(row.get("generated_at")),
+        "no_side_counter_event_probability": (
+            no_side_counter_event_probability(row.get("model_probabilities") or {})
+            if _json_is_no_side_row(row)
+            else None
+        ),
+    }
+
+
+def _rejected_reason_quality(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row.get("signal_filter_reason") or "eligible", []).append(row)
+    return [
+        _opportunity_quality_row(reason, items)
+        for reason, items in sorted(grouped.items(), key=lambda item: (-len(item[1]), str(item[0])))
+    ][:30]
+
+
+def _aggregate_opportunity_groups(rows: list[dict[str, Any]], key: str, width: Optional[float]) -> list[dict[str, Any]]:
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        group_key = row.get(key)
+        if width is not None:
+            group_key = _bucket_float(group_key, width)
+        grouped.setdefault(group_key, []).append(row)
+    return [
+        _opportunity_quality_row(group, items)
+        for group, items in sorted(grouped.items(), key=lambda item: str(item[0]))
+    ]
+
+
+def _opportunity_quality_row(group: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    row = _candidate_quality_row("cohort", group, rows)
+    row.pop("setting", None)
+    row["group"] = row.pop("threshold")
+    return row
+
+
+def _top_rejected_examples(rows: list[dict[str, Any]], *, payout: int) -> list[dict[str, Any]]:
+    filtered = [row for row in rows if row.get("polymarket_payout") == payout]
+    return [
+        {
+            "generated_at": row.get("generated_at"),
+            "token_id": row.get("token_id"),
+            "question": row.get("question"),
+            "city": row.get("city"),
+            "target_date": row.get("target_date"),
+            "side": row.get("side"),
+            "bucket": row.get("bucket"),
+            "signal_filter_reason": row.get("signal_filter_reason"),
+            "market_price": row.get("market_price"),
+            "fair_value": row.get("fair_value"),
+            "edge": row.get("edge"),
+            "model_agreement": row.get("model_agreement"),
+            "entry_hour_utc": row.get("entry_hour_utc"),
+            "lead_days": row.get("lead_days"),
+            "no_side_counter_event_probability": row.get("no_side_counter_event_probability"),
+            "polymarket_payout": row.get("polymarket_payout"),
+            "weather_outcome": row.get("weather_outcome"),
+        }
+        for row in sorted(filtered, key=lambda item: float(item.get("edge") or 0.0), reverse=True)[:10]
+    ]
+
+
 def _strategy_sensitivity_diagnostics(
     scored: list[dict[str, Any]],
     settings: SignalSettings,
@@ -2257,6 +2419,9 @@ def _strategy_recommendation_diagnostics(
         ("aggressive_max_position_fraction_0.25", "max_position_fraction_0.25", "25%"),
     )
     looser_tail = replays.get("looser_no_side_counter_event_0.20")
+    very_loose_tail = replays.get("looser_no_side_counter_event_0.30")
+    time_conditioned_tail = replays.get("utc12_relaxed_no_side_counter_event_0.20")
+    very_loose_time_conditioned_tail = replays.get("utc12_relaxed_no_side_counter_event_0.30")
     candidates = [
         _profile_summary("current", current),
         _profile_summary("conservative_max_position_fraction_0.10", conservative_cap),
@@ -2265,6 +2430,9 @@ def _strategy_recommendation_diagnostics(
             for display_name, variant_name, _label in cap_upgrade_variants
         ),
         _profile_summary("looser_no_side_counter_event_0.20", looser_tail),
+        _profile_summary("looser_no_side_counter_event_0.30", very_loose_tail),
+        _profile_summary("utc12_relaxed_no_side_counter_event_0.20", time_conditioned_tail),
+        _profile_summary("utc12_relaxed_no_side_counter_event_0.30", very_loose_time_conditioned_tail),
     ]
     candidates = [candidate for candidate in candidates if candidate]
 
@@ -2278,6 +2446,10 @@ def _strategy_recommendation_diagnostics(
     reasons = [
         "Current gates remain the accuracy baseline because traded tokens have weather-matched settlement checks and no ambiguous traded tokens.",
     ]
+    if current and _safe_float((current.get("pnl_concentration") or {}).get("top_1_pnl_share")) >= 0.75:
+        reasons.append(
+            "Current replay PnL is highly concentrated in its top trade, so headline return should be treated as strategy research rather than production proof."
+        )
     for display_name, variant_name, label in cap_upgrade_variants:
         replay = replays.get(variant_name)
         slice_check = cap_slice_checks[variant_name]
@@ -2300,6 +2472,18 @@ def _strategy_recommendation_diagnostics(
             reasons.append(
                 "The looser 20% NO counter-event tail is not recommended despite higher in-sample PnL because it lowered event hit rate or introduced ambiguous weather validation."
             )
+        elif _safe_float(looser_tail.get("pnl_usd")) > _safe_float(current.get("pnl_usd") if current else None):
+            reasons.append(
+                "The looser 20% NO counter-event tail is a high-risk candidate rather than a default promotion because it increases trade count, gross exposure, and drawdown; it needs live paper validation before replacing the strict 10% entry gate."
+            )
+    if time_conditioned_tail and _safe_float(time_conditioned_tail.get("pnl_usd")) > _safe_float(current.get("pnl_usd") if current else None):
+        reasons.append(
+            "The UTC-12 relaxed 20% NO counter-event tail is a narrower candidate for live-forward paper testing because it keeps the strict 10% tail outside its configured entry hour."
+        )
+    if very_loose_tail and _safe_float(very_loose_tail.get("max_drawdown_usd")) > _safe_float(looser_tail.get("max_drawdown_usd") if looser_tail else None):
+        reasons.append(
+            "The 30% NO counter-event tail is tracked as an exploratory diagnostic only; it is expected to add more trades but should not be promoted without cleaner drawdown and forward-paper evidence."
+        )
 
     return {
         "method": (
@@ -2600,6 +2784,7 @@ def _counterfactual_kelly_replays(
         ("looser_fair_value_0.60", replace(settings, min_signal_fair_value=0.60)),
         ("stricter_fair_value_0.80", replace(settings, min_signal_fair_value=0.80)),
         ("allow_bounded_bucket_entries", replace(settings, allow_bounded_bucket_entries=True)),
+        ("disable_bounded_no_side_entries", replace(settings, allow_bounded_no_side_entries=False)),
         (
             "allow_bounded_strict_fv_0.80",
             replace(settings, allow_bounded_bucket_entries=True, min_signal_fair_value=0.80),
@@ -2625,6 +2810,19 @@ def _counterfactual_kelly_replays(
         ("legacy_no_side_counter_event_0.09", replace(settings, no_side_max_counter_event_probability=0.09)),
         ("selected_no_side_counter_event_0.10", replace(settings, no_side_max_counter_event_probability=0.10)),
         ("looser_no_side_counter_event_0.20", replace(settings, no_side_max_counter_event_probability=0.20)),
+        ("looser_no_side_counter_event_0.30", replace(settings, no_side_max_counter_event_probability=0.30)),
+        (
+            "utc12_relaxed_no_side_counter_event_0.15",
+            replace(settings, no_side_relaxed_counter_event_probability=0.15, no_side_relaxed_counter_event_hours_utc=(12,)),
+        ),
+        (
+            "utc12_relaxed_no_side_counter_event_0.20",
+            replace(settings, no_side_relaxed_counter_event_probability=0.20, no_side_relaxed_counter_event_hours_utc=(12,)),
+        ),
+        (
+            "utc12_relaxed_no_side_counter_event_0.30",
+            replace(settings, no_side_relaxed_counter_event_probability=0.30, no_side_relaxed_counter_event_hours_utc=(12,)),
+        ),
         ("disabled_no_side_counter_event_gate", replace(settings, no_side_max_counter_event_probability=1.0)),
         ("legacy_no_side_max_price_0.90", replace(settings, no_side_max_price=0.90)),
         ("prior_no_side_max_price_0.93", replace(settings, no_side_max_price=0.93)),
@@ -3029,6 +3227,7 @@ def _json_kelly_replay(
     event_win_pnl = sum(trade_pnl.get(token, 0.0) for token in trade_tokens if trade_payout.get(token) == 1)
     profitable_event_losers = sum(1 for token in trade_tokens if trade_payout.get(token) == 0 and trade_pnl.get(token, 0.0) > 0)
     buy_notional = sum(trade_buy_notional.values())
+    replay_concentration = _pnl_concentration_from_values(list(trade_pnl.values()))
     return {
         "variant": name,
         "ending_equity_usd": round(cash, 2),
@@ -3044,6 +3243,8 @@ def _json_kelly_replay(
         "event_win_pnl_usd": round(event_win_pnl, 2),
         "event_loss_pnl_usd": round(event_loss_pnl, 2),
         "profitable_event_loser_trades": profitable_event_losers,
+        "pnl_concentration": replay_concentration,
+        "top_1_pnl_share": replay_concentration["top_1_pnl_share"],
         "buy_notional_usd": round(buy_notional, 4),
         "return_on_buy_notional": round(pnl / buy_notional, 4) if buy_notional else None,
         "executions": len(executions),
@@ -3065,6 +3266,8 @@ def _json_kelly_replay(
             "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,
             "no_side_max_price": settings.no_side_max_price,
             "no_side_max_counter_event_probability": settings.no_side_max_counter_event_probability,
+            "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
+            "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
             "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
             "hold_min_model_agreement": settings.hold_min_model_agreement,
             "hold_min_fair_value": settings.hold_min_fair_value,
@@ -3072,6 +3275,7 @@ def _json_kelly_replay(
             "hold_market_confirmation_min_fair_value": settings.hold_market_confirmation_min_fair_value,
             "preserve_valid_holds": settings.preserve_valid_holds,
             "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+            "allow_bounded_no_side_entries": settings.allow_bounded_no_side_entries,
             "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
             "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
             "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
@@ -3135,6 +3339,13 @@ def _json_hold_candidate(row: Mapping[str, Any], settings: SignalSettings) -> bo
         return False
     if (
         not settings.allow_bounded_bucket_entries
+        and row.get("bucket_lower_f") is not None
+        and row.get("bucket_upper_f") is not None
+    ):
+        return False
+    if (
+        _json_is_no_side_row(row)
+        and not settings.allow_bounded_no_side_entries
         and row.get("bucket_lower_f") is not None
         and row.get("bucket_upper_f") is not None
     ):
@@ -3379,13 +3590,27 @@ def _json_is_no_side_row(row: Mapping[str, Any]) -> bool:
     return row.get("side") == "NO" or str(row.get("bucket") or "").startswith("NO: ") or str(row.get("question") or "").startswith("NO: ")
 
 
+def _bucket_shape(lower_f: Any, upper_f: Any) -> str:
+    if lower_f is None and upper_f is None:
+        return "unknown"
+    if lower_f is None:
+        return "lower_tail"
+    if upper_f is None:
+        return "upper_tail"
+    return "bounded"
+
+
 def _json_fails_no_side_counter_event_gate(
     row: Mapping[str, Any],
     settings: SignalSettings,
     *,
     no_side_max_counter_event_probability: Optional[float] = None,
 ) -> bool:
-    threshold = settings.no_side_max_counter_event_probability if no_side_max_counter_event_probability is None else no_side_max_counter_event_probability
+    threshold = _json_active_no_side_counter_event_threshold(
+        row,
+        settings,
+        override=no_side_max_counter_event_probability,
+    )
     if threshold is None or threshold >= 1.0:
         return False
     probabilities = row.get("model_probabilities") or {}
@@ -3393,6 +3618,25 @@ def _json_fails_no_side_counter_event_gate(
         return True
     counter_probability = no_side_counter_event_probability(probabilities)
     return counter_probability is not None and counter_probability > threshold
+
+
+def _json_active_no_side_counter_event_threshold(
+    row: Mapping[str, Any],
+    settings: SignalSettings,
+    *,
+    override: Optional[float] = None,
+) -> Optional[float]:
+    if override is not None:
+        return override
+    threshold = settings.no_side_max_counter_event_probability
+    relaxed_threshold = settings.no_side_relaxed_counter_event_probability
+    relaxed_hours = settings.no_side_relaxed_counter_event_hours_utc
+    if relaxed_threshold is None or not relaxed_hours:
+        return threshold
+    generated_at = _parse_dt(row.get("generated_at"))
+    if generated_at is None:
+        return threshold
+    return relaxed_threshold if generated_at.astimezone(timezone.utc).hour in set(relaxed_hours) else threshold
 
 
 def _candidate_quality_row(name: str, threshold: float, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3566,8 +3810,12 @@ def _event_outcome_trade_summary(trades: list[dict[str, Any]]) -> dict[str, Any]
 
 
 def _pnl_concentration(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    total_pnl = sum(float(item.get("realized_pnl_usd") or 0.0) for item in trades)
-    if not trades:
+    return _pnl_concentration_from_values([float(item.get("realized_pnl_usd") or 0.0) for item in trades])
+
+
+def _pnl_concentration_from_values(values: list[float]) -> dict[str, Any]:
+    total_pnl = sum(values)
+    if not values:
         return {
             "total_pnl_usd": 0.0,
             "loss_trade_count": 0,
@@ -3577,19 +3825,19 @@ def _pnl_concentration(trades: list[dict[str, Any]]) -> dict[str, Any]:
             "top_5_pnl_share": None,
             "top_10_pnl_share": None,
         }
-    winners = sorted(trades, key=lambda item: float(item.get("realized_pnl_usd") or 0.0), reverse=True)
-    losses = [item for item in trades if float(item.get("realized_pnl_usd") or 0.0) < 0]
+    winners = sorted(values, reverse=True)
+    losses = [value for value in values if value < 0]
 
     def share(count: int) -> Optional[float]:
         if total_pnl <= 1e-9:
             return None
-        pnl = sum(float(item.get("realized_pnl_usd") or 0.0) for item in winners[:count])
+        pnl = sum(winners[:count])
         return round(pnl / total_pnl, 4)
 
     return {
         "total_pnl_usd": round(total_pnl, 4),
         "loss_trade_count": len(losses),
-        "loss_pnl_usd": round(sum(float(item.get("realized_pnl_usd") or 0.0) for item in losses), 4),
+        "loss_pnl_usd": round(sum(losses), 4),
         "top_1_pnl_share": share(1),
         "top_3_pnl_share": share(3),
         "top_5_pnl_share": share(5),
@@ -3660,6 +3908,15 @@ def _trade_lead_days(trade: Mapping[str, Any]) -> Optional[int]:
     return (target - executed.astimezone(_zoneinfo_or_utc(city)).date()).days
 
 
+def _score_lead_days(row: Mapping[str, Any]) -> Optional[int]:
+    generated_at = _parse_dt(row.get("generated_at"))
+    target_date = _parse_json_date(row.get("target_date"))
+    city = _city_from_display_name(str(row.get("city") or ""))
+    if generated_at is None or target_date is None or city is None:
+        return None
+    return (target_date - generated_at.astimezone(_zoneinfo_or_utc(city)).date()).days
+
+
 def _trade_entry_hour_utc(trade: Mapping[str, Any]) -> Optional[int]:
     first_buy_at = trade.get("first_buy_at")
     if not first_buy_at:
@@ -3668,6 +3925,11 @@ def _trade_entry_hour_utc(trade: Mapping[str, Any]) -> Optional[int]:
         return datetime.fromisoformat(str(first_buy_at).replace("Z", "+00:00")).astimezone(timezone.utc).hour
     except ValueError:
         return None
+
+
+def _score_entry_hour_utc(row: Mapping[str, Any]) -> Optional[int]:
+    generated_at = _parse_dt(row.get("generated_at"))
+    return generated_at.astimezone(timezone.utc).hour if generated_at is not None else None
 
 
 def _bucket_float(value: Any, width: float) -> Optional[float]:
@@ -3701,6 +3963,7 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "yes_side_min_price": settings.yes_side_min_price,
         "min_signal_fair_value": settings.min_signal_fair_value,
         "allow_bounded_bucket_entries": settings.allow_bounded_bucket_entries,
+        "allow_bounded_no_side_entries": settings.allow_bounded_no_side_entries,
         "bounded_bucket_min_edge": settings.bounded_bucket_min_edge,
         "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
         "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
@@ -3710,6 +3973,8 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,
         "no_side_max_price": settings.no_side_max_price,
         "no_side_max_counter_event_probability": settings.no_side_max_counter_event_probability,
+        "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
+        "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
         "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,

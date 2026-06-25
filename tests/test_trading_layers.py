@@ -772,6 +772,69 @@ class TradingLayersTest(unittest.TestCase):
         wider_tail = ScoredOutcome(**{**no_side.__dict__, "model_probabilities": {"a.model": 0.899, "b.model": 0.92, "c.model": 0.93}})
         self.assertEqual(signal_filter_reason(wider_tail, settings), "NO-side counter-event probability above 0.1")
 
+    def test_no_side_counter_event_gate_can_relax_at_configured_utc_hour(self) -> None:
+        no_side = ScoredOutcome(
+            market_id="market-1",
+            market_slug="slug",
+            question="NO: Will the highest temperature in Miami be 86°F or higher on January 22?",
+            bucket_label="NO: 86°F or higher",
+            token_id="no-token",
+            fair_value=0.86,
+            market_price=0.70,
+            edge=0.151,
+            model_count=3,
+            model_agreement=1.0,
+            probability_stdev=0.01,
+            generated_at=datetime(2026, 1, 20, 12, 0, tzinfo=timezone.utc),
+            city="Miami, FL",
+            target_date=date(2026, 1, 22),
+            rule_excerpt="rules",
+            model_probabilities={"a.model": 0.85, "b.model": 0.88, "c.model": 0.90},
+            bucket_lower_f=86.0,
+            bucket_upper_f=None,
+        )
+        settings = SignalSettings(
+            enforce_entry_timing_filter=False,
+            no_side_relaxed_counter_event_probability=0.20,
+            no_side_relaxed_counter_event_hours_utc=(12,),
+        )
+
+        self.assertIsNone(signal_filter_reason(no_side, settings))
+        outside_hour = ScoredOutcome(**{**no_side.__dict__, "generated_at": datetime(2026, 1, 20, 6, 0, tzinfo=timezone.utc)})
+        self.assertEqual(signal_filter_reason(outside_hour, settings), "NO-side counter-event probability above 0.1")
+
+    def test_bounded_no_side_entries_can_be_disabled_separately(self) -> None:
+        no_side = ScoredOutcome(
+            market_id="market-1",
+            market_slug="slug",
+            question="NO: Will the highest temperature in Seattle be between 40-41°F on January 22?",
+            bucket_label="NO: 40-41°F",
+            token_id="no-token",
+            fair_value=0.98,
+            market_price=0.80,
+            edge=0.17,
+            model_count=3,
+            model_agreement=1.0,
+            probability_stdev=0.01,
+            generated_at=datetime(2026, 1, 20, 12, 0, tzinfo=timezone.utc),
+            city="Seattle, WA",
+            target_date=date(2026, 1, 22),
+            rule_excerpt="rules",
+            model_probabilities={"a.model": 0.98, "b.model": 0.99, "c.model": 0.97},
+            bucket_lower_f=40.0,
+            bucket_upper_f=41.0,
+            bucket_width_f=1.0,
+        )
+
+        self.assertIsNone(signal_filter_reason(no_side, SignalSettings(enforce_entry_timing_filter=False)))
+        self.assertEqual(
+            signal_filter_reason(
+                no_side,
+                SignalSettings(enforce_entry_timing_filter=False, allow_bounded_no_side_entries=False),
+            ),
+            "bounded NO-side exact/range bucket entries disabled",
+        )
+
     def test_no_side_hold_tail_is_wider_than_new_entry_tail(self) -> None:
         no_side = ScoredOutcome(
             market_id="market-1",

@@ -3,15 +3,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional, TypeVar
 
 from weather_strategy.http import HttpClient
 from weather_strategy.polymarket import PriceHistoryPoint
 
 
 DEFAULT_BASE_URL = "https://api.telonex.io/v1"
+_T = TypeVar("_T")
 
 
 class TelonexConfigurationError(RuntimeError):
@@ -31,6 +34,7 @@ class TelonexClient:
         cache_dir: str | Path = "work/cache/telonex",
         http: Optional[HttpClient] = None,
         env_path: str | Path = ".env",
+        hard_timeout_seconds: Optional[float] = None,
     ) -> None:
         load_local_env(env_path)
         self.api_key = api_key or os.environ.get("TELONEX_API_KEY")
@@ -43,17 +47,19 @@ class TelonexClient:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.http = http or HttpClient(timeout_seconds=30)
+        self.hard_timeout_seconds = hard_timeout_seconds
         self.download_hits = 0
         self.download_misses = 0
 
     def availability(self, exchange: str = "polymarket", params: Optional[Mapping[str, Any]] = None) -> Any:
-        return self.http.get_json(
+        return self._http_call(
+            self.http.get_json,
             f"{self.base_url}/availability/{exchange}",
             params=params,
         )
 
     def dataset(self, exchange: str, dataset: str) -> Any:
-        return self.http.get_json(f"{self.base_url}/datasets/{exchange}/{dataset}")
+        return self._http_call(self.http.get_json, f"{self.base_url}/datasets/{exchange}/{dataset}")
 
     def download_dataset_parquet(self, *, exchange: str, dataset: str) -> Path:
         cache_path = self.cache_dir / exchange / "datasets" / f"{dataset}.parquet"
@@ -62,8 +68,8 @@ class TelonexClient:
             return cache_path
         self.download_misses += 1
         endpoint = f"{self.base_url}/datasets/{exchange}/{dataset}"
-        redirect_url = self.http.get_redirect_location(endpoint, headers=self._headers(accept="*/*"))
-        payload = self.http.get_bytes(redirect_url or endpoint, headers={"Accept": "*/*"})
+        redirect_url = self._http_call(self.http.get_redirect_location, endpoint, headers=self._headers(accept="*/*"))
+        payload = self._http_call(self.http.get_bytes, redirect_url or endpoint, headers={"Accept": "*/*"})
         if not _looks_like_parquet(payload):
             preview = payload[:250].decode("utf-8", errors="replace")
             raise TelonexDataError(f"Telonex dataset did not return Parquet for {exchange}/{dataset}: {preview}")
@@ -90,12 +96,18 @@ class TelonexClient:
         self.download_misses += 1
         endpoint = f"{self.base_url}/downloads/{exchange}/{channel}/{day.isoformat()}"
         try:
-            redirect_url = self.http.get_redirect_location(
+            redirect_url = self._http_call(
+                self.http.get_redirect_location,
                 endpoint,
                 params=params,
                 headers=self._headers(accept="*/*"),
             )
-            payload = self.http.get_bytes(redirect_url or endpoint, params=None if redirect_url else params, headers={"Accept": "*/*"})
+            payload = self._http_call(
+                self.http.get_bytes,
+                redirect_url or endpoint,
+                params=None if redirect_url else params,
+                headers={"Accept": "*/*"},
+            )
         except RuntimeError as error:
             if _is_missing_telonex_file(error):
                 missing_path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,6 +186,29 @@ class TelonexClient:
         payload = {"exchange": exchange, "channel": channel, "day": day.isoformat(), "params": dict(params)}
         key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
         return self.cache_dir / exchange / channel / f"{day.isoformat()}-{key}.parquet"
+
+    def _http_call(self, func: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        if self.hard_timeout_seconds is None or self.hard_timeout_seconds <= 0:
+            return func(*args, **kwargs)
+
+        result_queue: queue.Queue[tuple[bool, _T | BaseException]] = queue.Queue(maxsize=1)
+
+        def fetch() -> None:
+            try:
+                result_queue.put((True, func(*args, **kwargs)))
+            except BaseException as error:
+                result_queue.put((False, error))
+
+        worker = threading.Thread(target=fetch, daemon=True)
+        worker.start()
+        worker.join(self.hard_timeout_seconds)
+        if worker.is_alive():
+            raise RuntimeError(f"Telonex request hard-timeout after {self.hard_timeout_seconds}s")
+
+        ok, value = result_queue.get_nowait()
+        if ok:
+            return value  # type: ignore[return-value]
+        raise value
 
 
 def load_local_env(path: str | Path = ".env") -> None:

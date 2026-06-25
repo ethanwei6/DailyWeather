@@ -17,43 +17,19 @@ The recommended live run is bounded so API issues cannot hang the workflow indef
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
   --limit 250 \
   --discovery-request-limit 50 \
   --discovery-pages 1 \
   --max-runtime-seconds 420 \
   --progress-every 10 \
-  --min-edge 0.08 \
-  --min-model-agreement 1.0 \
-  --hold-min-model-agreement 0.65 \
-  --hold-min-fair-value 0.60 \
-  --hold-market-confirmation-price 0.80 \
-  --hold-market-confirmation-min-fair-value 0.50 \
-  --min-signal-fair-value 0.70 \
-  --min-price 0.125 \
-  --yes-side-min-price 0.20 \
-  --allow-no-side-entries \
-  --no-side-min-edge 0.10 \
-  --no-side-high-confidence-min-edge 0.02 \
-  --no-side-max-price 0.95 \
-  --no-side-max-counter-event-probability 0.10 \
-  --hold-no-side-max-counter-event-probability 0.15 \
-  --high-confidence-price-threshold 0.75 \
-  --high-confidence-min-kelly-edge 0.02 \
-  --bankroll-usd 100 \
-  --kelly-fraction 0.75 \
-  --compound-kelly-sizing \
-  --max-position-usd 100 \
-  --max-position-fraction 0.25 \
-  --edge-position-full-cap-edge 0.25 \
-  --edge-position-min-multiplier 0.35 \
-  --min-trade-usd 1 \
   --same-day-entry-start-hour 11 \
   --same-day-entry-cutoff-hour 17 \
-  --min-lead-days 1 \
-  --max-lead-days 2 \
   --weights-file work/data/model_weights.json \
   --run-log-dir work/logs/live_forward_paper
 ```
+
+The named profile applies the Telonex-tested `$100` paper settings: explicit NO-token entries, `75%` fractional Kelly, current-equity compounding, a `25%` current-equity max-position cap, `70%` minimum fair value, `100%` model-source agreement for new entries, a strict `10%` NO counter-event cap outside noon UTC, and a relaxed `20%` cap only at the `12:00 UTC` global window. Use `--strategy-profile live-forward-strict-100` to keep the older strict NO-tail cap at every run hour.
 
 ## Reporting
 
@@ -152,6 +128,7 @@ Use the long replay when changing trading gates or sizing:
 
 ```bash
 python3 -m weather_strategy.cli long-backtest \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
   --bankroll-usd 100 \
   --pages 20 \
   --limit-per-page 50 \
@@ -163,34 +140,11 @@ python3 -m weather_strategy.cli long-backtest \
   --max-price-staleness-minutes 90 \
   --historical-price-slippage 0.01 \
   --forecast-availability-lag-hours 6 \
-  --kelly-fraction 0.75 \
-  --compound-kelly-sizing \
-  --max-position-usd 100 \
-  --max-position-fraction 0.25 \
-  --edge-position-full-cap-edge 0.25 \
-  --edge-position-min-multiplier 0.35 \
-  --kelly-market-blend 0.0 \
-  --min-trade-usd 1 \
-  --min-edge 0.08 \
-  --min-model-agreement 1.0 \
-  --hold-min-model-agreement 0.65 \
-  --hold-min-fair-value 0.60 \
-  --hold-market-confirmation-price 0.80 \
-  --hold-market-confirmation-min-fair-value 0.50 \
-  --min-signal-fair-value 0.70 \
-  --min-price 0.125 \
-  --yes-side-min-price 0.20 \
-  --allow-no-side-entries \
-  --no-side-min-edge 0.10 \
-  --no-side-high-confidence-min-edge 0.02 \
-  --no-side-max-price 0.95 \
-  --no-side-max-counter-event-probability 0.10 \
-  --hold-no-side-max-counter-event-probability 0.15 \
   --run-log-dir work/logs/long_backtests \
   --summary-only
 ```
 
-Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, realized trade hit rate, event hit rate, profitable event-loser trades, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current best-tested paper replay uses a split `10c` normal / `2c` high-confidence NO-side minimum edge, a `95c` max-entry price, a `10%` NO entry counter-event cap, a `15%` NO hold counter-event cap, `0.75` fractional Kelly, current-equity compounding, a `25%` current-equity paper-test cap with the absolute fail-safe set to the starting bankroll, and an edge-scaled cap applied after that percentage cap so marginal trades floor at `35%` until buffered edge reaches `25c`. The `15%` cap remains the safer baseline and `20%` remains the prior aggressive reference, but the latest artifact promotes the `25%` cap for paper testing because it preserved current trade count, event hit rate, and weather-validation cleanliness while raising replay PnL. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
+Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, realized trade hit rate, event hit rate, profitable event-loser trades, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-utc12-relaxed-no-tail-0.20`: it keeps the strict `10%` NO-entry counter-event cap at most run hours, but relaxes to `20%` only at `12:00 UTC`, where the Telonex slice showed more trades with materially lower drawdown than the global-loose variants. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
 
 ## Failure Handling
 

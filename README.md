@@ -70,45 +70,21 @@ Run a bounded live paper pass:
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
   --limit 250 \
   --discovery-request-limit 50 \
   --discovery-pages 1 \
   --max-runtime-seconds 420 \
   --progress-every 10 \
-  --min-edge 0.08 \
-  --min-model-agreement 1.0 \
-  --hold-min-model-agreement 0.65 \
-  --hold-min-fair-value 0.60 \
-  --hold-market-confirmation-price 0.80 \
-  --hold-market-confirmation-min-fair-value 0.50 \
-  --min-signal-fair-value 0.70 \
-  --min-price 0.125 \
-  --yes-side-min-price 0.20 \
-  --allow-no-side-entries \
-  --no-side-min-edge 0.10 \
-  --no-side-high-confidence-min-edge 0.02 \
-  --no-side-max-price 0.95 \
-  --no-side-max-counter-event-probability 0.10 \
-  --hold-no-side-max-counter-event-probability 0.15 \
-  --high-confidence-price-threshold 0.75 \
-  --high-confidence-min-kelly-edge 0.02 \
-  --bankroll-usd 100 \
-  --kelly-fraction 0.75 \
-  --compound-kelly-sizing \
-  --max-position-usd 100 \
-  --max-position-fraction 0.25 \
-  --edge-position-full-cap-edge 0.25 \
-  --edge-position-min-multiplier 0.35 \
-  --min-trade-usd 1 \
   --same-day-entry-start-hour 11 \
   --same-day-entry-cutoff-hour 17 \
-  --min-lead-days 1 \
-  --max-lead-days 2 \
   --weights-file work/data/model_weights.json \
   --run-log-dir work/logs/live_forward_paper
 ```
 
-The live-forward automation runs this paper-only profile at `00:00`, `06:00`, `12:00`, and `18:00` UTC so global city markets are checked before the local weather day begins across Americas, Europe, and Asia-Pacific. It uses each market city's timezone for the local lead-day filter and writes detailed JSON logs with scored rows, `passes_signal_filter` / `signal_filter_reason`, signal-filter counts, skipped-market reasons, per-city coverage, local lead-day timing, positions, equity, and PnL.
+The `live-forward-utc12-relaxed-no-tail-0.20` profile applies the Telonex-tested `$100` paper settings, including explicit NO-token entries, `75%` fractional Kelly, `25%` current-equity max-position cap, strict `10%` NO counter-event risk outside UTC noon, and a relaxed `20%` NO counter-event cap only for the `12:00 UTC` window. Use `--strategy-profile live-forward-strict-100` to keep the older strict `10%` NO-entry tail at every run hour.
+
+The live-forward automation runs this paper-only profile at `00:00`, `06:00`, `12:00`, and `18:00` UTC so global city markets are checked before the local weather day begins across Americas, Europe, and Asia-Pacific. It uses each market city's timezone for the local lead-day filter and writes detailed JSON logs with scored rows, `passes_signal_filter` / `signal_filter_reason`, signal-filter counts, skipped-market reasons, per-city coverage, bucket-shape cohorts, local lead-day timing, positions, equity, PnL, and the applied `strategy_profile`.
 
 Summarize the paper ledger:
 
@@ -157,12 +133,13 @@ python3 -m weather_strategy.cli backtest \
   --run-log-dir work/logs/backtests
 ```
 
-Detailed automation artifacts are written under `work/logs/backtests/` and `work/logs/paper_runs/`. They include full scored-outcome detail, weights, settings, skipped-market reasons, and replay diagnostics.
+Detailed automation artifacts are written under `work/logs/backtests/`, `work/logs/live_forward_paper/`, and `work/logs/paper_runs/`. They include full scored-outcome detail, weights, settings, skipped-market reasons, and replay diagnostics.
 
 Run a long historical replay over resolved Polymarket weather markets:
 
 ```bash
 python3 -m weather_strategy.cli long-backtest \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
   --bankroll-usd 100 \
   --pages 20 \
   --limit-per-page 50 \
@@ -176,37 +153,16 @@ python3 -m weather_strategy.cli long-backtest \
   --max-price-staleness-minutes 90 \
   --historical-price-slippage 0.01 \
   --forecast-availability-lag-hours 6 \
-  --kelly-fraction 0.75 \
-  --compound-kelly-sizing \
-  --max-position-usd 100 \
-  --max-position-fraction 0.25 \
-  --edge-position-full-cap-edge 0.25 \
-  --edge-position-min-multiplier 0.35 \
-  --kelly-market-blend 0.0 \
-  --min-trade-usd 1 \
-  --min-edge 0.08 \
-  --min-signal-fair-value 0.70 \
-  --min-price 0.125 \
-  --yes-side-min-price 0.20 \
-  --min-model-agreement 1.0 \
-  --hold-min-model-agreement 0.65 \
-  --hold-min-fair-value 0.60 \
-  --hold-market-confirmation-price 0.80 \
-  --hold-market-confirmation-min-fair-value 0.50 \
   --run-log-dir work/logs/telonex_backtests \
   --cache-dir work/cache/telonex_long_backtest \
-  --summary-only \
-  --allow-no-side-entries \
-  --no-side-min-edge 0.10 \
-  --no-side-high-confidence-min-edge 0.02 \
-  --no-side-max-price 0.95 \
-  --no-side-max-counter-event-probability 0.10 \
-  --hold-no-side-max-counter-event-probability 0.15
+  --summary-only
 ```
 
 Add `--allow-no-side-entries` to replay or paper-trade real NO-token entries for binary markets. This is useful for research and paper validation, but real execution remains disabled until there is more out-of-sample evidence and explicit live risk-control review. The default `--no-side-min-edge 0.10` applies an extra absolute-edge floor to normal NO-token entries because low-edge NO trades were the weakest cohort in the long replay. The default `--no-side-high-confidence-min-edge 0.02` allows smaller absolute edges only when the explicit NO token already trades at or above the high-confidence price threshold. The default `--no-side-max-price 0.95` now matches the global max-price gate after the latest replay showed a small PnL and calibration improvement versus the prior 93c cap; set it below `--max-price` to make NO entries stricter again. The default `--no-side-max-counter-event-probability 0.10` blocks new NO entries when any underlying model view still gives the opposite YES event more than a 10% chance. Existing NO positions use the wider default `--hold-no-side-max-counter-event-probability 0.15`, which reduced churn on high-FV holds in the latest replay without loosening new-entry standards.
 
-Long-backtest artifacts are written under `work/logs/long_backtests/` or the configured run-log directory. Current backtests default to Telonex for historical Polymarket market discovery and tick-level quote data. They include scored outcomes, execution detail, calibration buckets, trade diagnostics, skipped-market reasons, data-provenance counters, a strict `real_data_audit` pass/fail block, and a `strategy_recommendation_diagnostics` block that compares clean sizing/tail variants before promoting a next paper-test profile.
+Use `--disable-bounded-no-side-entries` to research a stricter NO profile that blocks exact/range NO buckets while keeping open-ended NO tails available. The latest Telonex replay did not promote that profile: it reduced PnL and increased concentration on the same real-data slice.
+
+Long-backtest artifacts are written under `work/logs/long_backtests/` or the configured run-log directory. Current backtests default to Telonex for historical Polymarket market discovery and tick-level quote data. They include scored outcomes, execution detail, calibration buckets, bucket-shape trade cohorts, PnL concentration, skipped-market reasons, data-provenance counters, a strict `real_data_audit` pass/fail block, and a `strategy_recommendation_diagnostics` block that compares clean sizing/tail variants before promoting a next paper-test profile.
 
 Telonex is optional at install time but required for current historical replays:
 
@@ -232,7 +188,7 @@ Current entry controls include:
 - Default `70%` minimum model fair-value gate for new entries, based on the long replay showing weak realized accuracy in mid-confidence apparent edges.
 - Default full model-source agreement for new entries, with a looser `65%` agreement threshold for holding existing positions when the thesis remains positive.
 - Existing positions are preserved instead of trimmed back to Kelly target when the hold thesis remains valid; this reduces churn after the market starts confirming a good entry.
-- Bounded exact/range temperature buckets disabled by default for new entries because station-source rounding can make settlement cross-checks ambiguous.
+- Bounded exact/range temperature buckets are allowed only through stricter price, fair-value, edge, and full-agreement gates. Bounded NO-side entries can be disabled separately with `--disable-bounded-no-side-entries` for research.
 - One selected entry per city/date group to reduce correlated exposure.
 - Tomorrow/following-day lead-time focus for new entries.
 - Same-day entry windows only when observation-aware scoring is useful.
@@ -250,27 +206,28 @@ Current entry controls include:
 Current Telonex-backed replay:
 
 ```text
-Tests: 133 passed
+Profile: live-forward-utc12-relaxed-no-tail-0.20
+Tests: 141 passed
 Source: Telonex Polymarket market dataset + Telonex daily quote Parquet, Open-Meteo Single Runs forecasts, station METAR/ASOS cross-checks
 Bankroll: $100
 Raw markets discovered: 1000
-Parsed markets: 50
-Markets with Telonex price history: 50
-Sessions: 17
-Scored rows: 930
-Signals: 10
-Trades: 2 completed tokens
-Executions: 5
-Buys / sells / settlements: 3 / 2 / 0
-Ending equity: $112.16
-PnL: +$12.16
-Return: +12.16%
-Max drawdown in selected replay: $3.00 / 2.62%
-Event hit rate: 100% on 2 traded tokens
-Selected-candidate calibration: 2 traded tokens, 100% actual rate, 88.78% average FV, 64.00% average market price
-Selected-candidate Brier score, model vs market: 0.022311 / 0.149200
+Parsed markets: 100
+Markets with Telonex price history: 100
+Sessions: 20
+Scored rows: 1856
+Signals: 22
+Trades: 12 completed tokens
+Executions: 26
+Buys / sells / settlements: 14 / 12 / 0
+Ending equity: $288.96
+PnL: +$188.96
+Return: +188.96%
+Max drawdown in selected replay: $7.26 / 2.96%
+Event hit rate: 75% on 12 traded tokens
+Top-1 PnL share: 63.06%
+Bucket-shape PnL: upper-tail +$129.00 on 3 trades; bounded +$59.97 on 9 trades
 Weather cross-check mismatches: 0
-Traded weather-checked executions: 5 / 5
+Traded weather-checked executions: 26 / 26
 Future/stale price violations: 0 / 0
 Unavailable forecast violations: 0
 Forecast availability lag: 6h
@@ -278,10 +235,11 @@ Price-history errors: 0
 NO-side price-history errors: 0
 Runtime-limited: false
   real_data_audit: passed
-Run log: work/logs/telonex_backtests/20260624T085309Z-1782291189058001000-long-backtest.json
 ```
 
-Backtest PnL is a research diagnostic, not a production claim. The current Telonex-backed sample is clean but small: only two completed traded tokens, both New York. Looser NO-tail settings produced more in-sample candidates in the same scored artifact, but the recommendation engine kept the current baseline because it preserves the stricter weather-validation and event-hit-rate profile. Older Gamma/CLOB artifacts showed much higher headline PnL over broader saved slices; those are now treated as legacy research until reproduced on Telonex tick-level quote data.
+Backtest PnL is a research diagnostic, not a production claim. The current Telonex-backed sample is clean but still small and concentrated: the top trade contributes 63.06% of total PnL. Disabling bounded NO-side exact/range entries reduced PnL to +$110.08 and increased top-trade concentration to 96.83%, so it is not promoted. A global 20% NO-entry counter-event tail produced more trades and higher in-sample PnL (+$216.46 on 18 trades), but also much higher gross exposure and max drawdown ($24.16), so it remains high risk. The narrower UTC-12-only relaxed 20% NO-entry tail is the current forward-paper candidate because it increased trade count versus the strict baseline while preserving weather-validation cleanliness and keeping drawdown materially below the global-loose variants. Older Gamma/CLOB artifacts showed much higher headline PnL over broader saved slices; those are now treated as legacy research until reproduced on Telonex tick-level quote data.
+
+Historical quote replay requests are bounded to the strategy's scheduled decision and maintenance timestamps, rather than the full market lifetime. That keeps Telonex replays faster, avoids unnecessary future quote history, and matches the live strategy's available-information set more closely.
 
 The current long-backtest code emits `real_data_audit`, which fails fast if a replay uses fixture forecasts, missing forecast/price timestamps, future or stale historical prices, unavailable forecast runs, synthetic NO pricing, unresolved traded tokens, ambiguous traded settlement, or weather/payout mismatches.
 
