@@ -171,6 +171,7 @@ class CliTest(unittest.TestCase):
         args = argparse.Namespace(
             strategy_profile="live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.10",
             allow_no_side_entries=False,
+            no_side_max_counter_event_probability=0.05,
             no_side_relaxed_counter_event_probability=0.20,
             no_side_relaxed_counter_event_hours_utc="12",
             trim_valid_holds_to_kelly_target=True,
@@ -183,6 +184,33 @@ class CliTest(unittest.TestCase):
         _apply_strategy_profile(args)
 
         self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.10)
+        self.assertIsNone(args.no_side_relaxed_counter_event_probability)
+        self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "")
+        self.assertFalse(args.trim_valid_holds_to_kelly_target)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+
+    def test_strategy_profile_can_use_strict_no_tail_011_preserve_highconv_bounded_edge_010(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-strict-no-tail-0.11-preserve-highconv-bounded-edge-0.10",
+            allow_no_side_entries=False,
+            no_side_max_counter_event_probability=0.05,
+            no_side_relaxed_counter_event_probability=0.20,
+            no_side_relaxed_counter_event_hours_utc="12",
+            trim_valid_holds_to_kelly_target=True,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.11)
         self.assertIsNone(args.no_side_relaxed_counter_event_probability)
         self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "")
         self.assertFalse(args.trim_valid_holds_to_kelly_target)

@@ -2871,6 +2871,8 @@ def _counterfactual_kelly_replays(
         ("legacy_no_side_counter_event_0.08", replace(settings, no_side_max_counter_event_probability=0.08)),
         ("legacy_no_side_counter_event_0.09", replace(settings, no_side_max_counter_event_probability=0.09)),
         ("selected_no_side_counter_event_0.10", replace(settings, no_side_max_counter_event_probability=0.10)),
+        ("candidate_no_side_counter_event_0.11", replace(settings, no_side_max_counter_event_probability=0.11)),
+        ("candidate_no_side_counter_event_0.12", replace(settings, no_side_max_counter_event_probability=0.12)),
         ("looser_no_side_counter_event_0.20", replace(settings, no_side_max_counter_event_probability=0.20)),
         ("looser_no_side_counter_event_0.30", replace(settings, no_side_max_counter_event_probability=0.30)),
         (

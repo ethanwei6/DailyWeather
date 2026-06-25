@@ -2,7 +2,7 @@
 
 Date: 2026-06-20 Singapore time
 
-Status: historical snapshot. This report documents the earlier 38-trade research replay and is preserved for audit history. The current live-forward paper profile is documented in `README.md` and `docs/operations.md`; it now uses the strict NO-tail preserved-hold profile, partial invalid-hold exits, bounded-bucket edge gates, and a `$175` absolute position cap with the unchanged `25%` current-equity cap.
+Status: historical snapshot. This report documents the earlier 38-trade research replay and is preserved for audit history. The current live-forward paper profile is documented in `README.md` and `docs/operations.md`; it now uses the `11%` NO-tail preserved-hold profile, partial invalid-hold exits, bounded-bucket edge gates, and a `$175` absolute position cap with the unchanged `25%` current-equity cap.
 
 This report summarizes the live-compatible historical replay used to decide whether DailyWeather is worth advancing toward live Polymarket execution. The replay uses real Gamma market discovery, real CLOB historical price bars, Open-Meteo Single Runs historical forecasts with a six-hour availability lag, Polymarket settlement prices, and METAR/ASOS weather cross-checks where available.
 
@@ -139,7 +139,7 @@ The 25c full-size edge trigger remains the selected sizing shape because it impr
 
 The 95c NO cap replaced the 93c cap because it improved PnL and selected-candidate Brier score, not because it made the path cleaner. The separate 15% hold-tail cap then fixed one failure mode in the 95c profile: already-open, high-FV NO positions were being sold down when one model briefly lifted the opposite YES tail above the entry limit.
 
-The 10% NO-entry tail cap remains the promoted paper-test gate. It added clean trades versus the stricter 9% gate without admitting the weaker `12%+` tail cohort. The threshold sweep is not monotonic in quality: 12% and looser variants start admitting lower event hit rates and weather ambiguity, so those remain diagnostics, not defaults.
+Superseded note: this archived replay promoted the 10% NO-entry tail cap because it added clean trades versus the stricter 9% gate without admitting the weaker `12%+` tail cohort. Later saved Telonex artifacts promoted the narrower 11% cap; 12% and looser variants remain diagnostics because they start admitting lower event hit rates and weather ambiguity.
 
 The generated artifact includes `strategy_recommendation_diagnostics`. The latest artifact keeps the `25%` current-equity cap as current after the expanded cap grid showed that 20%, 22.5%, and 25% preserve the same 38 trades, event hit rate, and weather-validation cleanliness. It still explicitly rejects looser NO-entry tails despite higher PnL because they weaken accuracy/validation quality.
 
