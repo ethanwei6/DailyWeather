@@ -2,6 +2,8 @@
 
 Date: 2026-06-20 Singapore time
 
+Status: historical snapshot. This report documents the earlier 38-trade research replay and is preserved for audit history. The current live-forward paper profile is documented in `README.md` and `docs/operations.md`; it now uses the strict NO-tail preserved-hold profile, partial invalid-hold exits, bounded-bucket edge gates, and a `$175` absolute position cap with the unchanged `25%` current-equity cap.
+
 This report summarizes the live-compatible historical replay used to decide whether DailyWeather is worth advancing toward live Polymarket execution. The replay uses real Gamma market discovery, real CLOB historical price bars, Open-Meteo Single Runs historical forecasts with a six-hour availability lag, Polymarket settlement prices, and METAR/ASOS weather cross-checks where available.
 
 ## Command

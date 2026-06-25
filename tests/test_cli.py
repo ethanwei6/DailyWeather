@@ -43,7 +43,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(args.bankroll_usd, 100.0)
         self.assertEqual(args.kelly_fraction, 0.75)
         self.assertTrue(args.compound_kelly_sizing)
-        self.assertEqual(args.max_position_usd, 100.0)
+        self.assertEqual(args.max_position_usd, 175.0)
         self.assertEqual(args.max_position_fraction, 0.25)
         self.assertFalse(args.trim_valid_holds_to_kelly_target)
         self.assertEqual(args.min_lead_days, 1)

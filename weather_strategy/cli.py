@@ -73,7 +73,7 @@ LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
     "bankroll_usd": 100.0,
     "kelly_fraction": 0.75,
     "compound_kelly_sizing": True,
-    "max_position_usd": 100.0,
+    "max_position_usd": 175.0,
     "max_position_fraction": 0.25,
     "kelly_market_blend": 0.0,
     "edge_position_full_cap_edge": 0.25,

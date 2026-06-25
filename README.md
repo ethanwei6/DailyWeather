@@ -82,7 +82,7 @@ python3 -m weather_strategy.cli paper-run \
   --run-log-dir work/logs/live_forward_paper
 ```
 
-The `live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.15` profile applies the Telonex-tested `$100` paper settings, including explicit NO-token entries, `75%` fractional Kelly, `25%` current-equity max-position cap, a strict `10%` NO counter-event risk cap at every entry hour, preservation of valid existing holds, a partial-exit rule that sells half of an invalid hold only when model FV remains at least `90%` and the quote is between `50c` and `65c`, a hold-only high-conviction exception that lets existing NO positions use a `20%` counter-event cap only when model FV is at least `98%` and buffered edge is at least `35c`, and a `15c` minimum edge for bounded exact/range buckets. Use `--strategy-profile live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15` for the lower-exposure trim-to-Kelly comparison profile, or `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15` only as the higher-risk relaxed-tail comparison profile.
+The `live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.15` profile applies the Telonex-tested `$100` paper settings, including explicit NO-token entries, `75%` fractional Kelly, a `25%` current-equity max-position cap with a `$175` absolute cap, a strict `10%` NO counter-event risk cap at every entry hour, preservation of valid existing holds, a partial-exit rule that sells half of an invalid hold only when model FV remains at least `90%` and the quote is between `50c` and `65c`, a hold-only high-conviction exception that lets existing NO positions use a `20%` counter-event cap only when model FV is at least `98%` and buffered edge is at least `35c`, and a `15c` minimum edge for bounded exact/range buckets. Use `--strategy-profile live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15` for the lower-exposure trim-to-Kelly comparison profile, or `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15` only as the higher-risk relaxed-tail comparison profile.
 
 The live-forward automation runs this paper-only profile at `00:00`, `06:00`, `12:00`, and `18:00` UTC so global city markets are checked before the local weather day begins across Americas, Europe, and Asia-Pacific. It uses each market city's timezone for the local lead-day filter and writes detailed JSON logs with scored rows, `passes_signal_filter` / `signal_filter_reason`, signal-filter counts, skipped-market reasons, per-city coverage, bucket-shape cohorts, local lead-day timing, positions, equity, PnL, and the applied `strategy_profile`.
 
@@ -196,7 +196,7 @@ Current entry controls include:
 - Historical station METAR/ASOS cross-checks for resolved station markets.
 - Experimental NO-token entries require an additional default `10c` absolute-edge floor because low-edge NO trades were historically weak.
 - Experimental NO-token entries also require low model-tail risk: no individual model view may assign more than `10%` probability to the opposite YES event, and new NO entries are capped at the global `95c` max-price gate.
-- Kelly targets can compound from current paper/replay equity after the strategy proves itself; this scales winning capital without loosening signal gates.
+- Kelly targets compound from current paper/replay equity, with a `$175` absolute cap and unchanged `25%` current-equity cap. This lets paper capital scale after wins without loosening signal gates or changing early `$100` bankroll exposure.
 - Optional edge-scaled position caps keep marginal low-edge trades smaller while allowing the full cap once buffered edge reaches `25c`.
 - Existing-position hold logic separated from new-entry timing gates.
 - Expired-position settlement before live discovery.
@@ -219,12 +219,12 @@ Signals selected in JSON replay: 125
 Trades: 87 completed tokens
 Executions: 195
 Buys / sells / settlements: 107 / 29 / 59
-Ending equity: $1,184.79
-PnL: +$1,084.79
-Return: +1,084.79%
-Max drawdown in selected JSON replay diagnostics: $103.65
+Ending equity: $1,600.63
+PnL: +$1,500.63
+Return: +1,500.63%
+Max drawdown in selected JSON replay diagnostics: $181.39
 Event hit rate: 83.91% on 87 traded tokens
-Top-1 PnL share: 11.22%
+Top-1 PnL share: 9.00%
 Event winners / losers: 73 / 14
 Unprofitable event winners: 5 tokens, -$34.70 realized PnL
 Weather cross-check mismatches: 0
@@ -238,7 +238,7 @@ Runtime-limited: false
   real_data_audit: passed
 ```
 
-Backtest PnL is a research diagnostic, not a production claim. The latest saved Telonex replay showed that the UTC-12 relaxed `20%` NO-entry counter-event exception increased trade count but lowered hit rate, increased drawdown, and made PnL much more concentrated. The current forward-paper candidate removes that exception and keeps the strict `10%` NO-entry counter-event cap at every entry hour. Under those stricter entries, preserving valid existing holds beat trim-to-Kelly holds in the full sample, first half, second half, first 70%, last 30%, and every monthly slice while keeping the same trade count and event hit rate. The promoted partial-exit rule improved the broad real-data replay from `+$1,057.01` to `+$1,084.79` and the smaller time-aware artifact from `+$123.43` to `+$130.53`, without changing trade count or event hit rate. One traded token remains weather-ambiguous in the broad replay, so this still needs forward paper validation before any real execution.
+Backtest PnL is a research diagnostic, not a production claim. The latest saved Telonex replay showed that the UTC-12 relaxed `20%` NO-entry counter-event exception increased trade count but lowered hit rate, increased drawdown, and made PnL much more concentrated. The current forward-paper candidate removes that exception and keeps the strict `10%` NO-entry counter-event cap at every entry hour. Under those stricter entries, preserving valid existing holds beat trim-to-Kelly holds in the full sample, first half, second half, first 70%, last 30%, and every monthly slice while keeping the same trade count and event hit rate. The promoted partial-exit rule improved the broad real-data replay from `+$1,057.01` to `+$1,084.79` and the smaller time-aware artifact from `+$123.43` to `+$130.53`, without changing trade count or event hit rate. Raising the absolute position cap from `$100` to `$175`, while keeping the `25%` current-equity cap unchanged, improved the broad replay to `+$1,500.63` with the same `87` trades and `83.91%` event hit rate; it did not change the smaller time-aware artifact because that account never grew enough for the old `$100` cap to bind. One traded token remains weather-ambiguous in the broad replay, so this still needs forward paper validation before any real execution.
 
 Model diagnostics now report calibration by full model key, forecast source, and model family for both all resolved rows and signal-eligible rows. The latest replay shows `single_run_ecmwf_ifs025` has the best source-level Brier score, while the `hourly_curve_max` family is weakest on signal-eligible rows. Directly doubling ECMWF source weight or downweighting `hourly_curve_max` reduced end-to-end replay PnL, so no model-weight override is promoted from that evidence alone.
 
