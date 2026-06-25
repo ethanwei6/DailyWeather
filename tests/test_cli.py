@@ -87,6 +87,30 @@ class CliTest(unittest.TestCase):
         self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
         self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
 
+    def test_strategy_profile_can_require_stronger_bounded_bucket_edge(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15",
+            allow_no_side_entries=False,
+            no_side_relaxed_counter_event_probability=None,
+            no_side_relaxed_counter_event_hours_utc="",
+            trim_valid_holds_to_kelly_target=False,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.10,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.no_side_relaxed_counter_event_probability, 0.20)
+        self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "12")
+        self.assertTrue(args.trim_valid_holds_to_kelly_target)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.15)
+
     def test_manual_strategy_profile_leaves_explicit_settings_unchanged(self) -> None:
         args = argparse.Namespace(
             strategy_profile="manual",

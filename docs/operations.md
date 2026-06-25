@@ -17,7 +17,7 @@ The recommended live run is bounded so API issues cannot hang the workflow indef
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15 \
   --limit 250 \
   --discovery-request-limit 50 \
   --discovery-pages 1 \
@@ -128,7 +128,7 @@ Use the long replay when changing trading gates or sizing:
 
 ```bash
 python3 -m weather_strategy.cli long-backtest \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15 \
   --bankroll-usd 100 \
   --pages 20 \
   --limit-per-page 50 \
@@ -144,7 +144,7 @@ python3 -m weather_strategy.cli long-backtest \
   --summary-only
 ```
 
-Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds`: it keeps the strict `10%` NO-entry counter-event cap at most run hours, relaxes new NO entries to `20%` only at `12:00 UTC`, trims valid holds to the updated Kelly target, and only widens existing NO-hold counter-event tolerance to `20%` when FV is at least `98%` and buffered edge is at least `35c`. This improved the cached real-data replay but raised selected-replay drawdown versus `live-forward-utc12-relaxed-no-tail-0.20-trim-holds`, so treat it as the higher-conviction live-forward paper candidate rather than proof of live profitability. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
+Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, exit-management decision value, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15`: it keeps the strict `10%` NO-entry counter-event cap at most run hours, relaxes new NO entries to `20%` only at `12:00 UTC`, trims valid holds to the updated Kelly target, only widens existing NO-hold counter-event tolerance to `20%` when FV is at least `98%` and buffered edge is at least `35c`, and requires at least `15c` edge for bounded exact/range buckets. This improved the cached real-data replay while reducing one weak bounded bucket trade versus `live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds`, so treat it as the current live-forward paper candidate rather than proof of live profitability. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
 
 ## Failure Handling
 

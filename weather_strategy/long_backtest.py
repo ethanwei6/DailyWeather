@@ -1726,6 +1726,12 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
                 "first_buy_model_agreement": None,
                 "side": execution.get("side"),
                 "buy_notional_usd": 0.0,
+                "sell_notional_usd": 0.0,
+                "sell_realized_pnl_usd": 0.0,
+                "settlement_realized_pnl_usd": 0.0,
+                "sell_count": 0,
+                "settlement_count": 0,
+                "sell_decision_value_vs_settlement_usd": 0.0,
                 "realized_pnl_usd": 0.0,
                 "polymarket_payout": execution.get("polymarket_payout"),
                 "weather_outcome": execution.get("weather_outcome"),
@@ -1741,6 +1747,21 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
             row["polymarket_payout"] = execution.get("polymarket_payout")
         if execution.get("weather_outcome") is not None:
             row["weather_outcome"] = execution.get("weather_outcome")
+        if execution.get("action") == "SELL":
+            row["sell_count"] += 1
+            row["sell_notional_usd"] += float(execution.get("notional_usd") or 0.0)
+            row["sell_realized_pnl_usd"] += float(execution.get("realized_pnl_usd") or 0.0)
+            payout = _coerce_binary_outcome(execution.get("polymarket_payout"))
+            if payout is not None:
+                try:
+                    row["sell_decision_value_vs_settlement_usd"] += (
+                        float(execution.get("price")) - float(payout)
+                    ) * float(execution.get("shares") or 0.0)
+                except (TypeError, ValueError):
+                    pass
+        elif execution.get("action") == "SETTLE":
+            row["settlement_count"] += 1
+            row["settlement_realized_pnl_usd"] += float(execution.get("realized_pnl_usd") or 0.0)
         if execution.get("action") != "BUY":
             continue
         row["buy_notional_usd"] += float(execution.get("notional_usd") or 0.0)
@@ -1755,6 +1776,10 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
     for trade in trades:
         trade["realized_pnl_usd"] = round(float(trade["realized_pnl_usd"]), 4)
         trade["buy_notional_usd"] = round(float(trade["buy_notional_usd"]), 4)
+        trade["sell_notional_usd"] = round(float(trade["sell_notional_usd"]), 4)
+        trade["sell_realized_pnl_usd"] = round(float(trade["sell_realized_pnl_usd"]), 4)
+        trade["settlement_realized_pnl_usd"] = round(float(trade["settlement_realized_pnl_usd"]), 4)
+        trade["sell_decision_value_vs_settlement_usd"] = round(float(trade["sell_decision_value_vs_settlement_usd"]), 4)
         trade["return_on_buy_notional"] = (
             round(float(trade["realized_pnl_usd"]) / float(trade["buy_notional_usd"]), 4)
             if trade["buy_notional_usd"]
@@ -1785,6 +1810,7 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
             sum(float(trade.get("realized_pnl_usd") or 0.0) for trade in unprofitable_event_winners),
             2,
         ),
+        "exit_management": _exit_management_diagnostics(trades),
         "worst_unprofitable_event_winners": sorted(
             unprofitable_event_winners,
             key=lambda item: float(item["realized_pnl_usd"]),
@@ -3808,6 +3834,44 @@ def _model_probability_accuracy(rows: list[dict[str, Any]]) -> list[dict[str, An
             }
         )
     return sorted(diagnostics, key=lambda item: (item["brier"], -item["n"]))[:30]
+
+
+def _exit_management_diagnostics(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    sold_trades = [trade for trade in trades if int(trade.get("sell_count") or 0) > 0]
+    sell_decision_value = sum(float(trade.get("sell_decision_value_vs_settlement_usd") or 0.0) for trade in sold_trades)
+    event_winner_sell_drag = sum(
+        float(trade.get("sell_decision_value_vs_settlement_usd") or 0.0)
+        for trade in sold_trades
+        if trade.get("event_outcome") == "event_win"
+    )
+    event_loser_sell_value = sum(
+        float(trade.get("sell_decision_value_vs_settlement_usd") or 0.0)
+        for trade in sold_trades
+        if trade.get("event_outcome") == "event_loss"
+    )
+    return {
+        "method": (
+            "For each sell, decision value is shares * (sell_price - final_payout). "
+            "Positive means selling beat holding to settlement; negative means the sell reduced final PnL."
+        ),
+        "trades_with_sells": len(sold_trades),
+        "sell_count": sum(int(trade.get("sell_count") or 0) for trade in sold_trades),
+        "sell_notional_usd": round(sum(float(trade.get("sell_notional_usd") or 0.0) for trade in sold_trades), 4),
+        "sell_realized_pnl_usd": round(sum(float(trade.get("sell_realized_pnl_usd") or 0.0) for trade in sold_trades), 4),
+        "settlement_realized_pnl_usd": round(sum(float(trade.get("settlement_realized_pnl_usd") or 0.0) for trade in trades), 4),
+        "sell_decision_value_vs_settlement_usd": round(sell_decision_value, 4),
+        "event_winner_sell_drag_usd": round(event_winner_sell_drag, 4),
+        "event_loser_sell_value_usd": round(event_loser_sell_value, 4),
+        "worst_sells_vs_settlement": sorted(
+            sold_trades,
+            key=lambda item: float(item.get("sell_decision_value_vs_settlement_usd") or 0.0),
+        )[:10],
+        "best_sells_vs_settlement": sorted(
+            sold_trades,
+            key=lambda item: float(item.get("sell_decision_value_vs_settlement_usd") or 0.0),
+            reverse=True,
+        )[:10],
+    }
 
 
 def _aggregate_trade_groups(trades: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:

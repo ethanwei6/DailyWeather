@@ -2122,6 +2122,7 @@ class BacktestTest(unittest.TestCase):
                 "target_date": "2026-06-02",
                 "bucket": "NO: between 44-45°F",
                 "side": "NO",
+                "shares": 100.0,
                 "notional_usd": 60.0,
                 "realized_pnl_usd": 0.0,
                 "price": 0.60,
@@ -2140,6 +2141,7 @@ class BacktestTest(unittest.TestCase):
                 "target_date": "2026-06-02",
                 "bucket": "NO: between 44-45°F",
                 "side": "NO",
+                "shares": 100.0,
                 "notional_usd": 57.0,
                 "realized_pnl_usd": -3.0,
                 "price": 0.57,
@@ -2149,6 +2151,44 @@ class BacktestTest(unittest.TestCase):
                 "polymarket_payout": 1,
                 "weather_outcome": 1,
             },
+            {
+                "action": "BUY",
+                "token_id": "sold-loser",
+                "executed_at": "2026-06-01T12:00:00+00:00",
+                "question": "Will the highest temperature in Dallas be 90°F or higher on June 2?",
+                "city": "Dallas, TX",
+                "target_date": "2026-06-02",
+                "bucket": "90°F or higher",
+                "side": "YES",
+                "shares": 50.0,
+                "notional_usd": 25.0,
+                "realized_pnl_usd": 0.0,
+                "price": 0.50,
+                "fair_value": 0.80,
+                "edge": 0.29,
+                "model_agreement": 1.0,
+                "polymarket_payout": 0,
+                "weather_outcome": 0,
+            },
+            {
+                "action": "SELL",
+                "token_id": "sold-loser",
+                "executed_at": "2026-06-01T18:00:00+00:00",
+                "question": "Will the highest temperature in Dallas be 90°F or higher on June 2?",
+                "city": "Dallas, TX",
+                "target_date": "2026-06-02",
+                "bucket": "90°F or higher",
+                "side": "YES",
+                "shares": 50.0,
+                "notional_usd": 20.0,
+                "realized_pnl_usd": -5.0,
+                "price": 0.40,
+                "fair_value": 0.40,
+                "edge": -0.01,
+                "model_agreement": 0.5,
+                "polymarket_payout": 0,
+                "weather_outcome": 0,
+            },
         ]
 
         diagnostics = _trade_performance_diagnostics(executions)
@@ -2157,6 +2197,14 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(diagnostics["unprofitable_event_winner_trades"], 1)
         self.assertEqual(diagnostics["unprofitable_event_winner_pnl_usd"], -3.0)
         self.assertEqual(diagnostics["worst_unprofitable_event_winners"][0]["token_id"], "sold-winner")
+        exit_management = diagnostics["exit_management"]
+        self.assertEqual(exit_management["sell_count"], 2)
+        self.assertEqual(exit_management["trades_with_sells"], 2)
+        self.assertEqual(exit_management["event_winner_sell_drag_usd"], -43.0)
+        self.assertEqual(exit_management["event_loser_sell_value_usd"], 20.0)
+        self.assertEqual(exit_management["sell_decision_value_vs_settlement_usd"], -23.0)
+        self.assertEqual(exit_management["worst_sells_vs_settlement"][0]["token_id"], "sold-winner")
+        self.assertEqual(exit_management["best_sells_vs_settlement"][0]["token_id"], "sold-loser")
 
     def test_trade_concentration_omits_top_share_when_total_pnl_is_negative(self) -> None:
         concentration = _pnl_concentration(

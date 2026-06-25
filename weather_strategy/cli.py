@@ -38,6 +38,7 @@ STRATEGY_PROFILE_CHOICES = (
     "live-forward-utc12-relaxed-no-tail-0.20",
     "live-forward-utc12-relaxed-no-tail-0.20-trim-holds",
     "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds",
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15",
 )
 
 LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
@@ -99,6 +100,16 @@ STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "hold_no_side_high_conviction_min_fair_value": 0.98,
         "hold_no_side_high_conviction_min_edge": 0.35,
         "hold_no_side_high_conviction_counter_event_probability": 0.20,
+    },
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "no_side_relaxed_counter_event_probability": 0.20,
+        "no_side_relaxed_counter_event_hours_utc": "12",
+        "trim_valid_holds_to_kelly_target": True,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.15,
     },
 }
 
