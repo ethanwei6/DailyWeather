@@ -41,6 +41,7 @@ STRATEGY_PROFILE_CHOICES = (
     "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15",
     "live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15",
     "live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.15",
+    "live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.10",
 )
 
 LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
@@ -131,6 +132,13 @@ STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "hold_no_side_high_conviction_min_edge": 0.35,
         "hold_no_side_high_conviction_counter_event_probability": 0.20,
         "bounded_bucket_min_edge": 0.15,
+    },
+    "live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.10": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
     },
 }
 
