@@ -244,6 +244,8 @@ Model diagnostics now report calibration by full model key, forecast source, and
 
 Historical quote replay requests are bounded to the strategy's scheduled decision and maintenance timestamps, rather than the full market lifetime. That keeps Telonex replays faster, avoids unnecessary future quote history, and matches the live strategy's available-information set more closely.
 
+Replay diagnostics now include completed-trade cohorts by city, side, bucket shape, entry hour, lead day, first-buy price, first-buy fair-value bucket, edge bucket, model agreement, weather cross-check status, and NO-side counter-event probability. This is the main review surface for deciding whether future changes are real improvements or just headline-PnL overfit.
+
 The current long-backtest code emits `real_data_audit`, which fails fast if a replay uses fixture forecasts, missing forecast/price timestamps, future or stale historical prices, unavailable forecast runs, synthetic NO pricing, unresolved traded tokens, ambiguous traded settlement, or weather/payout mismatches.
 
 Scored-outcome JSON now separates `timing_entry_eligible` from `passes_signal_filter`, `signal_eligible`, and `trade_eligible`. This matters because some ultra-low-price rows can have large apparent fair-value gaps while still being rejected by price, fair-value, NO-tail, or exact-bucket gates; analysis should use `passes_signal_filter`/`signal_filter_reason` for tradability, not the timing-only legacy `entry_eligible` field.

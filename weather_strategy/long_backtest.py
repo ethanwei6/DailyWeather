@@ -1726,6 +1726,7 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
                 "first_buy_fair_value": None,
                 "first_buy_edge": None,
                 "first_buy_model_agreement": None,
+                "first_buy_no_side_counter_event_probability": None,
                 "side": execution.get("side"),
                 "buy_notional_usd": 0.0,
                 "sell_notional_usd": 0.0,
@@ -1773,6 +1774,7 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
             row["first_buy_fair_value"] = execution.get("fair_value")
             row["first_buy_edge"] = execution.get("edge")
             row["first_buy_model_agreement"] = execution.get("model_agreement")
+            row["first_buy_no_side_counter_event_probability"] = execution.get("no_side_counter_event_probability")
 
     trades = [row for row in by_token.values() if row["buy_notional_usd"] > 0]
     for trade in trades:
@@ -1793,8 +1795,13 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         trade["entry_month"] = _month_key(trade.get("first_buy_at"))
         trade["target_month"] = _month_key(trade.get("target_date"))
         trade["entry_price_bucket"] = _bucket_float(trade.get("first_buy_price"), 0.05)
+        trade["fair_value_bucket"] = _bucket_float(trade.get("first_buy_fair_value"), 0.05)
         trade["edge_bucket"] = _bucket_float(trade.get("first_buy_edge"), 0.05)
         trade["agreement_bucket"] = _bucket_float(trade.get("first_buy_model_agreement"), 0.25)
+        trade["no_side_counter_event_probability_bucket"] = _bucket_float(
+            trade.get("first_buy_no_side_counter_event_probability"),
+            0.025,
+        )
         trade["event_outcome"] = _event_outcome_label(trade.get("polymarket_payout"))
         if trade.get("bucket_shape") is None:
             trade["bucket_shape"] = _bucket_shape(trade.get("bucket_lower_f"), trade.get("bucket_upper_f"))
@@ -1820,6 +1827,7 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         "pnl_concentration": _pnl_concentration(trades),
         "by_city": _aggregate_trade_groups(trades, "city"),
         "by_entry_price_bucket": _aggregate_trade_groups(trades, "entry_price_bucket"),
+        "by_fair_value_bucket": _aggregate_trade_groups(trades, "fair_value_bucket"),
         "by_entry_hour_utc": _aggregate_trade_groups(trades, "entry_hour_utc"),
         "by_entry_month": _aggregate_trade_groups(trades, "entry_month"),
         "by_target_month": _aggregate_trade_groups(trades, "target_month"),
@@ -1828,6 +1836,10 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         "by_event_outcome": _aggregate_trade_groups(trades, "event_outcome"),
         "by_edge_bucket": _aggregate_trade_groups(trades, "edge_bucket"),
         "by_model_agreement_bucket": _aggregate_trade_groups(trades, "agreement_bucket"),
+        "by_no_side_counter_event_probability_bucket": _aggregate_trade_groups(
+            [trade for trade in trades if trade.get("side") == "NO"],
+            "no_side_counter_event_probability_bucket",
+        ),
         "by_lead_days": _aggregate_trade_groups(trades, "lead_days"),
         "by_weather_crosscheck": _aggregate_trade_groups(trades, "weather_crosscheck"),
         "best_trades": sorted(trades, key=lambda item: float(item["realized_pnl_usd"]), reverse=True)[:10],
@@ -3375,6 +3387,9 @@ def _json_kelly_replay(
     unprofitable_event_winner_pnl = sum(trade_pnl.get(token, 0.0) for token in unprofitable_event_winners)
     buy_notional = sum(trade_buy_notional.values())
     replay_concentration = _pnl_concentration_from_values(list(trade_pnl.values()))
+    trade_diagnostics = _trade_performance_diagnostics(
+        [_json_replay_execution_for_trade_diagnostics(execution) for execution in executions]
+    )
     return {
         "variant": name,
         "ending_equity_usd": round(cash, 2),
@@ -3406,6 +3421,7 @@ def _json_kelly_replay(
         "weather_mismatch_trades": len(weather_mismatch_trades),
         "weather_ambiguous_trades": len(weather_ambiguous_trades),
         "exit_management": _json_replay_exit_management(executions),
+        "trade_diagnostics": trade_diagnostics,
         "settings": {
             "min_price": settings.min_price,
             "yes_side_min_price": settings.yes_side_min_price,
@@ -3448,6 +3464,42 @@ def _json_kelly_replay(
             "invalid_hold_partial_exit_min_price": active_partial_exit_min_price,
             "invalid_hold_partial_exit_max_price": active_partial_exit_max_price,
         },
+    }
+
+
+def _json_replay_execution_for_trade_diagnostics(execution: Mapping[str, Any]) -> dict[str, Any]:
+    row = execution.get("row") or {}
+    payout = row.get("polymarket_payout")
+    if payout not in (0, 1):
+        payout = row.get("payout")
+    model_probabilities = row.get("model_probabilities") or {}
+    return {
+        "action": execution.get("action"),
+        "executed_at": row.get("generated_at"),
+        "token_id": execution.get("token_id"),
+        "question": row.get("question"),
+        "bucket": row.get("bucket") or row.get("bucket_label"),
+        "city": row.get("city"),
+        "target_date": row.get("target_date"),
+        "shares": execution.get("shares"),
+        "price": execution.get("price"),
+        "notional_usd": execution.get("notional_usd"),
+        "realized_pnl_usd": execution.get("realized_pnl_usd"),
+        "fair_value": row.get("fair_value"),
+        "edge": row.get("edge"),
+        "model_agreement": row.get("model_agreement"),
+        "no_side_counter_event_probability": (
+            no_side_counter_event_probability(model_probabilities)
+            if _json_is_no_side_row(row) and isinstance(model_probabilities, Mapping)
+            else None
+        ),
+        "side": row.get("side"),
+        "bucket_lower_f": row.get("bucket_lower_f"),
+        "bucket_upper_f": row.get("bucket_upper_f"),
+        "bucket_shape": _bucket_shape(row.get("bucket_lower_f"), row.get("bucket_upper_f")),
+        "polymarket_payout": payout,
+        "weather_outcome": row.get("weather_outcome"),
+        "weather_ambiguous": row.get("weather_ambiguous"),
     }
 
 

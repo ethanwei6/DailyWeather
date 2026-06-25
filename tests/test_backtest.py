@@ -742,6 +742,10 @@ class BacktestTest(unittest.TestCase):
                 "edge": 0.39,
                 "model_count": 3,
                 "model_agreement": 1.0,
+                "model_probabilities": {"source_a.model": 0.90, "source_b.model": 0.92, "source_c.model": 0.91},
+                "side": "NO",
+                "bucket_lower_f": 80.0,
+                "bucket_upper_f": 82.0,
                 "entry_eligible": True,
                 "polymarket_payout": 0,
                 "payout": 0,
@@ -757,6 +761,10 @@ class BacktestTest(unittest.TestCase):
                 "edge": -0.23,
                 "model_count": 3,
                 "model_agreement": 0.0,
+                "model_probabilities": {"source_a.model": 0.60, "source_b.model": 0.58, "source_c.model": 0.59},
+                "side": "NO",
+                "bucket_lower_f": 80.0,
+                "bucket_upper_f": 82.0,
                 "entry_eligible": True,
                 "polymarket_payout": 0,
                 "payout": 0,
@@ -796,6 +804,16 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["exit_management"]["by_final_payout"][0]["group"], 0)
         self.assertEqual(result["exit_management"]["by_final_payout"][0]["decision_value_vs_settlement_usd"], 16.0)
         self.assertEqual(result["exit_management"]["by_sell_price_bucket"][0]["group"], 0.8)
+        diagnostics = result["trade_diagnostics"]
+        self.assertEqual(diagnostics["trade_count"], 1)
+        self.assertEqual(diagnostics["event_losing_trades"], 1)
+        self.assertEqual(diagnostics["profitable_event_loser_trades"], 1)
+        self.assertEqual(diagnostics["by_event_outcome"][0]["group"], "event_loss")
+        self.assertEqual(diagnostics["by_side"][0]["group"], "NO")
+        self.assertEqual(diagnostics["by_bucket_shape"][0]["group"], "bounded")
+        self.assertEqual(diagnostics["by_entry_price_bucket"][0]["group"], 0.5)
+        self.assertEqual(diagnostics["by_fair_value_bucket"][0]["group"], 0.9)
+        self.assertEqual(diagnostics["by_no_side_counter_event_probability_bucket"][0]["group"], 0.075)
         forced_hold = _json_kelly_replay(
             "forced-hold",
             rows,
