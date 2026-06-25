@@ -70,7 +70,7 @@ Run a bounded live paper pass:
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-holds \
   --limit 250 \
   --discovery-request-limit 50 \
   --discovery-pages 1 \
@@ -82,7 +82,7 @@ python3 -m weather_strategy.cli paper-run \
   --run-log-dir work/logs/live_forward_paper
 ```
 
-The `live-forward-utc12-relaxed-no-tail-0.20` profile applies the Telonex-tested `$100` paper settings, including explicit NO-token entries, `75%` fractional Kelly, `25%` current-equity max-position cap, strict `10%` NO counter-event risk outside UTC noon, and a relaxed `20%` NO counter-event cap only for the `12:00 UTC` window. Use `--strategy-profile live-forward-strict-100` to keep the older strict `10%` NO-entry tail at every run hour.
+The `live-forward-utc12-relaxed-no-tail-0.20-trim-holds` profile applies the Telonex-tested `$100` paper settings, including explicit NO-token entries, `75%` fractional Kelly, `25%` current-equity max-position cap, strict `10%` NO counter-event risk outside UTC noon, a relaxed `20%` NO counter-event cap only for the `12:00 UTC` window, and Kelly-target trimming for valid holds. Use `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20` to keep the same entry gates while preserving valid holds at their current notional.
 
 The live-forward automation runs this paper-only profile at `00:00`, `06:00`, `12:00`, and `18:00` UTC so global city markets are checked before the local weather day begins across Americas, Europe, and Asia-Pacific. It uses each market city's timezone for the local lead-day filter and writes detailed JSON logs with scored rows, `passes_signal_filter` / `signal_filter_reason`, signal-filter counts, skipped-market reasons, per-city coverage, bucket-shape cohorts, local lead-day timing, positions, equity, PnL, and the applied `strategy_profile`.
 
@@ -139,7 +139,7 @@ Run a long historical replay over resolved Polymarket weather markets:
 
 ```bash
 python3 -m weather_strategy.cli long-backtest \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20 \
+  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-holds \
   --bankroll-usd 100 \
   --pages 20 \
   --limit-per-page 50 \
@@ -187,7 +187,7 @@ Current entry controls include:
 - Default `12.5c` general minimum price gate, plus a stricter `20c` YES-side entry floor. The split keeps low-price NO research entries available while blocking low-price YES longshots, which were weak in the expanded stress replay.
 - Default `70%` minimum model fair-value gate for new entries, based on the long replay showing weak realized accuracy in mid-confidence apparent edges.
 - Default full model-source agreement for new entries, with a looser `65%` agreement threshold for holding existing positions when the thesis remains positive.
-- Existing positions are preserved instead of trimmed back to Kelly target when the hold thesis remains valid; this reduces churn after the market starts confirming a good entry.
+- The current forward-paper profile trims valid holds back to the updated Kelly target. The preserved-hold profile remains available for comparison, but the latest Telonex slice showed better PnL, slightly lower drawdown, and slightly lower concentration with trimming.
 - Bounded exact/range temperature buckets are allowed only through stricter price, fair-value, edge, and full-agreement gates. Bounded NO-side entries can be disabled separately with `--disable-bounded-no-side-entries` for research.
 - One selected entry per city/date group to reduce correlated exposure.
 - Tomorrow/following-day lead-time focus for new entries.
@@ -206,7 +206,7 @@ Current entry controls include:
 Current Telonex-backed replay:
 
 ```text
-Profile: live-forward-utc12-relaxed-no-tail-0.20
+Profile: live-forward-utc12-relaxed-no-tail-0.20-trim-holds
 Tests: 141 passed
 Source: Telonex Polymarket market dataset + Telonex daily quote Parquet, Open-Meteo Single Runs forecasts, station METAR/ASOS cross-checks
 Bankroll: $100
@@ -217,17 +217,18 @@ Sessions: 20
 Scored rows: 1856
 Signals: 22
 Trades: 12 completed tokens
-Executions: 26
-Buys / sells / settlements: 14 / 12 / 0
-Ending equity: $288.96
-PnL: +$188.96
-Return: +188.96%
-Max drawdown in selected replay: $7.26 / 2.96%
+Executions: 32
+Buys / sells / settlements: 16 / 16 / 0
+Ending equity: $294.76
+PnL: +$194.76
+Return: +194.76%
+Max drawdown in selected replay: $7.02
 Event hit rate: 75% on 12 traded tokens
-Top-1 PnL share: 63.06%
-Bucket-shape PnL: upper-tail +$129.00 on 3 trades; bounded +$59.97 on 9 trades
+Top-1 PnL share: 62.25%
+Bucket-shape PnL: upper-tail +$132.06 on 3 trades; bounded +$62.71 on 9 trades
+Unprofitable event winners: 1 token, -$3.05 realized PnL
 Weather cross-check mismatches: 0
-Traded weather-checked executions: 26 / 26
+Traded weather-checked executions: 32 / 32
 Future/stale price violations: 0 / 0
 Unavailable forecast violations: 0
 Forecast availability lag: 6h
@@ -237,7 +238,7 @@ Runtime-limited: false
   real_data_audit: passed
 ```
 
-Backtest PnL is a research diagnostic, not a production claim. The current Telonex-backed sample is clean but still small and concentrated: the top trade contributes 63.06% of total PnL. Disabling bounded NO-side exact/range entries reduced PnL to +$110.08 and increased top-trade concentration to 96.83%, so it is not promoted. A global 20% NO-entry counter-event tail produced more trades and higher in-sample PnL (+$216.46 on 18 trades), but also much higher gross exposure and max drawdown ($24.16), so it remains high risk. The narrower UTC-12-only relaxed 20% NO-entry tail is the current forward-paper candidate because it increased trade count versus the strict baseline while preserving weather-validation cleanliness and keeping drawdown materially below the global-loose variants. Older Gamma/CLOB artifacts showed much higher headline PnL over broader saved slices; those are now treated as legacy research until reproduced on Telonex tick-level quote data.
+Backtest PnL is a research diagnostic, not a production claim. The current Telonex-backed sample is clean but still small and concentrated: the top trade contributes 62.25% of total PnL. Disabling bounded NO-side exact/range entries reduced PnL and increased concentration, so it is not promoted. A global 20% NO-entry counter-event tail produced more trades and higher in-sample PnL (+$216.46 on 18 trades), but also much higher gross exposure and max drawdown ($24.16), so it remains high risk. The narrower UTC-12-only relaxed 20% NO-entry tail with Kelly-target hold trimming is the current forward-paper candidate because it increased trade count versus the strict baseline while preserving weather-validation cleanliness and keeping drawdown materially below the global-loose variants. The replay still shows one ultimately winning event that realized a loss after an intermediate sell; that is tracked explicitly as `unprofitable_event_winner_trades` for future trader-logic work. Older Gamma/CLOB artifacts showed much higher headline PnL over broader saved slices; those are now treated as legacy research until reproduced on Telonex tick-level quote data.
 
 Historical quote replay requests are bounded to the strategy's scheduled decision and maintenance timestamps, rather than the full market lifetime. That keeps Telonex replays faster, avoids unnecessary future quote history, and matches the live strategy's available-information set more closely.
 

@@ -2029,6 +2029,53 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual({row["group"] for row in diagnostics["by_entry_month"]}, {"2026-06"})
         self.assertEqual({row["group"] for row in diagnostics["by_city"]}, {"Dallas, TX", "New York, NY"})
 
+    def test_trade_performance_diagnostics_flag_event_winners_that_lost_money(self) -> None:
+        executions = [
+            {
+                "action": "BUY",
+                "token_id": "sold-winner",
+                "executed_at": "2026-06-01T12:00:00+00:00",
+                "question": "NO: Will the highest temperature in New York City be between 44-45°F on June 2?",
+                "city": "New York, NY",
+                "target_date": "2026-06-02",
+                "bucket": "NO: between 44-45°F",
+                "side": "NO",
+                "notional_usd": 60.0,
+                "realized_pnl_usd": 0.0,
+                "price": 0.60,
+                "fair_value": 0.98,
+                "edge": 0.36,
+                "model_agreement": 1.0,
+                "polymarket_payout": 1,
+                "weather_outcome": 1,
+            },
+            {
+                "action": "SELL",
+                "token_id": "sold-winner",
+                "executed_at": "2026-06-01T18:00:00+00:00",
+                "question": "NO: Will the highest temperature in New York City be between 44-45°F on June 2?",
+                "city": "New York, NY",
+                "target_date": "2026-06-02",
+                "bucket": "NO: between 44-45°F",
+                "side": "NO",
+                "notional_usd": 57.0,
+                "realized_pnl_usd": -3.0,
+                "price": 0.57,
+                "fair_value": 0.98,
+                "edge": 0.38,
+                "model_agreement": 1.0,
+                "polymarket_payout": 1,
+                "weather_outcome": 1,
+            },
+        ]
+
+        diagnostics = _trade_performance_diagnostics(executions)
+
+        self.assertEqual(diagnostics["event_winning_trades"], 1)
+        self.assertEqual(diagnostics["unprofitable_event_winner_trades"], 1)
+        self.assertEqual(diagnostics["unprofitable_event_winner_pnl_usd"], -3.0)
+        self.assertEqual(diagnostics["worst_unprofitable_event_winners"][0]["token_id"], "sold-winner")
+
     def test_trade_concentration_omits_top_share_when_total_pnl_is_negative(self) -> None:
         concentration = _pnl_concentration(
             [

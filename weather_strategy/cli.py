@@ -36,6 +36,7 @@ STRATEGY_PROFILE_CHOICES = (
     "manual",
     "live-forward-strict-100",
     "live-forward-utc12-relaxed-no-tail-0.20",
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-holds",
 )
 
 LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
@@ -67,6 +68,7 @@ LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
     "edge_position_full_cap_edge": 0.25,
     "edge_position_min_multiplier": 0.35,
     "min_trade_usd": 1.0,
+    "trim_valid_holds_to_kelly_target": False,
     "min_lead_days": 1,
     "max_lead_days": 2,
 }
@@ -78,6 +80,12 @@ STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         **LIVE_FORWARD_PROFILE_SETTINGS,
         "no_side_relaxed_counter_event_probability": 0.20,
         "no_side_relaxed_counter_event_hours_utc": "12",
+    },
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-holds": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "no_side_relaxed_counter_event_probability": 0.20,
+        "no_side_relaxed_counter_event_hours_utc": "12",
+        "trim_valid_holds_to_kelly_target": True,
     },
 }
 

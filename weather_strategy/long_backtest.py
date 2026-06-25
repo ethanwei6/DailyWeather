@@ -1771,10 +1771,24 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
         trade["event_outcome"] = _event_outcome_label(trade.get("polymarket_payout"))
         if trade.get("bucket_shape") is None:
             trade["bucket_shape"] = _bucket_shape(trade.get("bucket_lower_f"), trade.get("bucket_upper_f"))
+    unprofitable_event_winners = [
+        trade
+        for trade in trades
+        if trade.get("polymarket_payout") == 1 and float(trade.get("realized_pnl_usd") or 0.0) < 0.0
+    ]
 
     return {
         "trade_count": len(trades),
         **_event_outcome_trade_summary(trades),
+        "unprofitable_event_winner_trades": len(unprofitable_event_winners),
+        "unprofitable_event_winner_pnl_usd": round(
+            sum(float(trade.get("realized_pnl_usd") or 0.0) for trade in unprofitable_event_winners),
+            2,
+        ),
+        "worst_unprofitable_event_winners": sorted(
+            unprofitable_event_winners,
+            key=lambda item: float(item["realized_pnl_usd"]),
+        )[:10],
         "pnl_concentration": _pnl_concentration(trades),
         "by_city": _aggregate_trade_groups(trades, "city"),
         "by_entry_price_bucket": _aggregate_trade_groups(trades, "entry_price_bucket"),
@@ -3226,6 +3240,12 @@ def _json_kelly_replay(
     event_loss_pnl = sum(trade_pnl.get(token, 0.0) for token in trade_tokens if trade_payout.get(token) == 0)
     event_win_pnl = sum(trade_pnl.get(token, 0.0) for token in trade_tokens if trade_payout.get(token) == 1)
     profitable_event_losers = sum(1 for token in trade_tokens if trade_payout.get(token) == 0 and trade_pnl.get(token, 0.0) > 0)
+    unprofitable_event_winners = [
+        token
+        for token in trade_tokens
+        if trade_payout.get(token) == 1 and trade_pnl.get(token, 0.0) < 0
+    ]
+    unprofitable_event_winner_pnl = sum(trade_pnl.get(token, 0.0) for token in unprofitable_event_winners)
     buy_notional = sum(trade_buy_notional.values())
     replay_concentration = _pnl_concentration_from_values(list(trade_pnl.values()))
     return {
@@ -3243,6 +3263,8 @@ def _json_kelly_replay(
         "event_win_pnl_usd": round(event_win_pnl, 2),
         "event_loss_pnl_usd": round(event_loss_pnl, 2),
         "profitable_event_loser_trades": profitable_event_losers,
+        "unprofitable_event_winner_trades": len(unprofitable_event_winners),
+        "unprofitable_event_winner_pnl_usd": round(unprofitable_event_winner_pnl, 2),
         "pnl_concentration": replay_concentration,
         "top_1_pnl_share": replay_concentration["top_1_pnl_share"],
         "buy_notional_usd": round(buy_notional, 4),

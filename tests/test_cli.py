@@ -29,6 +29,7 @@ class CliTest(unittest.TestCase):
             compound_kelly_sizing=False,
             max_position_usd=1000.0,
             max_position_fraction=0.15,
+            trim_valid_holds_to_kelly_target=True,
             min_lead_days=0,
             max_lead_days=7,
         )
@@ -44,8 +45,25 @@ class CliTest(unittest.TestCase):
         self.assertTrue(args.compound_kelly_sizing)
         self.assertEqual(args.max_position_usd, 100.0)
         self.assertEqual(args.max_position_fraction, 0.25)
+        self.assertFalse(args.trim_valid_holds_to_kelly_target)
         self.assertEqual(args.min_lead_days, 1)
         self.assertEqual(args.max_lead_days, 2)
+
+    def test_strategy_profile_can_trim_valid_holds_to_kelly_target(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-utc12-relaxed-no-tail-0.20-trim-holds",
+            allow_no_side_entries=False,
+            no_side_relaxed_counter_event_probability=None,
+            no_side_relaxed_counter_event_hours_utc="",
+            trim_valid_holds_to_kelly_target=False,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.no_side_relaxed_counter_event_probability, 0.20)
+        self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "12")
+        self.assertTrue(args.trim_valid_holds_to_kelly_target)
 
     def test_manual_strategy_profile_leaves_explicit_settings_unchanged(self) -> None:
         args = argparse.Namespace(
