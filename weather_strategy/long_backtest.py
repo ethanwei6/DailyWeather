@@ -1835,15 +1835,23 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
 
 def _score_calibration_diagnostics(scored: list[dict[str, Any]]) -> dict[str, Any]:
     resolved = [row for row in scored if row.get("polymarket_payout") in (0, 1)]
+    signal_eligible = [row for row in resolved if row.get("signal_filter_reason") is None]
     return {
         "resolved_count": len(resolved),
+        "signal_eligible_count": len(signal_eligible),
         "overall": _calibration_metrics(resolved),
+        "signal_eligible": _calibration_metrics(signal_eligible),
         "by_market_price_bucket": _aggregate_score_groups(resolved, "market_price", 0.10),
         "by_fair_value_bucket": _aggregate_score_groups(resolved, "fair_value", 0.10),
         "by_edge_bucket": _aggregate_score_groups(resolved, "edge", 0.10),
         "by_model_agreement_bucket": _aggregate_score_groups(resolved, "model_agreement", 0.25),
         "by_signal_filter_reason": _aggregate_score_groups(resolved, "signal_filter_reason", None),
         "model_probability_accuracy": _model_probability_accuracy(resolved),
+        "source_probability_accuracy": _model_probability_accuracy(resolved, group_by="source"),
+        "model_family_probability_accuracy": _model_probability_accuracy(resolved, group_by="model_family"),
+        "signal_eligible_model_probability_accuracy": _model_probability_accuracy(signal_eligible),
+        "signal_eligible_source_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="source"),
+        "signal_eligible_model_family_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="model_family"),
     }
 
 
@@ -3808,7 +3816,7 @@ def _aggregate_score_groups(rows: list[dict[str, Any]], key: str, width: Optiona
     ]
 
 
-def _model_probability_accuracy(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _model_probability_accuracy(rows: list[dict[str, Any]], *, group_by: str = "model") -> list[dict[str, Any]]:
     grouped: dict[str, list[tuple[float, int]]] = {}
     for row in rows:
         outcome = int(row["polymarket_payout"])
@@ -3817,23 +3825,37 @@ def _model_probability_accuracy(rows: list[dict[str, Any]]) -> list[dict[str, An
             continue
         for name, probability in probabilities.items():
             try:
-                grouped.setdefault(str(name), []).append((float(probability), outcome))
+                grouped.setdefault(_model_accuracy_group_key(str(name), group_by), []).append((float(probability), outcome))
             except (TypeError, ValueError):
                 continue
     diagnostics = []
     for name, values in grouped.items():
         if not values:
             continue
+        avg_probability = sum(prob for prob, _ in values) / len(values)
+        actual_rate = sum(outcome for _, outcome in values) / len(values)
         diagnostics.append(
             {
-                "model": name,
+                group_by: name,
                 "n": len(values),
-                "avg_probability": round(sum(prob for prob, _ in values) / len(values), 4),
-                "actual_rate": round(sum(outcome for _, outcome in values) / len(values), 4),
+                "avg_probability": round(avg_probability, 4),
+                "actual_rate": round(actual_rate, 4),
+                "bias": round(avg_probability - actual_rate, 4),
                 "brier": round(sum((prob - outcome) ** 2 for prob, outcome in values) / len(values), 6),
             }
         )
     return sorted(diagnostics, key=lambda item: (item["brier"], -item["n"]))[:30]
+
+
+def _model_accuracy_group_key(model_key: str, group_by: str) -> str:
+    if group_by == "model":
+        return model_key
+    source, separator, model_family = model_key.rpartition(".")
+    if group_by == "source":
+        return source if separator else "unknown"
+    if group_by == "model_family":
+        return model_family if separator else model_key
+    raise ValueError(f"Unknown model accuracy group: {group_by}")
 
 
 def _exit_management_diagnostics(trades: list[dict[str, Any]]) -> dict[str, Any]:

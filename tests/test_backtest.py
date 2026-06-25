@@ -38,6 +38,7 @@ from weather_strategy.long_backtest import (
     _resolve_market_outcome,
     _real_data_audit,
     _robustness_diagnostics,
+    _score_calibration_diagnostics,
     _scored_to_json,
     _settlement_quality_diagnostics,
     _signal_opportunity_diagnostics,
@@ -946,6 +947,49 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(high_conviction["sells"], 0)
         self.assertEqual(high_conviction["settlements"], 1)
         self.assertGreater(high_conviction["pnl_usd"], base["pnl_usd"])
+
+    def test_score_calibration_diagnostics_include_source_and_signal_eligible_model_accuracy(self) -> None:
+        rows = [
+            {
+                "polymarket_payout": 1,
+                "fair_value": 0.82,
+                "market_price": 0.60,
+                "edge": 0.20,
+                "model_agreement": 1.0,
+                "signal_filter_reason": None,
+                "model_probabilities": {
+                    "single_run_gfs_global.kernel_tight": 0.80,
+                    "single_run_ecmwf_ifs025.kernel_tight": 0.90,
+                    "single_run_ecmwf_ifs025.feature_aware": 0.85,
+                },
+            },
+            {
+                "polymarket_payout": 0,
+                "fair_value": 0.78,
+                "market_price": 0.55,
+                "edge": 0.21,
+                "model_agreement": 1.0,
+                "signal_filter_reason": "bounded exact/range bucket edge below 0.15",
+                "model_probabilities": {
+                    "single_run_gfs_global.kernel_tight": 0.70,
+                    "single_run_ecmwf_ifs025.kernel_tight": 0.20,
+                    "single_run_ecmwf_ifs025.feature_aware": 0.30,
+                },
+            },
+        ]
+
+        diagnostics = _score_calibration_diagnostics(rows)
+
+        self.assertEqual(diagnostics["resolved_count"], 2)
+        self.assertEqual(diagnostics["signal_eligible_count"], 1)
+        by_source = {row["source"]: row for row in diagnostics["source_probability_accuracy"]}
+        self.assertEqual(set(by_source), {"single_run_gfs_global", "single_run_ecmwf_ifs025"})
+        self.assertGreater(by_source["single_run_gfs_global"]["brier"], by_source["single_run_ecmwf_ifs025"]["brier"])
+        by_family = {row["model_family"]: row for row in diagnostics["model_family_probability_accuracy"]}
+        self.assertEqual(set(by_family), {"kernel_tight", "feature_aware"})
+        eligible_sources = {row["source"]: row for row in diagnostics["signal_eligible_source_probability_accuracy"]}
+        self.assertEqual(eligible_sources["single_run_gfs_global"]["actual_rate"], 1.0)
+        self.assertEqual(eligible_sources["single_run_ecmwf_ifs025"]["actual_rate"], 1.0)
 
     def test_robustness_diagnostics_include_time_slices_and_candidate_calibration(self) -> None:
         rows = [
