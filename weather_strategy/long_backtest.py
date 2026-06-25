@@ -3291,6 +3291,9 @@ def _json_kelly_replay(
             "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
             "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
             "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
+            "hold_no_side_high_conviction_min_fair_value": settings.hold_no_side_high_conviction_min_fair_value,
+            "hold_no_side_high_conviction_min_edge": settings.hold_no_side_high_conviction_min_edge,
+            "hold_no_side_high_conviction_counter_event_probability": settings.hold_no_side_high_conviction_counter_event_probability,
             "hold_min_model_agreement": settings.hold_min_model_agreement,
             "hold_min_fair_value": settings.hold_min_fair_value,
             "hold_market_confirmation_price": settings.hold_market_confirmation_price,
@@ -3353,10 +3356,11 @@ def _json_hold_candidate(row: Mapping[str, Any], settings: SignalSettings) -> bo
         return False
     if price < settings.min_price:
         return False
+    no_side_hold_counter_threshold = _json_active_no_side_hold_counter_event_threshold(row, settings)
     if _json_is_no_side_row(row) and _json_fails_no_side_counter_event_gate(
         row,
         settings,
-        no_side_max_counter_event_probability=settings.hold_no_side_max_counter_event_probability,
+        no_side_max_counter_event_probability=no_side_hold_counter_threshold,
     ):
         return False
     if (
@@ -3659,6 +3663,27 @@ def _json_active_no_side_counter_event_threshold(
     if generated_at is None:
         return threshold
     return relaxed_threshold if generated_at.astimezone(timezone.utc).hour in set(relaxed_hours) else threshold
+
+
+def _json_active_no_side_hold_counter_event_threshold(row: Mapping[str, Any], settings: SignalSettings) -> Optional[float]:
+    threshold = settings.hold_no_side_max_counter_event_probability
+    high_conviction_threshold = settings.hold_no_side_high_conviction_counter_event_probability
+    if high_conviction_threshold is None:
+        return threshold
+    min_fair_value = settings.hold_no_side_high_conviction_min_fair_value
+    min_edge = settings.hold_no_side_high_conviction_min_edge
+    if min_fair_value is None or min_edge is None:
+        return threshold
+    if not _json_is_no_side_row(row):
+        return threshold
+    try:
+        fair_value = float(row.get("fair_value"))
+        edge = float(row.get("edge"))
+    except (TypeError, ValueError):
+        return threshold
+    if fair_value < min_fair_value or edge < min_edge:
+        return threshold
+    return high_conviction_threshold
 
 
 def _candidate_quality_row(name: str, threshold: float, rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3998,6 +4023,9 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
         "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
         "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
+        "hold_no_side_high_conviction_min_fair_value": settings.hold_no_side_high_conviction_min_fair_value,
+        "hold_no_side_high_conviction_min_edge": settings.hold_no_side_high_conviction_min_edge,
+        "hold_no_side_high_conviction_counter_event_probability": settings.hold_no_side_high_conviction_counter_event_probability,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,
         "hold_min_model_agreement": settings.hold_min_model_agreement,

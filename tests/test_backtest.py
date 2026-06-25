@@ -865,6 +865,88 @@ class BacktestTest(unittest.TestCase):
         self.assertGreater(held["pnl_usd"], sold["pnl_usd"])
         self.assertEqual(sold["sells"], 1)
 
+    def test_json_kelly_replay_high_conviction_no_side_holds_can_use_wider_tail(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-06-15T12:00:00+00:00",
+                "token_id": "no-token",
+                "city": "Seoul, KR",
+                "target_date": "2026-06-17",
+                "bucket": "NO: Will the highest temperature in Seoul be 31°C or higher on June 17?",
+                "side": "NO",
+                "market_price": 0.50,
+                "exit_price": 0.50,
+                "fair_value": 0.99,
+                "edge": 0.48,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+                "model_probabilities": {"a.model": 0.99, "b.model": 0.99, "c.model": 0.99},
+            },
+            {
+                "generated_at": "2026-06-16T12:00:00+00:00",
+                "token_id": "no-token",
+                "city": "Seoul, KR",
+                "target_date": "2026-06-17",
+                "bucket": "NO: Will the highest temperature in Seoul be 31°C or higher on June 17?",
+                "side": "NO",
+                "market_price": 0.62,
+                "exit_price": 0.62,
+                "fair_value": 0.99,
+                "edge": 0.36,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+                "model_probabilities": {"a.model": 0.82, "b.model": 0.91, "c.model": 0.92},
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.70,
+            no_side_min_edge=0.0,
+            no_side_max_counter_event_probability=0.10,
+            hold_no_side_max_counter_event_probability=0.15,
+            enforce_entry_timing_filter=False,
+        )
+
+        base = _json_kelly_replay(
+            "base-hold-tail",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=10,
+            min_trade_usd=1,
+        )
+        high_conviction = _json_kelly_replay(
+            "high-conviction-hold-tail",
+            rows,
+            replace(
+                settings,
+                hold_no_side_high_conviction_min_fair_value=0.98,
+                hold_no_side_high_conviction_min_edge=0.35,
+                hold_no_side_high_conviction_counter_event_probability=0.20,
+            ),
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=10,
+            min_trade_usd=1,
+        )
+
+        self.assertEqual(base["sells"], 1)
+        self.assertEqual(high_conviction["sells"], 0)
+        self.assertEqual(high_conviction["settlements"], 1)
+        self.assertGreater(high_conviction["pnl_usd"], base["pnl_usd"])
+
     def test_robustness_diagnostics_include_time_slices_and_candidate_calibration(self) -> None:
         rows = [
             {

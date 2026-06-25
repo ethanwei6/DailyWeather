@@ -860,6 +860,39 @@ class TradingLayersTest(unittest.TestCase):
         self.assertEqual(signal_filter_reason(no_side, settings), "NO-side counter-event probability above 0.1")
         self.assertIsNone(hold_filter_reason(no_side, settings))
 
+    def test_high_conviction_no_side_hold_can_use_wider_tail_cap(self) -> None:
+        no_side = ScoredOutcome(
+            market_id="market-1",
+            market_slug="slug",
+            question="NO: Will the highest temperature in Seoul be 31°C or higher on June 17?",
+            bucket_label="NO: 31°C or higher",
+            token_id="no-token",
+            fair_value=0.99,
+            market_price=0.62,
+            edge=0.36,
+            model_count=3,
+            model_agreement=1.0,
+            probability_stdev=0.01,
+            generated_at=datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc),
+            city="Seoul, KR",
+            target_date=date(2026, 6, 17),
+            rule_excerpt="rules",
+            model_probabilities={"a.model": 0.82, "b.model": 0.91, "c.model": 0.92},
+        )
+        settings = SignalSettings(
+            enforce_entry_timing_filter=False,
+            hold_no_side_max_counter_event_probability=0.15,
+            hold_no_side_high_conviction_min_fair_value=0.98,
+            hold_no_side_high_conviction_min_edge=0.35,
+            hold_no_side_high_conviction_counter_event_probability=0.20,
+        )
+
+        self.assertIsNone(hold_filter_reason(no_side, settings))
+        lower_edge = ScoredOutcome(**{**no_side.__dict__, "edge": 0.34})
+        self.assertEqual(hold_filter_reason(lower_edge, settings), "NO-side hold counter-event probability above 0.15")
+        lower_fair_value = ScoredOutcome(**{**no_side.__dict__, "fair_value": 0.97})
+        self.assertEqual(hold_filter_reason(lower_fair_value, settings), "NO-side hold counter-event probability above 0.15")
+
     def test_no_side_entry_rejects_opposing_tail_disagreement(self) -> None:
         settings = SignalSettings(
             min_edge=0.08,

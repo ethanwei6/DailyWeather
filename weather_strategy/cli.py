@@ -37,6 +37,7 @@ STRATEGY_PROFILE_CHOICES = (
     "live-forward-strict-100",
     "live-forward-utc12-relaxed-no-tail-0.20",
     "live-forward-utc12-relaxed-no-tail-0.20-trim-holds",
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds",
 )
 
 LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
@@ -57,6 +58,9 @@ LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
     "no_side_relaxed_counter_event_probability": None,
     "no_side_relaxed_counter_event_hours_utc": "",
     "hold_no_side_max_counter_event_probability": 0.15,
+    "hold_no_side_high_conviction_min_fair_value": None,
+    "hold_no_side_high_conviction_min_edge": None,
+    "hold_no_side_high_conviction_counter_event_probability": None,
     "high_confidence_price_threshold": 0.75,
     "high_confidence_min_kelly_edge": 0.02,
     "bankroll_usd": 100.0,
@@ -86,6 +90,15 @@ STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "no_side_relaxed_counter_event_probability": 0.20,
         "no_side_relaxed_counter_event_hours_utc": "12",
         "trim_valid_holds_to_kelly_target": True,
+    },
+    "live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "no_side_relaxed_counter_event_probability": 0.20,
+        "no_side_relaxed_counter_event_hours_utc": "12",
+        "trim_valid_holds_to_kelly_target": True,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
     },
 }
 
@@ -163,6 +176,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None, help="Optional relaxed NO counter-event cap used only during --no-side-relaxed-counter-event-hours-utc")
     paper.add_argument("--no-side-relaxed-counter-event-hours-utc", default="", help="Comma-separated UTC hours that may use --no-side-relaxed-counter-event-probability")
     paper.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability")
+    paper.add_argument("--hold-no-side-high-conviction-min-fair-value", type=float, default=None, help="Optional FV floor for using the wider high-conviction NO hold counter-event cap")
+    paper.add_argument("--hold-no-side-high-conviction-min-edge", type=float, default=None, help="Optional edge floor for using the wider high-conviction NO hold counter-event cap")
+    paper.add_argument("--hold-no-side-high-conviction-counter-event-probability", type=float, default=None, help="Optional wider NO hold counter-event cap used only for high-conviction existing positions")
     paper.add_argument("--min-signal-fair-value", type=float, default=0.70)
     paper.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     paper.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
@@ -238,6 +254,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None)
     backtest.add_argument("--no-side-relaxed-counter-event-hours-utc", default="")
     backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15)
+    backtest.add_argument("--hold-no-side-high-conviction-min-fair-value", type=float, default=None)
+    backtest.add_argument("--hold-no-side-high-conviction-min-edge", type=float, default=None)
+    backtest.add_argument("--hold-no-side-high-conviction-counter-event-probability", type=float, default=None)
     backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
     backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
@@ -315,6 +334,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None, help="Optional relaxed NO counter-event cap used only during --no-side-relaxed-counter-event-hours-utc")
     long_backtest.add_argument("--no-side-relaxed-counter-event-hours-utc", default="", help="Comma-separated UTC hours that may use --no-side-relaxed-counter-event-probability")
     long_backtest.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability; set >=1 to disable")
+    long_backtest.add_argument("--hold-no-side-high-conviction-min-fair-value", type=float, default=None, help="Optional FV floor for using the wider high-conviction NO hold counter-event cap")
+    long_backtest.add_argument("--hold-no-side-high-conviction-min-edge", type=float, default=None, help="Optional edge floor for using the wider high-conviction NO hold counter-event cap")
+    long_backtest.add_argument("--hold-no-side-high-conviction-counter-event-probability", type=float, default=None, help="Optional wider NO hold counter-event cap used only for high-conviction existing positions")
     long_backtest.add_argument("--min-signal-fair-value", type=float, default=0.70)
     long_backtest.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
     long_backtest.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
@@ -444,6 +466,9 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
         no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        hold_no_side_high_conviction_min_fair_value=args.hold_no_side_high_conviction_min_fair_value,
+        hold_no_side_high_conviction_min_edge=args.hold_no_side_high_conviction_min_edge,
+        hold_no_side_high_conviction_counter_event_probability=args.hold_no_side_high_conviction_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
         allow_bounded_no_side_entries=args.allow_bounded_no_side_entries,
@@ -517,6 +542,9 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
         no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        hold_no_side_high_conviction_min_fair_value=args.hold_no_side_high_conviction_min_fair_value,
+        hold_no_side_high_conviction_min_edge=args.hold_no_side_high_conviction_min_edge,
+        hold_no_side_high_conviction_counter_event_probability=args.hold_no_side_high_conviction_counter_event_probability,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
         hold_min_fair_value=args.hold_min_fair_value,
@@ -697,6 +725,9 @@ def run_paper(args: argparse.Namespace) -> int:
         no_side_relaxed_counter_event_probability=args.no_side_relaxed_counter_event_probability,
         no_side_relaxed_counter_event_hours_utc=_parse_optional_entry_hours(args.no_side_relaxed_counter_event_hours_utc),
         hold_no_side_max_counter_event_probability=args.hold_no_side_max_counter_event_probability,
+        hold_no_side_high_conviction_min_fair_value=args.hold_no_side_high_conviction_min_fair_value,
+        hold_no_side_high_conviction_min_edge=args.hold_no_side_high_conviction_min_edge,
+        hold_no_side_high_conviction_counter_event_probability=args.hold_no_side_high_conviction_counter_event_probability,
         min_signal_fair_value=args.min_signal_fair_value,
         allow_bounded_bucket_entries=args.allow_bounded_bucket_entries,
         allow_bounded_no_side_entries=args.allow_bounded_no_side_entries,
@@ -1045,6 +1076,9 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "no_side_relaxed_counter_event_probability": settings.no_side_relaxed_counter_event_probability,
         "no_side_relaxed_counter_event_hours_utc": list(settings.no_side_relaxed_counter_event_hours_utc),
         "hold_no_side_max_counter_event_probability": settings.hold_no_side_max_counter_event_probability,
+        "hold_no_side_high_conviction_min_fair_value": settings.hold_no_side_high_conviction_min_fair_value,
+        "hold_no_side_high_conviction_min_edge": settings.hold_no_side_high_conviction_min_edge,
+        "hold_no_side_high_conviction_counter_event_probability": settings.hold_no_side_high_conviction_counter_event_probability,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,
         "hold_min_model_agreement": settings.hold_min_model_agreement,

@@ -40,6 +40,9 @@ class SignalSettings:
     no_side_relaxed_counter_event_probability: Optional[float] = None
     no_side_relaxed_counter_event_hours_utc: tuple[int, ...] = ()
     hold_no_side_max_counter_event_probability: Optional[float] = 0.15
+    hold_no_side_high_conviction_min_fair_value: Optional[float] = None
+    hold_no_side_high_conviction_min_edge: Optional[float] = None
+    hold_no_side_high_conviction_counter_event_probability: Optional[float] = None
     high_confidence_price_threshold: float = 0.75
     high_confidence_min_kelly_edge: float = 0.02
     low_price_exact_bucket_threshold: float = 0.20
@@ -294,12 +297,13 @@ def hold_filter_reason(outcome: ScoredOutcome, settings: Optional[SignalSettings
         return "final observation contradicts bucket"
     if hold_outcome.market_price < settings.min_price:
         return f"market price below {_format_threshold(settings.min_price)}"
+    no_side_hold_counter_threshold = _active_no_side_hold_counter_event_threshold(settings, hold_outcome)
     if _is_no_side_outcome(hold_outcome) and _fails_no_side_counter_event_gate(
         hold_outcome.model_probabilities,
         settings,
-        threshold=settings.hold_no_side_max_counter_event_probability,
+        threshold=no_side_hold_counter_threshold,
     ):
-        return f"NO-side hold counter-event probability above {_format_threshold(settings.hold_no_side_max_counter_event_probability or 0.0)}"
+        return f"NO-side hold counter-event probability above {_format_threshold(no_side_hold_counter_threshold or 0.0)}"
     if _fails_bounded_bucket_entry_gate(hold_outcome.bucket_lower_f, hold_outcome.bucket_upper_f, settings):
         return "bounded exact/range bucket entries disabled"
     if hold_outcome.model_count < settings.min_model_count:
@@ -452,6 +456,22 @@ def _active_no_side_counter_event_threshold(settings: SignalSettings, generated_
         return threshold
     current = generated_at if generated_at.tzinfo is not None else generated_at.replace(tzinfo=timezone.utc)
     return relaxed_threshold if current.astimezone(timezone.utc).hour in set(relaxed_hours) else threshold
+
+
+def _active_no_side_hold_counter_event_threshold(settings: SignalSettings, outcome: ScoredOutcome) -> Optional[float]:
+    threshold = settings.hold_no_side_max_counter_event_probability
+    high_conviction_threshold = settings.hold_no_side_high_conviction_counter_event_probability
+    if high_conviction_threshold is None:
+        return threshold
+    min_fair_value = settings.hold_no_side_high_conviction_min_fair_value
+    min_edge = settings.hold_no_side_high_conviction_min_edge
+    if min_fair_value is None or min_edge is None:
+        return threshold
+    if not _is_no_side_outcome(outcome):
+        return threshold
+    if outcome.fair_value < min_fair_value or outcome.edge < min_edge:
+        return threshold
+    return high_conviction_threshold
 
 
 def _fails_low_price_exact_bucket_gate(
