@@ -43,6 +43,10 @@ class SignalSettings:
     hold_no_side_high_conviction_min_fair_value: Optional[float] = None
     hold_no_side_high_conviction_min_edge: Optional[float] = None
     hold_no_side_high_conviction_counter_event_probability: Optional[float] = None
+    invalid_hold_partial_exit_fraction: Optional[float] = None
+    invalid_hold_partial_exit_min_fair_value: float = 0.90
+    invalid_hold_partial_exit_min_price: float = 0.50
+    invalid_hold_partial_exit_max_price: float = 0.65
     high_confidence_price_threshold: float = 0.75
     high_confidence_min_kelly_edge: float = 0.02
     low_price_exact_bucket_threshold: float = 0.20

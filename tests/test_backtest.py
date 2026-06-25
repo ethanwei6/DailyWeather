@@ -41,6 +41,7 @@ from weather_strategy.long_backtest import (
     _score_calibration_diagnostics,
     _scored_to_json,
     _settlement_quality_diagnostics,
+    _selected_candidate_weather_validation,
     _signal_opportunity_diagnostics,
     _strategy_recommendation_diagnostics,
     _strategy_sensitivity_diagnostics,
@@ -789,6 +790,161 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["event_hit_rate"], 0.0)
         self.assertEqual(result["profitable_event_loser_trades"], 1)
         self.assertGreater(result["event_loss_pnl_usd"], 0)
+        self.assertEqual(result["exit_management"]["sell_count"], 1)
+        self.assertEqual(result["exit_management"]["event_loser_sell_value_usd"], 16.0)
+        self.assertEqual(result["exit_management"]["sell_decision_value_vs_settlement_usd"], 16.0)
+        self.assertEqual(result["exit_management"]["by_final_payout"][0]["group"], 0)
+        self.assertEqual(result["exit_management"]["by_final_payout"][0]["decision_value_vs_settlement_usd"], 16.0)
+        self.assertEqual(result["exit_management"]["by_sell_price_bucket"][0]["group"], 0.8)
+        forced_hold = _json_kelly_replay(
+            "forced-hold",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=10,
+            min_trade_usd=1,
+            force_hold_existing_positions=True,
+        )
+        self.assertEqual(forced_hold["sells"], 0)
+        self.assertLess(forced_hold["pnl_usd"], result["pnl_usd"])
+        self.assertTrue(forced_hold["settings"]["force_hold_existing_positions"])
+
+    def test_selected_candidate_weather_validation_surfaces_ambiguous_and_mismatched_rows(self) -> None:
+        base = {
+            "market_price": 0.50,
+            "fair_value": 0.90,
+            "edge": 0.39,
+            "model_count": 3,
+            "model_agreement": 1.0,
+            "entry_eligible": True,
+            "bucket_lower_f": 90.0,
+            "bucket_upper_f": 91.0,
+            "side": "NO",
+        }
+        rows = [
+            {
+                **base,
+                "generated_at": "2026-06-01T12:00:00+00:00",
+                "token_id": "ambiguous",
+                "question": "NO: Will the highest temperature in Seoul be 32°C on June 2?",
+                "city": "Seoul, KR",
+                "target_date": "2026-06-02",
+                "polymarket_payout": 0,
+                "weather_outcome": None,
+                "weather_ambiguous": True,
+                "settlement_source": "historical_metar_RKSI_ambiguous_resolution",
+            },
+            {
+                **base,
+                "generated_at": "2026-06-01T12:00:00+00:00",
+                "token_id": "mismatch",
+                "question": "NO: Will the highest temperature in Miami be between 92-93°F on June 2?",
+                "city": "Miami, FL",
+                "target_date": "2026-06-02",
+                "polymarket_payout": 1,
+                "weather_outcome": 0,
+                "weather_ambiguous": False,
+                "settlement_source": "historical_metar_KMIA",
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.70,
+            no_side_min_edge=0.0,
+            no_side_max_counter_event_probability=1.0,
+            bounded_bucket_min_price=0.0,
+            bounded_bucket_min_edge=0.0,
+            bounded_bucket_min_fair_value=0.0,
+            enforce_entry_timing_filter=False,
+        )
+
+        diagnostics = _selected_candidate_weather_validation(rows, settings)
+
+        self.assertEqual(diagnostics["selected_candidate_count"], 2)
+        self.assertEqual(diagnostics["weather_ambiguous_count"], 1)
+        self.assertEqual(diagnostics["weather_mismatch_count"], 1)
+        self.assertEqual(diagnostics["quality"]["weather_ambiguous"], 1)
+        self.assertEqual(diagnostics["quality"]["weather_mismatches"], 1)
+        self.assertEqual(diagnostics["ambiguous_examples"][0]["token_id"], "ambiguous")
+        self.assertEqual(diagnostics["mismatch_examples"][0]["token_id"], "mismatch")
+
+    def test_json_kelly_replay_can_partially_exit_high_fair_value_invalid_holds(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-06-01T12:00:00+00:00",
+                "token_id": "event-winner",
+                "city": "New York, NY",
+                "target_date": "2026-06-02",
+                "market_price": 0.50,
+                "fair_value": 0.95,
+                "edge": 0.44,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+            {
+                "generated_at": "2026-06-01T18:00:00+00:00",
+                "token_id": "event-winner",
+                "city": "New York, NY",
+                "target_date": "2026-06-02",
+                "market_price": 0.70,
+                "exit_price": 0.70,
+                "fair_value": 0.95,
+                "edge": 0.24,
+                "model_count": 3,
+                "model_agreement": 0.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.70,
+            hold_min_model_agreement=0.65,
+            enforce_entry_timing_filter=False,
+        )
+
+        full_exit = _json_kelly_replay(
+            "full-exit",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=10,
+            min_trade_usd=1,
+        )
+        partial_exit = _json_kelly_replay(
+            "partial-exit",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=10,
+            min_trade_usd=1,
+            invalid_hold_partial_exit_fraction=0.5,
+            invalid_hold_partial_exit_min_fair_value=0.90,
+            invalid_hold_partial_exit_min_price=0.50,
+            invalid_hold_partial_exit_max_price=0.80,
+        )
+
+        self.assertEqual(full_exit["sells"], 1)
+        self.assertEqual(partial_exit["sells"], 1)
+        self.assertGreater(partial_exit["pnl_usd"], full_exit["pnl_usd"])
+        self.assertEqual(partial_exit["exit_management"]["event_winner_sell_drag_usd"], -3.0)
+        self.assertEqual(partial_exit["settings"]["invalid_hold_partial_exit_fraction"], 0.5)
 
     def test_json_kelly_replay_uses_wider_no_side_hold_tail_without_weakening_entry_tail(self) -> None:
         rows = [
@@ -1603,6 +1759,10 @@ class BacktestTest(unittest.TestCase):
         self.assertIn("legacy_no_side_counter_event_0.08", replay_by_variant)
         self.assertIn("legacy_no_side_counter_event_0.09", replay_by_variant)
         self.assertIn("selected_no_side_counter_event_0.10", replay_by_variant)
+        self.assertIn("looser_hold_no_side_counter_event_0.30", replay_by_variant)
+        self.assertIn("disabled_hold_no_side_counter_event_gate", replay_by_variant)
+        self.assertIn("force_hold_existing_positions_to_settlement", replay_by_variant)
+        self.assertIn("partial_invalid_hold_exit_x0.50_fv0.90_price0.50_0.65", replay_by_variant)
         self.assertIn("looser_no_side_counter_event_0.30", replay_by_variant)
         self.assertIn("max_position_fraction_0.05", replay_by_variant)
         self.assertIn("max_position_fraction_0.10", replay_by_variant)

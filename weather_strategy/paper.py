@@ -308,7 +308,8 @@ class PaperLedger:
                     elif hold_eligible:
                         target_notional = current_notional
                 delta_notional = target_notional - current_notional
-                if target_notional <= 0 and current_shares > 0:
+                delta_notional = _partial_exit_delta_notional(delta_notional, outcome, settings)
+                if target_notional <= 0 and current_shares > 0 and abs(delta_notional) >= current_notional - 1e-9:
                     self._sell(conn, outcome, current, current_shares)
                     executions += 1
                     continue
@@ -662,6 +663,21 @@ def _yes_bucket_label(label: str) -> str:
 def _is_expired_without_settlement(outcome: ScoredOutcome) -> bool:
     reason = (outcome.entry_filter_reason or "").lower()
     return "target date has passed" in reason
+
+
+def _partial_exit_delta_notional(delta_notional: float, outcome: ScoredOutcome, settings: SignalSettings) -> float:
+    if delta_notional >= 0.0 or settings.invalid_hold_partial_exit_fraction is None:
+        return delta_notional
+    fraction = max(0.0, min(1.0, settings.invalid_hold_partial_exit_fraction))
+    if fraction >= 1.0:
+        return delta_notional
+    if outcome.market_price < settings.invalid_hold_partial_exit_min_price:
+        return delta_notional
+    if outcome.market_price > settings.invalid_hold_partial_exit_max_price:
+        return delta_notional
+    if outcome.fair_value < settings.invalid_hold_partial_exit_min_fair_value:
+        return delta_notional
+    return delta_notional * fraction
 
 
 def _local_date(timezone_name: str, current: datetime) -> date:

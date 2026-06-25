@@ -627,6 +627,7 @@ def run_long_historical_backtest(
         forecast_availability_lag_hours=forecast_availability_lag_hours,
     )
     settlement_quality_diagnostics = _settlement_quality_diagnostics(scored_detail, executions)
+    selected_candidate_weather_validation = _selected_candidate_weather_validation(scored_detail, settings)
     strategy_sensitivity_diagnostics = _strategy_sensitivity_diagnostics(
         scored_detail,
         settings,
@@ -753,6 +754,7 @@ def run_long_historical_backtest(
         },
         "data_quality_diagnostics": data_quality_diagnostics,
         "settlement_quality_diagnostics": settlement_quality_diagnostics,
+        "selected_candidate_weather_validation": selected_candidate_weather_validation,
         "top_trades": sorted(executions, key=lambda item: abs(float(item.get("realized_pnl_usd") or 0.0)), reverse=True)[:20],
         "top_weather_crosscheck_mismatch_trades": _top_weather_crosscheck_mismatch_trades(executions),
         "executions_detail": executions,
@@ -2880,6 +2882,8 @@ def _counterfactual_kelly_replays(
         ("legacy_hold_no_side_counter_event_0.09", replace(settings, hold_no_side_max_counter_event_probability=0.09)),
         ("selected_hold_no_side_counter_event_0.15", replace(settings, hold_no_side_max_counter_event_probability=0.15)),
         ("looser_hold_no_side_counter_event_0.20", replace(settings, hold_no_side_max_counter_event_probability=0.20)),
+        ("looser_hold_no_side_counter_event_0.30", replace(settings, hold_no_side_max_counter_event_probability=0.30)),
+        ("disabled_hold_no_side_counter_event_gate", replace(settings, hold_no_side_max_counter_event_probability=1.0)),
         ("trim_valid_holds_to_kelly_target", replace(settings, preserve_valid_holds=False)),
     )
     setting_replays = [
@@ -3091,6 +3095,50 @@ def _counterfactual_kelly_replays(
             high_price_damping_multiplier=0.35,
         )
     ]
+    exit_management_replays = [
+        _json_kelly_replay(
+            "force_hold_existing_positions_to_settlement",
+            scored,
+            settings,
+            bankroll_usd=bankroll_usd,
+            kelly_fraction=kelly_fraction,
+            compound_kelly_sizing=compound_kelly_sizing,
+            max_position_usd=max_position_usd,
+            max_position_fraction=max_position_fraction,
+            kelly_market_blend=kelly_market_blend,
+            edge_position_full_cap_edge=edge_position_full_cap_edge,
+            edge_position_min_multiplier=edge_position_min_multiplier,
+            min_trade_usd=min_trade_usd,
+            force_hold_existing_positions=True,
+        )
+    ]
+    partial_exit_replays = [
+        _json_kelly_replay(
+            name,
+            scored,
+            settings,
+            bankroll_usd=bankroll_usd,
+            kelly_fraction=kelly_fraction,
+            compound_kelly_sizing=compound_kelly_sizing,
+            max_position_usd=max_position_usd,
+            max_position_fraction=max_position_fraction,
+            kelly_market_blend=kelly_market_blend,
+            edge_position_full_cap_edge=edge_position_full_cap_edge,
+            edge_position_min_multiplier=edge_position_min_multiplier,
+            min_trade_usd=min_trade_usd,
+            invalid_hold_partial_exit_fraction=fraction,
+            invalid_hold_partial_exit_min_fair_value=min_fair_value,
+            invalid_hold_partial_exit_min_price=min_price,
+            invalid_hold_partial_exit_max_price=max_price,
+        )
+        for name, fraction, min_fair_value, min_price, max_price in (
+            ("partial_invalid_hold_exit_x0.50_fv0.90_price0.50_0.80", 0.50, 0.90, 0.50, 0.80),
+            ("partial_invalid_hold_exit_x0.50_fv0.95_price0.50_0.80", 0.50, 0.95, 0.50, 0.80),
+            ("partial_invalid_hold_exit_x0.25_fv0.90_price0.50_0.80", 0.25, 0.90, 0.50, 0.80),
+            ("partial_invalid_hold_exit_x0.50_fv0.90_price0.50_0.70", 0.50, 0.90, 0.50, 0.70),
+            ("partial_invalid_hold_exit_x0.50_fv0.90_price0.50_0.65", 0.50, 0.90, 0.50, 0.65),
+        )
+    ]
     return (
         setting_replays
         + sizing_replays
@@ -3102,6 +3150,8 @@ def _counterfactual_kelly_replays(
         + calibration_sizing_replays
         + edge_scaled_cap_replays
         + high_price_damping_replays
+        + exit_management_replays
+        + partial_exit_replays
     )
 
 
@@ -3158,6 +3208,11 @@ def _json_kelly_replay(
     high_price_damping_threshold: Optional[float] = None,
     high_price_damping_edge: float = 0.0,
     high_price_damping_multiplier: float = 1.0,
+    force_hold_existing_positions: bool = False,
+    invalid_hold_partial_exit_fraction: Optional[float] = None,
+    invalid_hold_partial_exit_min_fair_value: float = 0.90,
+    invalid_hold_partial_exit_min_price: float = 0.50,
+    invalid_hold_partial_exit_max_price: float = 0.80,
 ) -> dict[str, Any]:
     sessions: dict[str, list[dict[str, Any]]] = {}
     for row in scored:
@@ -3170,6 +3225,26 @@ def _json_kelly_replay(
     executions: list[dict[str, Any]] = []
     equity_curve: list[dict[str, Any]] = []
     signal_count = 0
+    active_partial_exit_fraction = (
+        settings.invalid_hold_partial_exit_fraction
+        if invalid_hold_partial_exit_fraction is None
+        else invalid_hold_partial_exit_fraction
+    )
+    active_partial_exit_min_fair_value = (
+        settings.invalid_hold_partial_exit_min_fair_value
+        if invalid_hold_partial_exit_fraction is None
+        else invalid_hold_partial_exit_min_fair_value
+    )
+    active_partial_exit_min_price = (
+        settings.invalid_hold_partial_exit_min_price
+        if invalid_hold_partial_exit_fraction is None
+        else invalid_hold_partial_exit_min_price
+    )
+    active_partial_exit_max_price = (
+        settings.invalid_hold_partial_exit_max_price
+        if invalid_hold_partial_exit_fraction is None
+        else invalid_hold_partial_exit_max_price
+    )
     for session_key in sorted(sessions):
         session_time = _parse_dt(session_key)
         if session_time is None:
@@ -3188,7 +3263,7 @@ def _json_kelly_replay(
             current = positions.get(token)
             current_shares = float(current["shares"]) if current else 0.0
             current_notional = current_shares * price
-            hold_eligible = current is not None and _json_hold_candidate(row, settings)
+            hold_eligible = current is not None and (force_hold_existing_positions or _json_hold_candidate(row, settings))
             target_notional = 0.0
             if token in selected_tokens:
                 sizing_bankroll = _json_portfolio_equity(cash, positions) if compound_kelly_sizing else bankroll_usd
@@ -3214,6 +3289,14 @@ def _json_kelly_replay(
             elif hold_eligible:
                 target_notional = current_notional
             delta = target_notional - current_notional
+            delta = _json_partial_exit_delta(
+                delta,
+                row,
+                invalid_hold_partial_exit_fraction=active_partial_exit_fraction,
+                invalid_hold_partial_exit_min_fair_value=active_partial_exit_min_fair_value,
+                invalid_hold_partial_exit_min_price=active_partial_exit_min_price,
+                invalid_hold_partial_exit_max_price=active_partial_exit_max_price,
+            )
             if delta > 0 and delta >= min_trade_usd:
                 notional = min(delta, cash)
                 if notional < min_trade_usd:
@@ -3232,7 +3315,17 @@ def _json_kelly_replay(
                     current["cost_basis"] += notional
                     current["last_price"] = price
                     current["row"] = row
-                executions.append({"action": "BUY", "token_id": token, "notional_usd": notional, "realized_pnl_usd": 0.0, "row": row})
+                executions.append(
+                    {
+                        "action": "BUY",
+                        "token_id": token,
+                        "shares": shares,
+                        "price": price,
+                        "notional_usd": notional,
+                        "realized_pnl_usd": 0.0,
+                        "row": row,
+                    }
+                )
             elif delta < 0 and current is not None and abs(delta) >= min_trade_usd:
                 shares = min(current_shares, abs(delta) / price)
                 cash = _json_sell_position(positions, executions, cash, token, shares, row)
@@ -3312,6 +3405,7 @@ def _json_kelly_replay(
         "max_drawdown_pct": _equity_curve_drawdown(equity_curve)[1],
         "weather_mismatch_trades": len(weather_mismatch_trades),
         "weather_ambiguous_trades": len(weather_ambiguous_trades),
+        "exit_management": _json_replay_exit_management(executions),
         "settings": {
             "min_price": settings.min_price,
             "yes_side_min_price": settings.yes_side_min_price,
@@ -3348,6 +3442,11 @@ def _json_kelly_replay(
             "high_price_damping_threshold": high_price_damping_threshold,
             "high_price_damping_edge": high_price_damping_edge,
             "high_price_damping_multiplier": high_price_damping_multiplier,
+            "force_hold_existing_positions": force_hold_existing_positions,
+            "invalid_hold_partial_exit_fraction": active_partial_exit_fraction,
+            "invalid_hold_partial_exit_min_fair_value": active_partial_exit_min_fair_value,
+            "invalid_hold_partial_exit_min_price": active_partial_exit_min_price,
+            "invalid_hold_partial_exit_max_price": active_partial_exit_max_price,
         },
     }
 
@@ -3369,6 +3468,31 @@ def _damped_max_position_usd(
     if price >= high_price_damping_threshold and edge < high_price_damping_edge:
         return max(0.0, max_position_usd * max(0.0, high_price_damping_multiplier))
     return max_position_usd
+
+
+def _json_partial_exit_delta(
+    delta: float,
+    row: Mapping[str, Any],
+    *,
+    invalid_hold_partial_exit_fraction: Optional[float],
+    invalid_hold_partial_exit_min_fair_value: float,
+    invalid_hold_partial_exit_min_price: float,
+    invalid_hold_partial_exit_max_price: float,
+) -> float:
+    if delta >= 0.0 or invalid_hold_partial_exit_fraction is None:
+        return delta
+    fraction = max(0.0, min(1.0, invalid_hold_partial_exit_fraction))
+    if fraction >= 1.0:
+        return delta
+    price = _optional_float(row.get("market_price"))
+    fair_value = _optional_float(row.get("fair_value"))
+    if price is None or fair_value is None:
+        return delta
+    if price < invalid_hold_partial_exit_min_price or price > invalid_hold_partial_exit_max_price:
+        return delta
+    if fair_value < invalid_hold_partial_exit_min_fair_value:
+        return delta
+    return delta * fraction
 
 
 def _json_selected_tokens(rows: list[dict[str, Any]], settings: SignalSettings) -> set[str]:
@@ -3503,7 +3627,17 @@ def _json_settle_position(
     notional = float(position["shares"]) * payout
     realized = notional - float(position["cost_basis"])
     cash += notional
-    executions.append({"action": "SETTLE", "token_id": token, "notional_usd": notional, "realized_pnl_usd": realized, "row": row})
+    executions.append(
+        {
+            "action": "SETTLE",
+            "token_id": token,
+            "shares": float(position["shares"]),
+            "price": float(payout),
+            "notional_usd": notional,
+            "realized_pnl_usd": realized,
+            "row": row,
+        }
+    )
     del positions[token]
     return cash
 
@@ -3527,7 +3661,17 @@ def _json_sell_position(
     position["last_price"] = price
     position["row"] = dict(row)
     cash += notional
-    executions.append({"action": "SELL", "token_id": token, "notional_usd": notional, "realized_pnl_usd": realized, "row": dict(row)})
+    executions.append(
+        {
+            "action": "SELL",
+            "token_id": token,
+            "shares": shares,
+            "price": price,
+            "notional_usd": notional,
+            "realized_pnl_usd": realized,
+            "row": dict(row),
+        }
+    )
     if position["shares"] <= 1e-9:
         del positions[token]
     return cash
@@ -3771,6 +3915,177 @@ def _candidate_quality_row(name: str, threshold: float, rows: list[dict[str, Any
         "weather_mismatches": weather_mismatches,
         "weather_ambiguous": weather_ambiguous,
     }
+
+
+def _selected_candidate_weather_validation(scored: list[dict[str, Any]], settings: SignalSettings) -> dict[str, Any]:
+    selected = _selected_candidate_rows(scored, settings)
+    ambiguous = [row for row in selected if row.get("weather_ambiguous")]
+    mismatches = [
+        row
+        for row in selected
+        if not row.get("weather_ambiguous")
+        and row.get("weather_outcome") in (0, 1)
+        and row.get("weather_outcome") != row.get("polymarket_payout")
+    ]
+    return {
+        "method": (
+            "Uses the same first-token-per-city-date-session selection rule as the JSON Kelly replay, "
+            "then checks whether the selected candidates are independently weather-matched."
+        ),
+        "selected_candidate_count": len(selected),
+        "weather_ambiguous_count": len(ambiguous),
+        "weather_mismatch_count": len(mismatches),
+        "quality": _candidate_quality_row("selected_candidates", 0.0, selected),
+        "by_city": _selected_candidate_weather_groups(selected, "city"),
+        "by_bucket_shape": _selected_candidate_weather_groups(selected, "bucket_shape"),
+        "by_settlement_source": _selected_candidate_weather_groups(selected, "settlement_source"),
+        "ambiguous_examples": [_selected_weather_example(row) for row in ambiguous[:10]],
+        "mismatch_examples": [_selected_weather_example(row) for row in mismatches[:10]],
+    }
+
+
+def _selected_candidate_weather_groups(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if key == "bucket_shape":
+            group = _bucket_shape(row.get("bucket_lower_f"), row.get("bucket_upper_f"))
+        else:
+            group = str(row.get(key) or "none")
+        grouped.setdefault(group, []).append(row)
+    groups = []
+    for group, items in grouped.items():
+        quality = _candidate_quality_row(key, 0.0, items)
+        groups.append(
+            {
+                "group": group,
+                "n": quality["n"],
+                "actual_rate": quality["actual_rate"],
+                "avg_market_price": quality["avg_market_price"],
+                "avg_fair_value": quality["avg_fair_value"],
+                "avg_edge": quality["avg_edge"],
+                "flat_pnl_per_1usd": quality["flat_pnl_per_1usd"],
+                "weather_mismatches": quality["weather_mismatches"],
+                "weather_ambiguous": quality["weather_ambiguous"],
+            }
+        )
+    return sorted(groups, key=lambda item: (-int(item["n"]), str(item["group"])))
+
+
+def _selected_weather_example(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "question": row.get("question"),
+        "city": row.get("city"),
+        "target_date": row.get("target_date"),
+        "generated_at": row.get("generated_at"),
+        "market_price": row.get("market_price"),
+        "fair_value": row.get("fair_value"),
+        "edge": row.get("edge"),
+        "side": row.get("side"),
+        "polymarket_payout": row.get("polymarket_payout"),
+        "weather_outcome": row.get("weather_outcome"),
+        "observed_high_f": row.get("observed_high_f"),
+        "settlement_source": row.get("settlement_source"),
+        "token_id": row.get("token_id"),
+    }
+
+
+def _json_replay_exit_management(executions: list[dict[str, Any]]) -> dict[str, Any]:
+    sells = [execution for execution in executions if execution.get("action") == "SELL"]
+    rows = []
+    unchecked_sells = 0
+    for execution in sells:
+        row = execution.get("row") or {}
+        payout = _coerce_binary_outcome(row.get("polymarket_payout"))
+        if payout is None:
+            payout = _coerce_binary_outcome(row.get("payout"))
+        try:
+            price = float(execution.get("price"))
+            shares = float(execution.get("shares"))
+        except (TypeError, ValueError):
+            unchecked_sells += 1
+            continue
+        if payout is None:
+            unchecked_sells += 1
+            continue
+        rows.append(
+            {
+                "token_id": execution.get("token_id"),
+                "question": row.get("question"),
+                "city": row.get("city"),
+                "target_date": row.get("target_date"),
+                "side": row.get("side"),
+                "shares": round(shares, 6),
+                "sell_price": round(price, 4),
+                "sell_fair_value": _optional_float(row.get("fair_value")),
+                "sell_edge": _optional_float(row.get("edge")),
+                "final_payout": payout,
+                "notional_usd": round(float(execution.get("notional_usd") or 0.0), 4),
+                "realized_pnl_usd": round(float(execution.get("realized_pnl_usd") or 0.0), 4),
+                "decision_value_vs_settlement_usd": round((price - payout) * shares, 4),
+                "bucket_shape": _bucket_shape(row.get("bucket_lower_f"), row.get("bucket_upper_f")),
+            }
+        )
+    decision_value = sum(float(row["decision_value_vs_settlement_usd"]) for row in rows)
+    event_winner_drag = sum(
+        float(row["decision_value_vs_settlement_usd"])
+        for row in rows
+        if row.get("final_payout") == 1
+    )
+    event_loser_value = sum(
+        float(row["decision_value_vs_settlement_usd"])
+        for row in rows
+        if row.get("final_payout") == 0
+    )
+    return {
+        "method": (
+            "For each replay sell, decision value is shares * (sell_price - final_payout). "
+            "Positive means selling beat holding to settlement; negative means the sell reduced final PnL."
+        ),
+        "sell_count": len(sells),
+        "checked_sell_count": len(rows),
+        "unchecked_sell_count": unchecked_sells,
+        "sell_notional_usd": round(sum(float(execution.get("notional_usd") or 0.0) for execution in sells), 4),
+        "sell_realized_pnl_usd": round(sum(float(execution.get("realized_pnl_usd") or 0.0) for execution in sells), 4),
+        "sell_decision_value_vs_settlement_usd": round(decision_value, 4),
+        "event_winner_sell_drag_usd": round(event_winner_drag, 4),
+        "event_loser_sell_value_usd": round(event_loser_value, 4),
+        "by_final_payout": _aggregate_replay_sell_rows(rows, "final_payout"),
+        "by_side": _aggregate_replay_sell_rows(rows, "side"),
+        "by_bucket_shape": _aggregate_replay_sell_rows(rows, "bucket_shape"),
+        "by_city": _aggregate_replay_sell_rows(rows, "city"),
+        "by_sell_price_bucket": _aggregate_replay_sell_rows(rows, "sell_price", width=0.10),
+        "by_sell_fair_value_bucket": _aggregate_replay_sell_rows(rows, "sell_fair_value", width=0.10),
+        "worst_sells_vs_settlement": sorted(rows, key=lambda item: float(item["decision_value_vs_settlement_usd"]))[:10],
+        "best_sells_vs_settlement": sorted(rows, key=lambda item: float(item["decision_value_vs_settlement_usd"]), reverse=True)[:10],
+    }
+
+
+def _aggregate_replay_sell_rows(rows: list[dict[str, Any]], key: str, *, width: Optional[float] = None) -> list[dict[str, Any]]:
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        group = row.get(key)
+        if width is not None:
+            group = _bucket_float(group, width)
+        grouped.setdefault(group, []).append(row)
+    aggregates = []
+    for group, items in grouped.items():
+        decision_value = sum(float(item.get("decision_value_vs_settlement_usd") or 0.0) for item in items)
+        sell_notional = sum(float(item.get("notional_usd") or 0.0) for item in items)
+        realized_pnl = sum(float(item.get("realized_pnl_usd") or 0.0) for item in items)
+        prices = [float(item["sell_price"]) for item in items if item.get("sell_price") is not None]
+        fair_values = [float(item["sell_fair_value"]) for item in items if item.get("sell_fair_value") is not None]
+        aggregates.append(
+            {
+                "group": group,
+                "sell_count": len(items),
+                "sell_notional_usd": round(sell_notional, 4),
+                "sell_realized_pnl_usd": round(realized_pnl, 4),
+                "decision_value_vs_settlement_usd": round(decision_value, 4),
+                "avg_sell_price": round(sum(prices) / len(prices), 4) if prices else None,
+                "avg_sell_fair_value": round(sum(fair_values) / len(fair_values), 4) if fair_values else None,
+            }
+        )
+    return sorted(aggregates, key=lambda item: (-abs(float(item["decision_value_vs_settlement_usd"])), str(item["group"])))
 
 
 def _json_required_buffered_edge(market_price: float, settings: SignalSettings) -> float:
@@ -4112,6 +4427,10 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "hold_no_side_high_conviction_min_fair_value": settings.hold_no_side_high_conviction_min_fair_value,
         "hold_no_side_high_conviction_min_edge": settings.hold_no_side_high_conviction_min_edge,
         "hold_no_side_high_conviction_counter_event_probability": settings.hold_no_side_high_conviction_counter_event_probability,
+        "invalid_hold_partial_exit_fraction": settings.invalid_hold_partial_exit_fraction,
+        "invalid_hold_partial_exit_min_fair_value": settings.invalid_hold_partial_exit_min_fair_value,
+        "invalid_hold_partial_exit_min_price": settings.invalid_hold_partial_exit_min_price,
+        "invalid_hold_partial_exit_max_price": settings.invalid_hold_partial_exit_max_price,
         "min_model_count": settings.min_model_count,
         "min_model_agreement": settings.min_model_agreement,
         "hold_min_model_agreement": settings.hold_min_model_agreement,

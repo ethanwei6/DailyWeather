@@ -1292,6 +1292,82 @@ class TradingLayersTest(unittest.TestCase):
             self.assertEqual(ledger.rebalance_kelly(dust_scored, bankroll_usd=1000, kelly_fraction=0.25, max_position_usd=50, min_trade_usd=1, min_edge=0.05), 1)
             self.assertEqual(ledger.positions(), [])
 
+    def test_kelly_rebalance_can_partially_exit_high_fair_value_invalid_hold(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 80°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.50", "0.50"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.70,
+            invalid_hold_partial_exit_fraction=0.50,
+            invalid_hold_partial_exit_min_fair_value=0.90,
+            invalid_hold_partial_exit_min_price=0.50,
+            invalid_hold_partial_exit_max_price=0.80,
+            enforce_entry_timing_filter=False,
+        )
+        entry_scored = score_outcomes(
+            market,
+            {
+                market.buckets[0].label: ConsensusValue(
+                    market.buckets[0].label,
+                    0.95,
+                    {"source_a.model": 0.95, "source_b.model": 0.96, "source_c.model": 0.94},
+                    3,
+                    0.01,
+                )
+            },
+            settings=settings,
+        )
+
+        repriced_market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 80°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.70", "0.30"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert repriced_market is not None
+        invalid_hold_scored = score_outcomes(
+            repriced_market,
+            {
+                repriced_market.buckets[0].label: ConsensusValue(
+                    repriced_market.buckets[0].label,
+                    0.95,
+                    {"source_a.model": 0.40, "source_b.model": 0.42, "source_c.model": 0.41},
+                    3,
+                    0.01,
+                )
+            },
+            settings=settings,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            self.assertEqual(ledger.rebalance_kelly(entry_scored, bankroll_usd=100, kelly_fraction=1.0, max_position_usd=10, settings=settings), 1)
+            initial_position = ledger.positions()[0]
+            self.assertEqual(ledger.rebalance_kelly(invalid_hold_scored, bankroll_usd=100, kelly_fraction=1.0, max_position_usd=10, settings=settings), 1)
+            reduced_position = ledger.positions()[0]
+
+        self.assertAlmostEqual(reduced_position["shares"], initial_position["shares"] * 0.5)
+
     def test_forecast_scores_record_calibration_rows(self) -> None:
         market = parse_weather_market(
             {

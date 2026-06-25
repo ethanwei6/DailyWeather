@@ -97,6 +97,10 @@ class CliTest(unittest.TestCase):
             hold_no_side_high_conviction_min_fair_value=None,
             hold_no_side_high_conviction_min_edge=None,
             hold_no_side_high_conviction_counter_event_probability=None,
+            invalid_hold_partial_exit_fraction=None,
+            invalid_hold_partial_exit_min_fair_value=0.90,
+            invalid_hold_partial_exit_min_price=0.50,
+            invalid_hold_partial_exit_max_price=0.80,
             bounded_bucket_min_edge=0.10,
         )
 
@@ -109,6 +113,10 @@ class CliTest(unittest.TestCase):
         self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
         self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
         self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.invalid_hold_partial_exit_fraction, 0.50)
+        self.assertEqual(args.invalid_hold_partial_exit_min_fair_value, 0.90)
+        self.assertEqual(args.invalid_hold_partial_exit_min_price, 0.50)
+        self.assertEqual(args.invalid_hold_partial_exit_max_price, 0.65)
         self.assertEqual(args.bounded_bucket_min_edge, 0.15)
 
     def test_strategy_profile_can_use_strict_no_tail_trim_highconv_settings(self) -> None:
