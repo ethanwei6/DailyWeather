@@ -17,7 +17,7 @@ The recommended live run is bounded so API issues cannot hang the workflow indef
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15 \
+  --strategy-profile live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15 \
   --limit 250 \
   --discovery-request-limit 50 \
   --discovery-pages 1 \
@@ -29,7 +29,7 @@ python3 -m weather_strategy.cli paper-run \
   --run-log-dir work/logs/live_forward_paper
 ```
 
-The named profile applies the Telonex-tested `$100` paper settings: explicit NO-token entries, `75%` fractional Kelly, current-equity compounding, a `25%` current-equity max-position cap, `70%` minimum fair value, `100%` model-source agreement for new entries, a strict `10%` NO counter-event cap outside noon UTC, a relaxed `20%` cap only at the `12:00 UTC` global window, and Kelly-target trimming for valid holds. Use `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20` to preserve valid holds instead.
+The named profile applies the Telonex-tested `$100` paper settings: explicit NO-token entries, `75%` fractional Kelly, current-equity compounding, a `25%` current-equity max-position cap, `70%` minimum fair value, `100%` model-source agreement for new entries, a strict `10%` NO counter-event cap at every entry hour, Kelly-target trimming for valid holds, a hold-only high-conviction exception for existing NO positions, and a `15c` minimum edge for bounded exact/range buckets. Use `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15` only as the higher-risk relaxed-tail comparison profile.
 
 ## Reporting
 
@@ -128,7 +128,7 @@ Use the long replay when changing trading gates or sizing:
 
 ```bash
 python3 -m weather_strategy.cli long-backtest \
-  --strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15 \
+  --strategy-profile live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15 \
   --bankroll-usd 100 \
   --pages 20 \
   --limit-per-page 50 \
@@ -144,7 +144,7 @@ python3 -m weather_strategy.cli long-backtest \
   --summary-only
 ```
 
-Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, source/model-family calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, exit-management decision value, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15`: it keeps the strict `10%` NO-entry counter-event cap at most run hours, relaxes new NO entries to `20%` only at `12:00 UTC`, trims valid holds to the updated Kelly target, only widens existing NO-hold counter-event tolerance to `20%` when FV is at least `98%` and buffered edge is at least `35c`, and requires at least `15c` edge for bounded exact/range buckets. This improved the cached real-data replay while reducing one weak bounded bucket trade versus `live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-holds`, so treat it as the current live-forward paper candidate rather than proof of live profitability. Source-level diagnostics currently favor `single_run_ecmwf_ifs025`, but direct ECMWF overweighting and `hourly_curve_max` downweighting reduced end-to-end replay PnL, so do not promote model-weight changes from source Brier alone. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
+Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, source/model-family calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, exit-management decision value, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15`: it keeps the strict `10%` NO-entry counter-event cap at every entry hour, trims valid holds to the updated Kelly target, only widens existing NO-hold counter-event tolerance to `20%` when FV is at least `98%` and buffered edge is at least `35c`, and requires at least `15c` edge for bounded exact/range buckets. On the saved real Telonex/Open-Meteo replay, removing the UTC-12 relaxed `20%` NO-tail exception improved PnL, event hit rate, drawdown, and concentration across the full sample and every chronological slice. Source-level diagnostics currently favor `single_run_ecmwf_ifs025`, but direct ECMWF overweighting and `hourly_curve_max` downweighting reduced end-to-end replay PnL, so do not promote model-weight changes from source Brier alone. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
 
 ## Failure Handling
 
