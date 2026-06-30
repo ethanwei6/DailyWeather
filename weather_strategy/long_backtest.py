@@ -3,20 +3,23 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import queue
 import re
+import statistics
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from weather_strategy.backtest import load_calibration_weights
+from weather_strategy.backtest import load_calibration_weights, load_probability_calibration
 from weather_strategy.cities import city_with_station_coordinates
-from weather_strategy.forecast import ConsensusForecastEngine
+from weather_strategy.forecast import ConsensusForecastEngine, _calibrated_probabilities, _source_probability_views
 from weather_strategy.http import HttpClient
 from weather_strategy.models import CityConfig, ConsensusValue, ForecastDistribution, ScoredOutcome, TemperatureBucket, WeatherMarket
 from weather_strategy.observations import ObservedHigh, ObservedHighClient, observed_outcome_for_bucket
@@ -35,6 +38,9 @@ from weather_strategy.signals import (
 )
 from weather_strategy.telonex import TelonexClient, TelonexConfigurationError, _load_parquet_records
 from weather_strategy.weather import extract_daily_temperature_samples, extract_weather_features
+
+
+LIVE_FORWARD_ENTRY_HOURS_UTC = (0, 6, 12, 18)
 
 
 @dataclass(frozen=True)
@@ -264,7 +270,10 @@ def run_long_historical_backtest(
     limit_per_page: int = 50,
     max_markets: int = 8000,
     query: str = "highest temperature",
-    entry_hours_utc: tuple[int, ...] = (0, 12),
+    min_end_date: Optional[date] = None,
+    max_end_date: Optional[date] = None,
+    market_selection: str = "end_date_asc",
+    entry_hours_utc: tuple[int, ...] = LIVE_FORWARD_ENTRY_HOURS_UTC,
     min_lead_days: int = 1,
     max_lead_days: int = 2,
     max_runtime_seconds: float = 0.0,
@@ -273,6 +282,10 @@ def run_long_historical_backtest(
     forecast_availability_lag_hours: int = 6,
     kelly_fraction: float = 0.25,
     compound_kelly_sizing: bool = False,
+    max_new_exposure_usd_per_run: Optional[float] = None,
+    max_new_exposure_fraction_per_run: Optional[float] = None,
+    new_exposure_target_positions_per_run: Optional[float] = None,
+    kelly_sizing_bankroll_fraction_per_run: Optional[float] = None,
     max_position_usd: float = 50.0,
     max_position_fraction: Optional[float] = None,
     kelly_market_blend: float = 0.0,
@@ -288,10 +301,12 @@ def run_long_historical_backtest(
     http_hard_timeout_seconds: int = 30,
     price_source: str = "telonex",
     market_source: str = "telonex",
+    settlement_audit: str = "weather_crosscheck",
     strategy_profile: str = "manual",
 ) -> dict[str, Any]:
     started = time.monotonic()
     deadline = None if max_runtime_seconds <= 0 else started + max_runtime_seconds
+    preparation_deadline = None if max_runtime_seconds <= 0 else started + (max_runtime_seconds * 0.65)
     settings = settings or SignalSettings(enforce_entry_timing_filter=True)
     http = CachedHttpClient(cache_dir, hard_timeout_seconds=http_hard_timeout_seconds)
     gamma = PolymarketGammaClient(http=http)
@@ -301,13 +316,21 @@ def run_long_historical_backtest(
     forecast_client = SingleRunForecastClient(http)
     observation_client = ObservedHighClient(http=http)
     source_weights, model_weights = load_calibration_weights(weights_file)
-    forecast_engine = ConsensusForecastEngine(source_weights=source_weights, model_weights=model_weights)
+    probability_calibration = load_probability_calibration(weights_file)
+    forecast_engine = ConsensusForecastEngine(
+        source_weights=source_weights,
+        model_weights=model_weights,
+        probability_calibration=probability_calibration,
+    )
 
     raw_markets = (
         _discover_telonex_raw_temperature_markets(
             telonex,
             query=query,
             max_candidates=max(max_markets * 3, pages * limit_per_page, 500),
+            min_end_date=min_end_date,
+            max_end_date=max_end_date,
+            market_selection=market_selection,
         )
         if market_source_name == "telonex"
         else _discover_raw_temperature_markets(gamma, query=query, pages=pages, limit_per_page=limit_per_page)
@@ -334,7 +357,7 @@ def run_long_historical_backtest(
     skipped: list[dict[str, str]] = []
 
     for market_index, (market, raw) in enumerate(parsed, start=1):
-        if _deadline_exceeded(deadline):
+        if _deadline_exceeded(preparation_deadline):
             break
         bucket = _single_bucket(market)
         if bucket is None or not bucket.token_id or market.city is None or market.target_date is None:
@@ -343,7 +366,14 @@ def run_long_historical_backtest(
         resolution_city = _market_resolution_city(market.city, raw)
         if resolution_city != market.city:
             market = replace(market, city=resolution_city)
-        resolution = _resolve_market_outcome(market, raw, bucket, observation_client, observation_cache)
+        resolution = _resolve_market_outcome(
+            market,
+            raw,
+            bucket,
+            observation_client,
+            observation_cache,
+            fetch_weather_crosscheck=settlement_audit == "weather_crosscheck",
+        )
         if resolution["payout"] is None:
             resolution_error_count += 1
             skipped.append({"question": market.question, "reason": "no final Polymarket/weather outcome"})
@@ -368,31 +398,24 @@ def run_long_historical_backtest(
             replay_times,
             max_staleness_minutes=max_price_staleness_minutes,
         )
-        try:
-            history = _cached_price_history(
-                price_history_cache,
-                clob,
-                bucket.token_id,
-                start_ts=price_start_ts,
-                end_ts=price_end_ts,
-                price_source=price_source_name,
-                telonex=telonex,
-                market_slug=raw.get("slug") or market.slug,
-                outcome="Yes",
-            )
-        except (RuntimeError, ValueError) as error:
-            price_error_count += 1
-            skipped.append({"question": market.question, "reason": f"price_history: {str(error)[:240]}"})
-            continue
-        if not history:
-            skipped.append({"question": market.question, "reason": "empty price history"})
-            continue
-        nonempty_price_history_count += 1
         no_token_id = _binary_no_token(raw) if settings.allow_no_side_entries else None
         no_history: list[PriceHistoryPoint] = []
         if no_token_id:
-            try:
-                no_history = _cached_price_history(
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                yes_future = executor.submit(
+                    _cached_price_history,
+                    price_history_cache,
+                    clob,
+                    bucket.token_id,
+                    start_ts=price_start_ts,
+                    end_ts=price_end_ts,
+                    price_source=price_source_name,
+                    telonex=telonex,
+                    market_slug=raw.get("slug") or market.slug,
+                    outcome="Yes",
+                )
+                no_future = executor.submit(
+                    _cached_price_history,
                     price_history_cache,
                     clob,
                     no_token_id,
@@ -403,12 +426,41 @@ def run_long_historical_backtest(
                     market_slug=raw.get("slug") or market.slug,
                     outcome="No",
                 )
-                if no_history:
-                    no_side_price_history_count += 1
+                try:
+                    history = yes_future.result()
+                except (RuntimeError, ValueError) as error:
+                    price_error_count += 1
+                    skipped.append({"question": market.question, "reason": f"price_history: {str(error)[:240]}"})
+                    continue
+                try:
+                    no_history = no_future.result()
+                    if no_history:
+                        no_side_price_history_count += 1
+                except (RuntimeError, ValueError) as error:
+                    no_side_price_error_count += 1
+                    if len(skipped) < 50:
+                        skipped.append({"question": market.question, "reason": f"no_side_price_history: {str(error)[:240]}"})
+        else:
+            try:
+                history = _cached_price_history(
+                    price_history_cache,
+                    clob,
+                    bucket.token_id,
+                    start_ts=price_start_ts,
+                    end_ts=price_end_ts,
+                    price_source=price_source_name,
+                    telonex=telonex,
+                    market_slug=raw.get("slug") or market.slug,
+                    outcome="Yes",
+                )
             except (RuntimeError, ValueError) as error:
-                no_side_price_error_count += 1
-                if len(skipped) < 50:
-                    skipped.append({"question": market.question, "reason": f"no_side_price_history: {str(error)[:240]}"})
+                price_error_count += 1
+                skipped.append({"question": market.question, "reason": f"price_history: {str(error)[:240]}"})
+                continue
+        if not history:
+            skipped.append({"question": market.question, "reason": "empty price history"})
+            continue
+        nonempty_price_history_count += 1
         added_entry_session = False
         for decision_time, maintenance_only in replay_times:
             if maintenance_only and not added_entry_session:
@@ -497,8 +549,13 @@ def run_long_historical_backtest(
     outcomes_scored = 0
     signal_count = 0
     session_count = 0
+    equity_curve: list[dict[str, Any]] = []
 
-    for session_time in sorted(session_markets):
+    sorted_session_times = sorted(session_markets)
+    if sorted_session_times:
+        equity_curve.append(_historical_equity_snapshot(sorted_session_times[0], cash, positions))
+
+    for session_time in sorted_session_times:
         if _deadline_exceeded(deadline):
             break
         session_count += 1
@@ -506,7 +563,34 @@ def run_long_historical_backtest(
         cash = cash_ref["cash"]
         scored: list[ScoredOutcome] = []
         score_metadata: dict[str, dict[str, Any]] = {}
-        forecast_cache: dict[tuple[str, str], tuple[tuple[ForecastDistribution, ...], datetime]] = {}
+        forecast_cache, forecast_errors = _fetch_session_forecasts(
+            forecast_client,
+            session_markets[session_time],
+            session_time,
+            availability_lag_hours=forecast_availability_lag_hours,
+            max_workers=_historical_forecast_workers(),
+        )
+        for forecast_key, error_record in forecast_errors.items():
+            errors = tuple(error_record.get("errors", ()))
+            if not errors:
+                continue
+            city_name, target_date_text = forecast_key
+            forecast_error_count += len(errors)
+            for error in errors:
+                forecast_error_count_by_city[city_name] = forecast_error_count_by_city.get(city_name, 0) + 1
+                source_name = str(error).split(":", 1)[0]
+                forecast_error_count_by_source[source_name] = forecast_error_count_by_source.get(source_name, 0) + 1
+            for error in errors[:3]:
+                if len(forecast_error_examples) < 50:
+                    forecast_error_examples.append(
+                        {
+                            "session_time": session_time.isoformat(),
+                            "city": city_name,
+                            "target_date": target_date_text,
+                            "question": str(error_record.get("example_question") or ""),
+                            "error": error,
+                        }
+                    )
         for market, raw, entry, settlement in session_markets[session_time]:
             if _deadline_exceeded(deadline):
                 break
@@ -514,32 +598,8 @@ def run_long_historical_backtest(
                 continue
             forecast_key = (market.city.display_name, market.target_date.isoformat())
             if forecast_key not in forecast_cache:
-                distributions, run_time, errors = forecast_client.fetch_sources(
-                    market.city,
-                    market.target_date,
-                    session_time,
-                    availability_lag_hours=forecast_availability_lag_hours,
-                )
-                forecast_error_count += len(errors)
-                for error in errors:
-                    forecast_error_count_by_city[market.city.display_name] = forecast_error_count_by_city.get(market.city.display_name, 0) + 1
-                    source_name = str(error).split(":", 1)[0]
-                    forecast_error_count_by_source[source_name] = forecast_error_count_by_source.get(source_name, 0) + 1
-                for error in errors[:3]:
-                    if len(forecast_error_examples) < 50:
-                        forecast_error_examples.append(
-                            {
-                                "session_time": session_time.isoformat(),
-                                "city": market.city.display_name,
-                                "target_date": market.target_date.isoformat(),
-                                "question": market.question,
-                                "error": error,
-                            }
-                        )
-                if not distributions:
-                    skipped.append({"question": market.question, "reason": "no historical forecast distributions"})
-                    continue
-                forecast_cache[forecast_key] = (distributions, run_time)
+                skipped.append({"question": market.question, "reason": "no historical forecast distributions"})
+                continue
             distributions, run_time = forecast_cache[forecast_key]
             consensus = forecast_engine.consensus_by_bucket(distributions, market.buckets)
             observed = _historical_observed_high_for_session(
@@ -592,6 +652,10 @@ def run_long_historical_backtest(
             bankroll_usd=bankroll_usd,
             kelly_fraction=kelly_fraction,
             compound_kelly_sizing=compound_kelly_sizing,
+            max_new_exposure_usd_per_run=max_new_exposure_usd_per_run,
+            max_new_exposure_fraction_per_run=max_new_exposure_fraction_per_run,
+            new_exposure_target_positions_per_run=new_exposure_target_positions_per_run,
+            kelly_sizing_bankroll_fraction_per_run=kelly_sizing_bankroll_fraction_per_run,
             max_position_usd=max_position_usd,
             max_position_fraction=max_position_fraction,
             kelly_market_blend=kelly_market_blend,
@@ -602,6 +666,7 @@ def run_long_historical_backtest(
         )
         cash = cash_ref["cash"]
         scored_detail.extend(_scored_to_json(outcome, score_metadata.get(outcome.token_id or outcome.bucket_label, {}), settings) for outcome in scored)
+        equity_curve.append(_historical_equity_snapshot(session_time, cash, positions))
         _progress(
             progress_every,
             (
@@ -614,9 +679,11 @@ def run_long_historical_backtest(
     runtime_limited = _deadline_exceeded(deadline)
     cash, open_value = _finalize_positions_for_result(positions, executions, cash, runtime_limited=runtime_limited)
     equity = cash + open_value
+    equity_curve.append(_historical_final_equity_snapshot(cash, open_value, positions))
     crosscheck_summary = _crosscheck_pnl_summary(executions)
     run_log_path = _make_run_log_path(run_log_dir, "long-backtest")
     trade_diagnostics = _trade_performance_diagnostics(executions)
+    performance_diagnostics = _performance_diagnostics_from_equity_curve(equity_curve, bankroll_usd)
     score_calibration_diagnostics = _score_calibration_diagnostics(scored_detail)
     signal_filter_diagnostics = _signal_filter_diagnostics(scored_detail)
     signal_opportunity_diagnostics = _signal_opportunity_diagnostics(scored_detail, settings)
@@ -659,6 +726,7 @@ def run_long_historical_backtest(
         robustness_diagnostics,
     )
     result = {
+        "strategy_profile": strategy_profile,
         "bankroll_usd": bankroll_usd,
         "ending_equity_usd": round(equity, 2),
         "pnl_usd": round(equity - bankroll_usd, 2),
@@ -680,6 +748,8 @@ def run_long_historical_backtest(
         "settlements": sum(1 for item in executions if item["action"] == "SETTLE"),
         "realized_pnl_usd": round(sum(float(item.get("realized_pnl_usd") or 0.0) for item in executions), 2),
         **crosscheck_summary,
+        "performance_diagnostics": performance_diagnostics,
+        "equity_curve": equity_curve,
         "trade_diagnostics": trade_diagnostics,
         "score_calibration_diagnostics": score_calibration_diagnostics,
         "signal_filter_diagnostics": signal_filter_diagnostics,
@@ -692,6 +762,7 @@ def run_long_historical_backtest(
             executions,
             data_quality_diagnostics=data_quality_diagnostics,
             settlement_quality_diagnostics=settlement_quality_diagnostics,
+            require_weather_crosscheck=settlement_audit == "weather_crosscheck",
         ),
         "forecast_error_count": forecast_error_count,
         "forecast_error_count_by_city": dict(sorted(forecast_error_count_by_city.items(), key=lambda item: (-item[1], item[0]))),
@@ -711,11 +782,16 @@ def run_long_historical_backtest(
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "settings": {
             "query": query,
+            "min_end_date": min_end_date.isoformat() if min_end_date else None,
+            "max_end_date": max_end_date.isoformat() if max_end_date else None,
+            "market_selection": market_selection,
             "pages": pages,
             "limit_per_page": limit_per_page,
             "max_markets": max_markets,
             "max_runtime_seconds": max_runtime_seconds,
             "entry_hours_utc": list(entry_hours_utc),
+            "live_forward_entry_hours_utc": list(LIVE_FORWARD_ENTRY_HOURS_UTC),
+            "entry_hours_match_live_forward": tuple(entry_hours_utc) == LIVE_FORWARD_ENTRY_HOURS_UTC,
             "min_lead_days": min_lead_days,
             "max_lead_days": max_lead_days,
             "max_price_staleness_minutes": max_price_staleness_minutes,
@@ -723,6 +799,10 @@ def run_long_historical_backtest(
             "forecast_availability_lag_hours": forecast_availability_lag_hours,
             "kelly_fraction": kelly_fraction,
             "compound_kelly_sizing": compound_kelly_sizing,
+            "max_new_exposure_usd_per_run": max_new_exposure_usd_per_run,
+            "max_new_exposure_fraction_per_run": max_new_exposure_fraction_per_run,
+            "new_exposure_target_positions_per_run": new_exposure_target_positions_per_run,
+            "kelly_sizing_bankroll_fraction_per_run": kelly_sizing_bankroll_fraction_per_run,
             "max_position_usd": max_position_usd,
             "max_position_fraction": max_position_fraction,
             "kelly_market_blend": kelly_market_blend,
@@ -735,9 +815,19 @@ def run_long_historical_backtest(
             "http_hard_timeout_seconds": http_hard_timeout_seconds,
             "price_source": price_source_name,
             "market_source": market_source_name,
+            "settlement_audit": settlement_audit,
             "strategy_profile": strategy_profile,
             "source_weights_loaded": len(source_weights),
             "model_weights_loaded": len(model_weights),
+            "probability_calibration": {
+                "active": probability_calibration.active,
+                "center_shrink_alpha": probability_calibration.center_shrink_alpha,
+                "high_cap": probability_calibration.high_cap,
+                "low_floor": probability_calibration.low_floor,
+                "single_bucket_only": probability_calibration.single_bucket_only,
+                "tail_threshold": probability_calibration.tail_threshold,
+                "tail_shrink_alpha": probability_calibration.tail_shrink_alpha,
+            },
             "signal_settings": _signal_settings_to_json(settings),
         },
         "data_provenance": {
@@ -745,7 +835,11 @@ def run_long_historical_backtest(
             "polymarket_price_source": _price_source_description(price_source_name, "YES"),
             "polymarket_no_price_source": _price_source_description(price_source_name, "NO"),
             "forecast_source": "Open-Meteo Single Runs API",
-            "settlement_preference": "Polymarket resolved YES payout, station METAR/ASOS weather cross-check when the market names a station",
+            "settlement_preference": (
+                "Polymarket resolved YES payout, station METAR/ASOS weather cross-check when the market names a station"
+                if settlement_audit == "weather_crosscheck"
+                else "Polymarket resolved YES payout; station weather cross-check skipped for broad replay speed"
+            ),
             "cache_dir": str(cache_dir),
             "cache_hits": http.hits,
             "cache_misses": http.misses,
@@ -770,6 +864,331 @@ def run_long_historical_backtest(
     return result
 
 
+def load_scored_outcome_snapshot(snapshot_path: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Load scored rows from a long-backtest JSON artifact without refetching data."""
+    path = Path(snapshot_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        source: dict[str, Any] = {"source_path": str(path)}
+        raw_rows = payload
+    elif isinstance(payload, Mapping):
+        source = dict(payload)
+        source.setdefault("source_path", str(path))
+        raw_rows = source.get("scored_outcomes_detail") or source.get("scored_outcomes") or []
+    else:
+        raise ValueError(f"Unsupported scored-outcome snapshot payload: {type(payload).__name__}")
+    if not isinstance(raw_rows, list):
+        raise ValueError("Scored-outcome snapshot must contain a list of scored rows")
+
+    rows: list[dict[str, Any]] = []
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        if "fair_value" not in row and "fair_value_probability" in row:
+            row["fair_value"] = row["fair_value_probability"]
+        if "market_price" not in row and "market_probability" in row:
+            row["market_price"] = row["market_probability"]
+        if "edge" not in row and "edge_after_buffer" in row:
+            row["edge"] = row["edge_after_buffer"]
+        rows.append(row)
+    if not rows:
+        raise ValueError(f"No scored_outcomes_detail rows found in {path}")
+    return source, rows
+
+
+def run_cached_scored_outcome_replay(
+    *,
+    snapshot_path: str | Path,
+    settings: SignalSettings,
+    strategy_profile: str = "manual",
+    bankroll_usd: float = 100.0,
+    kelly_fraction: float = 0.25,
+    compound_kelly_sizing: bool = False,
+    max_new_exposure_usd_per_run: Optional[float] = None,
+    max_new_exposure_fraction_per_run: Optional[float] = None,
+    new_exposure_target_positions_per_run: Optional[float] = None,
+    kelly_sizing_bankroll_fraction_per_run: Optional[float] = None,
+    max_position_usd: float = 50.0,
+    max_position_fraction: Optional[float] = None,
+    kelly_market_blend: float = 0.0,
+    edge_position_full_cap_edge: float = 0.0,
+    edge_position_min_multiplier: float = 0.35,
+    min_trade_usd: float = 1.0,
+    run_log_dir: str | Path = "work/logs/scored_replays",
+    recompute_from_raw_model_probabilities: bool = False,
+    weights_file: str | Path | None = None,
+) -> dict[str, Any]:
+    """Replay a strategy from saved long-backtest scored rows only.
+
+    This intentionally performs no market, forecast, price-history, or observation
+    fetches. It is meant for fast strategy sweeps over one expensive real-data
+    scoring artifact.
+    """
+    started = time.monotonic()
+    source, scored = load_scored_outcome_snapshot(snapshot_path)
+    raw_recalibration = {
+        "enabled": False,
+        "weights_file": str(weights_file) if weights_file else None,
+        "rows_with_raw_model_probabilities": sum(
+            1
+            for row in scored
+            if isinstance(row.get("raw_model_probabilities"), Mapping) and row.get("raw_model_probabilities")
+        ),
+        "rows_recomputed": 0,
+    }
+    if recompute_from_raw_model_probabilities:
+        if weights_file is None:
+            raise ValueError("weights_file is required when recompute_from_raw_model_probabilities=True")
+        scored, raw_recalibration = _recompute_scored_from_raw_model_probabilities(scored, weights_file)
+    replay = _json_kelly_replay(
+        strategy_profile,
+        scored,
+        settings,
+        bankroll_usd=bankroll_usd,
+        kelly_fraction=kelly_fraction,
+        compound_kelly_sizing=compound_kelly_sizing,
+        max_new_exposure_usd_per_run=max_new_exposure_usd_per_run,
+        max_new_exposure_fraction_per_run=max_new_exposure_fraction_per_run,
+        new_exposure_target_positions_per_run=new_exposure_target_positions_per_run,
+        kelly_sizing_bankroll_fraction_per_run=kelly_sizing_bankroll_fraction_per_run,
+        max_position_usd=max_position_usd,
+        max_position_fraction=max_position_fraction,
+        kelly_market_blend=kelly_market_blend,
+        edge_position_full_cap_edge=edge_position_full_cap_edge,
+        edge_position_min_multiplier=edge_position_min_multiplier,
+        min_trade_usd=min_trade_usd,
+        include_executions=True,
+    )
+    run_log_path = _make_run_log_path(run_log_dir, "scored-replay")
+    source_settings = source.get("settings") if isinstance(source.get("settings"), Mapping) else {}
+    source_signal_settings = (
+        source_settings.get("signal_settings")
+        if isinstance(source_settings, Mapping) and isinstance(source_settings.get("signal_settings"), Mapping)
+        else {}
+    )
+    source_real_data_audit = source.get("real_data_audit") if isinstance(source.get("real_data_audit"), Mapping) else None
+    selected_candidate_weather_validation = _selected_candidate_weather_validation(scored, settings)
+    replay_real_data_audit = {
+        "method": (
+            "Replay inherits the source artifact's real-data audit and rechecks traded-token "
+            "weather mismatch/ambiguity counts from cached scored rows. No live data was refetched."
+        ),
+        "source_real_data_audit_passed": source_real_data_audit.get("passed") if source_real_data_audit else None,
+        "replay_weather_mismatch_trades": replay.get("weather_mismatch_trades"),
+        "replay_weather_ambiguous_trades": replay.get("weather_ambiguous_trades"),
+        "passed": (
+            (source_real_data_audit.get("passed") is not False if source_real_data_audit else True)
+            and int(replay.get("weather_mismatch_trades") or 0) == 0
+        ),
+        "source_real_data_audit": source_real_data_audit,
+    }
+    executions_detail = replay.get("executions_detail") or []
+    result = {
+        **replay,
+        "strategy_profile": strategy_profile,
+        "bankroll_usd": bankroll_usd,
+        "cash_usd": replay.get("ending_equity_usd"),
+        "open_positions": 0,
+        "source_snapshot_path": str(snapshot_path),
+        "source_run_log_path": source.get("run_log_path") or str(snapshot_path),
+        "source_strategy_profile": source.get("strategy_profile"),
+        "source_scored_outcomes_detail_count": len(scored),
+        "raw_recalibration": raw_recalibration,
+        "source_runtime_limited": source.get("runtime_limited"),
+        "source_session_count": source.get("session_count"),
+        "source_markets_scored": source.get("markets_scored"),
+        "source_outcomes_scored": source.get("outcomes_scored"),
+        "source_settings": {
+            "entry_hours_utc": source_settings.get("entry_hours_utc") if isinstance(source_settings, Mapping) else None,
+            "entry_hours_match_live_forward": (
+                source_settings.get("entry_hours_match_live_forward")
+                if isinstance(source_settings, Mapping)
+                else None
+            ),
+            "min_lead_days": source_settings.get("min_lead_days") if isinstance(source_settings, Mapping) else None,
+            "max_lead_days": source_settings.get("max_lead_days") if isinstance(source_settings, Mapping) else None,
+            "price_source": source_settings.get("price_source") if isinstance(source_settings, Mapping) else None,
+            "market_source": source_settings.get("market_source") if isinstance(source_settings, Mapping) else None,
+            "signal_settings": dict(source_signal_settings),
+        },
+        "score_calibration_diagnostics": _score_calibration_diagnostics(scored),
+        "signal_filter_diagnostics": _signal_filter_diagnostics(scored),
+        "signal_opportunity_diagnostics": _signal_opportunity_diagnostics(scored, settings),
+        "selected_candidate_weather_validation": selected_candidate_weather_validation,
+        "real_data_audit": replay_real_data_audit,
+        "top_scored_outcomes": sorted(scored, key=lambda item: float(item.get("edge") or 0.0), reverse=True)[:20],
+        "run_log_path": str(run_log_path),
+        "elapsed_seconds": round(time.monotonic() - started, 4),
+        "cache_replay": {
+            "uses_cached_scored_outcomes_only": True,
+            "refetched_forecasts": False,
+            "refetched_prices": False,
+            "refetched_observations": False,
+            "source_rows": len(scored),
+        },
+    }
+    result["executions_detail"] = executions_detail
+    result["top_trades"] = sorted(
+        [_json_replay_execution_for_trade_diagnostics(execution) for execution in executions_detail],
+        key=lambda item: abs(float(item.get("realized_pnl_usd") or 0.0)),
+        reverse=True,
+    )[:20]
+    try:
+        _write_json_log(run_log_path, result)
+    except OSError as exc:
+        result["run_log_write_error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def _recompute_scored_from_raw_model_probabilities(
+    scored: list[dict[str, Any]],
+    weights_file: str | Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    source_weights, model_weights = load_calibration_weights(weights_file)
+    probability_calibration = load_probability_calibration(weights_file)
+    recomputed: list[dict[str, Any]] = []
+    rows_with_raw = 0
+    rows_recomputed = 0
+    for row in scored:
+        raw_probabilities = row.get("raw_model_probabilities") or {}
+        if not isinstance(raw_probabilities, Mapping) or not raw_probabilities:
+            recomputed.append(dict(row))
+            continue
+        rows_with_raw += 1
+        calibrated_probabilities = _calibrated_probabilities(
+            raw_probabilities,
+            probability_calibration,
+            bucket_count=1,
+        )
+        source_probabilities = _source_probability_views(calibrated_probabilities, model_weights)
+        if not source_probabilities:
+            recomputed.append(dict(row))
+            continue
+        values = list(source_probabilities.values())
+        fair_value = _weighted_source_probability(source_probabilities, source_weights)
+        raw_source_probabilities = _source_probability_views(raw_probabilities, model_weights)
+        raw_values = list(raw_source_probabilities.values())
+        raw_fair_value = _weighted_source_probability(raw_source_probabilities, source_weights) if raw_source_probabilities else None
+        market_price = float(row.get("market_price") or row.get("market_probability") or 0.0)
+        old_fair_value = _optional_float(row.get("fair_value")) or _optional_float(row.get("fair_value_probability")) or fair_value
+        old_edge = _optional_float(row.get("edge")) or _optional_float(row.get("edge_after_buffer")) or (old_fair_value - market_price)
+        preserved_buffer = max(0.0, old_fair_value - market_price - old_edge)
+        edge = fair_value - market_price - preserved_buffer
+        model_agreement = _source_agreement_above(source_probabilities, market_price + preserved_buffer)
+        updated = dict(row)
+        updated.update(
+            {
+                "fair_value": round(fair_value, 4),
+                "fair_value_probability": round(fair_value, 4),
+                "raw_fair_value": round(raw_fair_value, 4) if raw_fair_value is not None else None,
+                "raw_fair_value_probability": round(raw_fair_value, 4) if raw_fair_value is not None else None,
+                "edge": round(edge, 4),
+                "edge_after_buffer": round(edge, 4),
+                "model_probabilities": {
+                    key: round(float(value), 4)
+                    for key, value in sorted(calibrated_probabilities.items())
+                },
+                "model_count": len(source_probabilities),
+                "model_agreement": round(model_agreement, 4),
+                "probability_stdev": round(statistics.pstdev(values), 4) if len(values) >= 2 else 0.0,
+                "raw_probability_stdev": round(statistics.pstdev(raw_values), 4) if len(raw_values) >= 2 else None,
+                "recomputed_from_raw_model_probabilities": True,
+            }
+        )
+        rows_recomputed += 1
+        recomputed.append(updated)
+    return recomputed, {
+        "enabled": True,
+        "weights_file": str(weights_file),
+        "probability_calibration": {
+            "active": probability_calibration.active,
+            "center_shrink_alpha": probability_calibration.center_shrink_alpha,
+            "high_cap": probability_calibration.high_cap,
+            "low_floor": probability_calibration.low_floor,
+            "single_bucket_only": probability_calibration.single_bucket_only,
+            "tail_threshold": probability_calibration.tail_threshold,
+            "tail_shrink_alpha": probability_calibration.tail_shrink_alpha,
+        },
+        "source_weights_loaded": len(source_weights),
+        "model_weights_loaded": len(model_weights),
+        "rows_with_raw_model_probabilities": rows_with_raw,
+        "rows_recomputed": rows_recomputed,
+    }
+
+
+def _weighted_source_probability(source_probabilities: Mapping[str, float], source_weights: Mapping[str, float]) -> float:
+    weighted_total = 0.0
+    weight_sum = 0.0
+    for source_name, probability in source_probabilities.items():
+        weight = max(0.0, float(source_weights.get(source_name, 1.0)))
+        weighted_total += float(probability) * weight
+        weight_sum += weight
+    return weighted_total / weight_sum if weight_sum else sum(source_probabilities.values()) / len(source_probabilities)
+
+
+def _source_agreement_above(source_probabilities: Mapping[str, float], threshold: float) -> float:
+    if not source_probabilities:
+        return 0.0
+    return sum(1 for probability in source_probabilities.values() if probability > threshold) / len(source_probabilities)
+
+
+def _fetch_session_forecasts(
+    forecast_client: SingleRunForecastClient,
+    session_items: list[tuple[WeatherMarket, dict[str, Any], EntryPrice, dict[str, Any]]],
+    session_time: datetime,
+    *,
+    availability_lag_hours: int,
+    max_workers: int,
+) -> tuple[
+    dict[tuple[str, str], tuple[tuple[ForecastDistribution, ...], datetime]],
+    dict[tuple[str, str], dict[str, Any]],
+]:
+    jobs: dict[tuple[str, str], tuple[CityConfig, date, str]] = {}
+    for market, _raw, _entry, _settlement in session_items:
+        if market.city is None or market.target_date is None:
+            continue
+        key = (market.city.display_name, market.target_date.isoformat())
+        jobs.setdefault(key, (market.city, market.target_date, market.question))
+
+    cache: dict[tuple[str, str], tuple[tuple[ForecastDistribution, ...], datetime]] = {}
+    errors_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def fetch(key: tuple[str, str], city: CityConfig, target_date: date) -> tuple[tuple[str, str], tuple[ForecastDistribution, ...], datetime, list[str]]:
+        distributions, run_time, errors = forecast_client.fetch_sources(
+            city,
+            target_date,
+            session_time,
+            availability_lag_hours=availability_lag_hours,
+        )
+        return key, distributions, run_time, errors
+
+    if max_workers <= 1 or len(jobs) <= 1:
+        results = [fetch(key, city, target_date) for key, (city, target_date, _question) in jobs.items()]
+    else:
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(jobs))) as executor:
+            futures = [
+                executor.submit(fetch, key, city, target_date)
+                for key, (city, target_date, _question) in jobs.items()
+            ]
+            results = [future.result() for future in futures]
+
+    for key, distributions, run_time, errors in results:
+        if distributions:
+            cache[key] = (distributions, run_time)
+        if errors:
+            errors_by_key[key] = {"errors": tuple(errors), "example_question": jobs[key][2]}
+    return cache, errors_by_key
+
+
+def _historical_forecast_workers() -> int:
+    try:
+        configured = int(os.environ.get("HISTORICAL_FORECAST_WORKERS", "2"))
+    except ValueError:
+        configured = 2
+    return max(1, configured)
+
+
 def _discover_raw_temperature_markets(gamma: PolymarketGammaClient, *, query: str, pages: int, limit_per_page: int) -> list[dict[str, Any]]:
     raw_markets: list[dict[str, Any]] = []
     seen = set()
@@ -790,11 +1209,21 @@ def _discover_telonex_raw_temperature_markets(
     *,
     query: str,
     max_candidates: int,
+    min_end_date: Optional[date] = None,
+    max_end_date: Optional[date] = None,
+    market_selection: str = "end_date_asc",
 ) -> list[dict[str, Any]]:
     if telonex is None:
         raise TelonexConfigurationError("Telonex market source selected but no Telonex client is configured")
     dataset_path = telonex.download_dataset_parquet(exchange="polymarket", dataset="markets")
-    records = _load_telonex_market_records(dataset_path, query=query, max_candidates=max_candidates)
+    records = _load_telonex_market_records(
+        dataset_path,
+        query=query,
+        max_candidates=max_candidates,
+        min_end_date=min_end_date,
+        max_end_date=max_end_date,
+        market_selection=market_selection,
+    )
     raw_markets = []
     seen = set()
     for record in records:
@@ -809,8 +1238,20 @@ def _discover_telonex_raw_temperature_markets(
     return raw_markets
 
 
-def _load_telonex_market_records(path: Path, *, query: str, max_candidates: int) -> list[Mapping[str, Any]]:
+def _load_telonex_market_records(
+    path: Path,
+    *,
+    query: str,
+    max_candidates: int,
+    min_end_date: Optional[date] = None,
+    max_end_date: Optional[date] = None,
+    market_selection: str = "end_date_asc",
+) -> list[Mapping[str, Any]]:
     limit = max(1, max_candidates)
+    if market_selection not in {"end_date_asc", "end_date_desc", "month_balanced"}:
+        raise ValueError(f"Unsupported market_selection={market_selection!r}")
+    min_end_us = _date_to_epoch_us(min_end_date) if min_end_date else None
+    max_end_us = _date_to_epoch_us(max_end_date + timedelta(days=1)) - 1 if max_end_date else None
     try:
         import polars as pl  # type: ignore
 
@@ -830,17 +1271,19 @@ def _load_telonex_market_records(path: Path, *, query: str, max_candidates: int)
                     for column in text_columns
                 ]
             )
-        df = (
+        scan = (
             pl.scan_parquet(path)
             .filter(text_filter & query_filter)
             .filter(pl.col("status").fill_null("") == "resolved")
             .filter(pl.col("quotes_from").fill_null("") >= "2026-01-19")
             .filter(pl.col("quotes_to").fill_null("") != "")
-            .sort("end_date_us")
-            .limit(limit)
-            .collect()
         )
-        return [dict(row) for row in df.to_dicts()]
+        if min_end_us is not None:
+            scan = scan.filter(pl.col("end_date_us") >= min_end_us)
+        if max_end_us is not None:
+            scan = scan.filter(pl.col("end_date_us") <= max_end_us)
+        rows = [dict(row) for row in scan.sort("end_date_us").collect().to_dicts()]
+        return _select_telonex_market_records(rows, limit=limit, market_selection=market_selection)
     except ModuleNotFoundError:
         records = []
         for record in _load_parquet_records(path):
@@ -851,10 +1294,62 @@ def _load_telonex_market_records(path: Path, *, query: str, max_candidates: int)
                 continue
             if not record.get("quotes_from") or str(record.get("quotes_from")) < "2026-01-19" or not record.get("quotes_to"):
                 continue
+            end_date_us = _to_int(record.get("end_date_us"))
+            if min_end_us is not None and (end_date_us is None or end_date_us < min_end_us):
+                continue
+            if max_end_us is not None and (end_date_us is None or end_date_us > max_end_us):
+                continue
             records.append(record)
-            if len(records) >= limit:
-                break
-        return records
+        records.sort(key=lambda record: _to_int(record.get("end_date_us")) or 0)
+        return _select_telonex_market_records(records, limit=limit, market_selection=market_selection)
+
+
+def _select_telonex_market_records(
+    records: list[Mapping[str, Any]],
+    *,
+    limit: int,
+    market_selection: str,
+) -> list[Mapping[str, Any]]:
+    if market_selection == "end_date_asc":
+        return records[:limit]
+    if market_selection == "end_date_desc":
+        return list(reversed(records))[:limit]
+    by_month: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        month = _end_month(record) or "unknown"
+        by_month.setdefault(month, []).append(record)
+    selected: list[Mapping[str, Any]] = []
+    months = sorted(by_month)
+    while len(selected) < limit and months:
+        remaining_months = []
+        for month in months:
+            bucket = by_month[month]
+            if bucket:
+                selected.append(bucket.pop(0))
+                if len(selected) >= limit:
+                    break
+            if bucket:
+                remaining_months.append(month)
+        months = remaining_months
+    return selected
+
+
+def _end_month(record: Mapping[str, Any]) -> Optional[str]:
+    end_date_us = _to_int(record.get("end_date_us"))
+    if end_date_us is None:
+        return None
+    return datetime.fromtimestamp(end_date_us / 1_000_000, tz=timezone.utc).strftime("%Y-%m")
+
+
+def _date_to_epoch_us(value: date) -> int:
+    return int(datetime.combine(value, datetime_time(0, 0), tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _telonex_market_record_to_raw(record: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -1061,7 +1556,16 @@ def _invert_binary_scored_outcome(outcome: ScoredOutcome, settings: SignalSettin
         model_name: 1.0 - max(0.0, min(1.0, float(probability)))
         for model_name, probability in outcome.model_probabilities.items()
     }
+    raw_model_probabilities = (
+        {
+            model_name: 1.0 - max(0.0, min(1.0, float(probability)))
+            for model_name, probability in outcome.raw_model_probabilities.items()
+        }
+        if outcome.raw_model_probabilities
+        else None
+    )
     fair_value = 1.0 - outcome.fair_value
+    raw_fair_value = 1.0 - outcome.raw_fair_value if outcome.raw_fair_value is not None else None
     buffer = _price_adjusted_uncertainty_buffer(outcome.market_price, settings)
     agreement = ConsensusValue(
         bucket_label=outcome.bucket_label,
@@ -1078,6 +1582,8 @@ def _invert_binary_scored_outcome(outcome: ScoredOutcome, settings: SignalSettin
         edge=round(fair_value - outcome.market_price - buffer, 4),
         model_agreement=round(agreement, 4),
         model_probabilities=model_probabilities,
+        raw_fair_value=round(raw_fair_value, 4) if raw_fair_value is not None else None,
+        raw_model_probabilities=raw_model_probabilities,
         observed_outcome=_invert_binary_outcome(outcome.observed_outcome),
     )
 
@@ -1088,13 +1594,15 @@ def _resolve_market_outcome(
     bucket: TemperatureBucket,
     observation_client: ObservedHighClient,
     observation_cache: Optional[dict[tuple[str, ...], Optional[ObservedHigh]]] = None,
+    *,
+    fetch_weather_crosscheck: bool = True,
 ) -> dict[str, Any]:
     polymarket_payout = _polymarket_yes_payout(raw)
     observed_high_f = None
     weather_outcome = None
     weather_ambiguous = False
     settlement_source = None
-    if market.city is not None and market.target_date is not None:
+    if fetch_weather_crosscheck and market.city is not None and market.target_date is not None:
         observation_city = _market_resolution_city(market.city, raw)
         station = _resolution_station(raw)
         cache_key = (
@@ -1407,7 +1915,21 @@ def _rebalance_session(
     edge_position_min_multiplier: float,
     min_trade_usd: float,
     settings: SignalSettings,
+    max_new_exposure_usd_per_run: Optional[float] = None,
+    max_new_exposure_fraction_per_run: Optional[float] = None,
+    new_exposure_target_positions_per_run: Optional[float] = None,
+    kelly_sizing_bankroll_fraction_per_run: Optional[float] = None,
 ) -> None:
+    sizing_base = _historical_portfolio_equity(cash_ref["cash"], positions) if compound_kelly_sizing else bankroll_usd
+    buy_budget_remaining = _new_exposure_budget_usd(
+        sizing_base,
+        max_new_exposure_usd_per_run,
+        max_new_exposure_fraction_per_run,
+    )
+    per_buy_budget = _new_exposure_per_buy_budget_usd(
+        buy_budget_remaining,
+        new_exposure_target_positions_per_run,
+    )
     for outcome in sorted(scored, key=lambda item: item.edge, reverse=True):
         if not outcome.token_id:
             continue
@@ -1422,6 +1944,7 @@ def _rebalance_session(
         target_notional = 0.0
         if token in selected_tokens:
             sizing_bankroll = _historical_portfolio_equity(cash_ref["cash"], positions) if compound_kelly_sizing else bankroll_usd
+            sizing_bankroll = _kelly_sizing_bankroll_usd(sizing_bankroll, kelly_sizing_bankroll_fraction_per_run)
             target_notional = _kelly_target_notional(
                 outcome,
                 sizing_bankroll,
@@ -1438,11 +1961,20 @@ def _rebalance_session(
             target_notional = current_notional
         delta = target_notional - current_notional
         if delta > 0 and delta >= min_trade_usd:
+            if buy_budget_remaining is not None:
+                delta = min(delta, buy_budget_remaining)
+            if per_buy_budget is not None:
+                delta = min(delta, per_buy_budget)
+            if buy_budget_remaining is not None or per_buy_budget is not None:
+                if delta < min_trade_usd:
+                    continue
             notional = min(delta, cash_ref["cash"])
             if notional < min_trade_usd:
                 continue
             shares = notional / outcome.market_price
             cash_ref["cash"] -= notional
+            if buy_budget_remaining is not None:
+                buy_budget_remaining = max(0.0, buy_budget_remaining - notional)
             _upsert_historical_position(positions, outcome, shares, notional, token_metadata)
             executions.append(_execution_json("BUY", outcome, shares, outcome.market_price, notional, 0.0, token_metadata))
         elif delta < 0 and current is not None and abs(delta) >= min_trade_usd:
@@ -1455,6 +1987,41 @@ def _rebalance_session(
 def _historical_portfolio_equity(cash: float, positions: Mapping[str, HistoricalPosition]) -> float:
     marked = sum(position.shares * position.last_price for position in positions.values())
     return max(0.0, cash + marked)
+
+
+def _new_exposure_budget_usd(
+    sizing_bankroll_usd: float,
+    max_new_exposure_usd_per_run: Optional[float],
+    max_new_exposure_fraction_per_run: Optional[float],
+) -> Optional[float]:
+    caps: list[float] = []
+    if max_new_exposure_usd_per_run is not None and max_new_exposure_usd_per_run > 0:
+        caps.append(float(max_new_exposure_usd_per_run))
+    if max_new_exposure_fraction_per_run is not None and max_new_exposure_fraction_per_run > 0:
+        caps.append(max(0.0, float(sizing_bankroll_usd) * float(max_new_exposure_fraction_per_run)))
+    if not caps:
+        return None
+    return max(0.0, min(caps))
+
+
+def _new_exposure_per_buy_budget_usd(
+    run_budget_usd: Optional[float],
+    target_positions_per_run: Optional[float],
+) -> Optional[float]:
+    if run_budget_usd is None:
+        return None
+    if target_positions_per_run is None or target_positions_per_run <= 0:
+        return None
+    return max(0.0, run_budget_usd / float(target_positions_per_run))
+
+
+def _kelly_sizing_bankroll_usd(
+    bankroll_usd: float,
+    fraction_per_run: Optional[float],
+) -> float:
+    if fraction_per_run is None or fraction_per_run <= 0:
+        return bankroll_usd
+    return max(0.0, bankroll_usd * float(fraction_per_run))
 
 
 def _upsert_historical_position(positions: dict[str, HistoricalPosition], outcome: ScoredOutcome, shares: float, cost: float, metadata: Mapping[str, Any]) -> None:
@@ -1662,6 +2229,8 @@ def _scored_to_json(outcome: ScoredOutcome, metadata: Mapping[str, Any], setting
         "model_count": outcome.model_count,
         "model_agreement": outcome.model_agreement,
         "probability_stdev": outcome.probability_stdev,
+        "raw_fair_value": outcome.raw_fair_value,
+        "raw_probability_stdev": outcome.raw_probability_stdev,
         "bucket_lower_f": outcome.bucket_lower_f,
         "bucket_upper_f": outcome.bucket_upper_f,
         "bucket_width_f": outcome.bucket_width_f,
@@ -1681,6 +2250,7 @@ def _scored_to_json(outcome: ScoredOutcome, metadata: Mapping[str, Any], setting
         "trade_eligible": filter_reason is None,
         "signal_filter_reason": filter_reason,
         "model_probabilities": outcome.model_probabilities,
+        "raw_model_probabilities": outcome.raw_model_probabilities or {},
         **dict(metadata),
     }
 
@@ -1850,22 +2420,34 @@ def _trade_performance_diagnostics(executions: list[dict[str, Any]]) -> dict[str
 def _score_calibration_diagnostics(scored: list[dict[str, Any]]) -> dict[str, Any]:
     resolved = [row for row in scored if row.get("polymarket_payout") in (0, 1)]
     signal_eligible = [row for row in resolved if row.get("signal_filter_reason") is None]
+    raw_resolved = [row for row in resolved if row.get("raw_fair_value") is not None]
+    raw_signal_eligible = [row for row in signal_eligible if row.get("raw_fair_value") is not None]
     return {
         "resolved_count": len(resolved),
         "signal_eligible_count": len(signal_eligible),
+        "raw_probability_rows": len(raw_resolved),
+        "raw_signal_eligible_rows": len(raw_signal_eligible),
         "overall": _calibration_metrics(resolved),
         "signal_eligible": _calibration_metrics(signal_eligible),
+        "raw_overall": _calibration_metrics(raw_resolved, probability_key="raw_fair_value"),
+        "raw_signal_eligible": _calibration_metrics(raw_signal_eligible, probability_key="raw_fair_value"),
         "by_market_price_bucket": _aggregate_score_groups(resolved, "market_price", 0.10),
         "by_fair_value_bucket": _aggregate_score_groups(resolved, "fair_value", 0.10),
         "by_edge_bucket": _aggregate_score_groups(resolved, "edge", 0.10),
         "by_model_agreement_bucket": _aggregate_score_groups(resolved, "model_agreement", 0.25),
         "by_signal_filter_reason": _aggregate_score_groups(resolved, "signal_filter_reason", None),
         "model_probability_accuracy": _model_probability_accuracy(resolved),
+        "raw_model_probability_accuracy": _model_probability_accuracy(resolved, probability_key="raw_model_probabilities"),
         "source_probability_accuracy": _model_probability_accuracy(resolved, group_by="source"),
+        "raw_source_probability_accuracy": _model_probability_accuracy(resolved, group_by="source", probability_key="raw_model_probabilities"),
         "model_family_probability_accuracy": _model_probability_accuracy(resolved, group_by="model_family"),
+        "raw_model_family_probability_accuracy": _model_probability_accuracy(resolved, group_by="model_family", probability_key="raw_model_probabilities"),
         "signal_eligible_model_probability_accuracy": _model_probability_accuracy(signal_eligible),
+        "signal_eligible_raw_model_probability_accuracy": _model_probability_accuracy(signal_eligible, probability_key="raw_model_probabilities"),
         "signal_eligible_source_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="source"),
+        "signal_eligible_raw_source_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="source", probability_key="raw_model_probabilities"),
         "signal_eligible_model_family_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="model_family"),
+        "signal_eligible_raw_model_family_probability_accuracy": _model_probability_accuracy(signal_eligible, group_by="model_family", probability_key="raw_model_probabilities"),
     }
 
 
@@ -1911,6 +2493,7 @@ def _real_data_audit(
     *,
     data_quality_diagnostics: Mapping[str, Any],
     settlement_quality_diagnostics: Mapping[str, Any],
+    require_weather_crosscheck: bool = True,
 ) -> dict[str, Any]:
     scored_quality = data_quality_diagnostics.get("scored_rows") or {}
     execution_quality = data_quality_diagnostics.get("executions") or {}
@@ -1946,6 +2529,50 @@ def _real_data_audit(
         for row in forecast_source_rows
         if any(str(source).lower() == "fixture" for source in row.get("forecast_sources") or [])
     ][:5]
+
+    signal_weather_check = {
+        "required": require_weather_crosscheck,
+        "passed": int(signal_quality.get("total_rows") or 0) == 0
+        or (
+            int(signal_quality.get("weather_checked_rows") or 0) == int(signal_quality.get("total_rows") or 0)
+            and int(signal_quality.get("weather_matched_rows") or 0) == int(signal_quality.get("total_rows") or 0)
+            and int(signal_quality.get("weather_mismatch_rows") or 0) == 0
+            and int(signal_quality.get("weather_ambiguous_rows") or 0) == 0
+            and int(signal_quality.get("unresolved_rows") or 0) == 0
+        ),
+        "total_rows": int(signal_quality.get("total_rows") or 0),
+        "weather_checked_rows": int(signal_quality.get("weather_checked_rows") or 0),
+        "weather_matched_rows": int(signal_quality.get("weather_matched_rows") or 0),
+        "weather_mismatch_rows": int(signal_quality.get("weather_mismatch_rows") or 0),
+        "weather_ambiguous_rows": int(signal_quality.get("weather_ambiguous_rows") or 0),
+        "unresolved_rows": int(signal_quality.get("unresolved_rows") or 0),
+    }
+    if not require_weather_crosscheck:
+        signal_weather_check["passed"] = True
+        signal_weather_check["note"] = "Weather cross-check skipped by settlement_audit=polymarket_only; Polymarket resolved payout is the settlement source."
+
+    traded_weather_check = {
+        "required": require_weather_crosscheck,
+        "passed": int(traded_quality.get("traded_token_count") or 0) == 0
+        or (
+            int(traded_quality.get("weather_checked_traded_tokens") or 0) == int(traded_quality.get("traded_token_count") or 0)
+            and int(traded_quality.get("weather_matched_traded_tokens") or 0) == int(traded_quality.get("traded_token_count") or 0)
+            and int(traded_quality.get("weather_mismatch_traded_tokens") or 0) == 0
+            and int(traded_quality.get("weather_ambiguous_traded_tokens") or 0) == 0
+            and int(traded_quality.get("unresolved_traded_tokens") or 0) == 0
+            and int(traded_quality.get("polymarket_only_traded_tokens") or 0) == 0
+        ),
+        "traded_token_count": int(traded_quality.get("traded_token_count") or 0),
+        "weather_checked_traded_tokens": int(traded_quality.get("weather_checked_traded_tokens") or 0),
+        "weather_matched_traded_tokens": int(traded_quality.get("weather_matched_traded_tokens") or 0),
+        "weather_mismatch_traded_tokens": int(traded_quality.get("weather_mismatch_traded_tokens") or 0),
+        "weather_ambiguous_traded_tokens": int(traded_quality.get("weather_ambiguous_traded_tokens") or 0),
+        "unresolved_traded_tokens": int(traded_quality.get("unresolved_traded_tokens") or 0),
+        "polymarket_only_traded_tokens": int(traded_quality.get("polymarket_only_traded_tokens") or 0),
+    }
+    if not require_weather_crosscheck:
+        traded_weather_check["passed"] = True
+        traded_weather_check["note"] = "Weather cross-check skipped by settlement_audit=polymarket_only; Polymarket resolved payout is the settlement source."
 
     checks = {
         "scored_rows_have_historical_price_timestamps": {
@@ -1992,40 +2619,8 @@ def _real_data_audit(
             "no_side_buy_executions": len(no_side_buy_executions),
             "explicit_no_side_buy_executions": len(explicit_no_buy_executions),
         },
-        "signal_eligible_rows_weather_matched": {
-            "passed": int(signal_quality.get("total_rows") or 0) == 0
-            or (
-                int(signal_quality.get("weather_checked_rows") or 0) == int(signal_quality.get("total_rows") or 0)
-                and int(signal_quality.get("weather_matched_rows") or 0) == int(signal_quality.get("total_rows") or 0)
-                and int(signal_quality.get("weather_mismatch_rows") or 0) == 0
-                and int(signal_quality.get("weather_ambiguous_rows") or 0) == 0
-                and int(signal_quality.get("unresolved_rows") or 0) == 0
-            ),
-            "total_rows": int(signal_quality.get("total_rows") or 0),
-            "weather_checked_rows": int(signal_quality.get("weather_checked_rows") or 0),
-            "weather_matched_rows": int(signal_quality.get("weather_matched_rows") or 0),
-            "weather_mismatch_rows": int(signal_quality.get("weather_mismatch_rows") or 0),
-            "weather_ambiguous_rows": int(signal_quality.get("weather_ambiguous_rows") or 0),
-            "unresolved_rows": int(signal_quality.get("unresolved_rows") or 0),
-        },
-        "traded_tokens_weather_matched": {
-            "passed": int(traded_quality.get("traded_token_count") or 0) == 0
-            or (
-                int(traded_quality.get("weather_checked_traded_tokens") or 0) == int(traded_quality.get("traded_token_count") or 0)
-                and int(traded_quality.get("weather_matched_traded_tokens") or 0) == int(traded_quality.get("traded_token_count") or 0)
-                and int(traded_quality.get("weather_mismatch_traded_tokens") or 0) == 0
-                and int(traded_quality.get("weather_ambiguous_traded_tokens") or 0) == 0
-                and int(traded_quality.get("unresolved_traded_tokens") or 0) == 0
-                and int(traded_quality.get("polymarket_only_traded_tokens") or 0) == 0
-            ),
-            "traded_token_count": int(traded_quality.get("traded_token_count") or 0),
-            "weather_checked_traded_tokens": int(traded_quality.get("weather_checked_traded_tokens") or 0),
-            "weather_matched_traded_tokens": int(traded_quality.get("weather_matched_traded_tokens") or 0),
-            "weather_mismatch_traded_tokens": int(traded_quality.get("weather_mismatch_traded_tokens") or 0),
-            "weather_ambiguous_traded_tokens": int(traded_quality.get("weather_ambiguous_traded_tokens") or 0),
-            "unresolved_traded_tokens": int(traded_quality.get("unresolved_traded_tokens") or 0),
-            "polymarket_only_traded_tokens": int(traded_quality.get("polymarket_only_traded_tokens") or 0),
-        },
+        "signal_eligible_rows_weather_matched": signal_weather_check,
+        "traded_tokens_weather_matched": traded_weather_check,
     }
     failures = [name for name, check in checks.items() if not check.get("passed")]
     return {
@@ -2033,8 +2628,9 @@ def _real_data_audit(
         "method": (
             "Strict real-data audit for the historical replay. It verifies historical price timestamps, "
             "forecast run-time lag, Open-Meteo Single Runs forecast sources, explicit NO-token attribution, "
-            "and weather-matched settlement for signal-eligible and traded rows."
+            "and weather-matched settlement for signal-eligible and traded rows when settlement_audit=weather_crosscheck."
         ),
+        "require_weather_crosscheck": require_weather_crosscheck,
         "failure_reasons": failures,
         "checks": checks,
     }
@@ -3003,8 +3599,11 @@ def _counterfactual_kelly_replays(
             min_trade_usd=min_trade_usd,
         )
         for name, hours in (
-            ("entry_hours_utc_0_only", {0}),
-            ("entry_hours_utc_12_only", {12}),
+            ("live_forward_entry_hours_utc_0_6_12_18", set(LIVE_FORWARD_ENTRY_HOURS_UTC)),
+            *(
+                (f"entry_hours_utc_{hour}_only", {hour})
+                for hour in LIVE_FORWARD_ENTRY_HOURS_UTC
+            ),
         )
     ]
     hour_tail_replays = [
@@ -3213,6 +3812,10 @@ def _json_kelly_replay(
     bankroll_usd: float,
     kelly_fraction: float,
     compound_kelly_sizing: bool = False,
+    max_new_exposure_usd_per_run: Optional[float] = None,
+    max_new_exposure_fraction_per_run: Optional[float] = None,
+    new_exposure_target_positions_per_run: Optional[float] = None,
+    kelly_sizing_bankroll_fraction_per_run: Optional[float] = None,
     max_position_usd: float,
     max_position_fraction: Optional[float] = None,
     kelly_market_blend: float = 0.0,
@@ -3227,6 +3830,7 @@ def _json_kelly_replay(
     invalid_hold_partial_exit_min_fair_value: float = 0.90,
     invalid_hold_partial_exit_min_price: float = 0.50,
     invalid_hold_partial_exit_max_price: float = 0.80,
+    include_executions: bool = False,
 ) -> dict[str, Any]:
     sessions: dict[str, list[dict[str, Any]]] = {}
     for row in scored:
@@ -3267,6 +3871,16 @@ def _json_kelly_replay(
         rows = sessions[session_key]
         selected_tokens = _json_selected_tokens(rows, settings)
         signal_count += len(selected_tokens)
+        sizing_base = _json_portfolio_equity(cash, positions) if compound_kelly_sizing else bankroll_usd
+        buy_budget_remaining = _new_exposure_budget_usd(
+            sizing_base,
+            max_new_exposure_usd_per_run,
+            max_new_exposure_fraction_per_run,
+        )
+        per_buy_budget = _new_exposure_per_buy_budget_usd(
+            buy_budget_remaining,
+            new_exposure_target_positions_per_run,
+        )
         for row in sorted(rows, key=lambda item: float(item.get("edge") or 0.0), reverse=True):
             token = str(row.get("token_id") or "")
             if not token:
@@ -3281,6 +3895,7 @@ def _json_kelly_replay(
             target_notional = 0.0
             if token in selected_tokens:
                 sizing_bankroll = _json_portfolio_equity(cash, positions) if compound_kelly_sizing else bankroll_usd
+                sizing_bankroll = _kelly_sizing_bankroll_usd(sizing_bankroll, kelly_sizing_bankroll_fraction_per_run)
                 row_max_position_usd = _damped_max_position_usd(
                     max_position_usd,
                     row,
@@ -3312,11 +3927,20 @@ def _json_kelly_replay(
                 invalid_hold_partial_exit_max_price=active_partial_exit_max_price,
             )
             if delta > 0 and delta >= min_trade_usd:
+                if buy_budget_remaining is not None:
+                    delta = min(delta, buy_budget_remaining)
+                if per_buy_budget is not None:
+                    delta = min(delta, per_buy_budget)
+                if buy_budget_remaining is not None or per_buy_budget is not None:
+                    if delta < min_trade_usd:
+                        continue
                 notional = min(delta, cash)
                 if notional < min_trade_usd:
                     continue
                 shares = notional / price
                 cash -= notional
+                if buy_budget_remaining is not None:
+                    buy_budget_remaining = max(0.0, buy_budget_remaining - notional)
                 if current is None:
                     positions[token] = {
                         "shares": shares,
@@ -3392,11 +4016,20 @@ def _json_kelly_replay(
     trade_diagnostics = _trade_performance_diagnostics(
         [_json_replay_execution_for_trade_diagnostics(execution) for execution in executions]
     )
-    return {
+    performance_diagnostics = _performance_diagnostics_from_equity_curve(equity_curve, bankroll_usd)
+    max_drawdown_usd, max_drawdown_pct = _equity_curve_drawdown(equity_curve)
+    cash_points = [
+        float(snapshot.get("cash") or 0.0)
+        for snapshot in equity_curve
+        if isinstance(snapshot, Mapping) and snapshot.get("cash") is not None
+    ]
+    min_cash_usd = min(cash_points) if cash_points else None
+    result = {
         "variant": name,
         "ending_equity_usd": round(cash, 2),
         "pnl_usd": round(pnl, 2),
         "return_pct": round(pnl / bankroll_usd, 4) if bankroll_usd else None,
+        "performance_diagnostics": performance_diagnostics,
         "signals": signal_count,
         "trade_count": len(trade_tokens),
         "winning_trades": winners,
@@ -3418,10 +4051,13 @@ def _json_kelly_replay(
         "sells": sum(1 for execution in executions if execution["action"] == "SELL"),
         "settlements": sum(1 for execution in executions if execution["action"] == "SETTLE"),
         "min_equity_usd": _equity_curve_min(equity_curve),
-        "max_drawdown_usd": _equity_curve_drawdown(equity_curve)[0],
-        "max_drawdown_pct": _equity_curve_drawdown(equity_curve)[1],
+        "min_cash_usd": round(min_cash_usd, 4) if min_cash_usd is not None else None,
+        "min_cash_pct": round(min_cash_usd / bankroll_usd, 4) if min_cash_usd is not None and bankroll_usd else None,
+        "max_drawdown_usd": max_drawdown_usd,
+        "max_drawdown_pct": max_drawdown_pct,
         "weather_mismatch_trades": len(weather_mismatch_trades),
         "weather_ambiguous_trades": len(weather_ambiguous_trades),
+        "equity_curve": equity_curve,
         "exit_management": _json_replay_exit_management(executions),
         "trade_diagnostics": trade_diagnostics,
         "settings": {
@@ -3452,6 +4088,10 @@ def _json_kelly_replay(
             "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
             "bounded_bucket_min_price": settings.bounded_bucket_min_price,
             "compound_kelly_sizing": compound_kelly_sizing,
+            "max_new_exposure_usd_per_run": max_new_exposure_usd_per_run,
+            "max_new_exposure_fraction_per_run": max_new_exposure_fraction_per_run,
+            "new_exposure_target_positions_per_run": new_exposure_target_positions_per_run,
+            "kelly_sizing_bankroll_fraction_per_run": kelly_sizing_bankroll_fraction_per_run,
             "max_position_usd": max_position_usd,
             "max_position_fraction": max_position_fraction,
             "kelly_market_blend": kelly_market_blend,
@@ -3467,6 +4107,9 @@ def _json_kelly_replay(
             "invalid_hold_partial_exit_max_price": active_partial_exit_max_price,
         },
     }
+    if include_executions:
+        result["executions_detail"] = executions
+    return result
 
 
 def _json_replay_execution_for_trade_diagnostics(execution: Mapping[str, Any]) -> dict[str, Any]:
@@ -3788,6 +4431,13 @@ def _json_signal_candidate(
         and row.get("bucket_upper_f") is not None
     ):
         return False
+    if (
+        _json_is_no_side_row(row)
+        and not settings.allow_bounded_no_side_entries
+        and row.get("bucket_lower_f") is not None
+        and row.get("bucket_upper_f") is not None
+    ):
+        return False
     if fair_value < active_min_fair_value:
         return False
     if model_count < settings.min_model_count:
@@ -3834,7 +4484,13 @@ def _json_fails_bounded_bucket_quality_gate(row: Mapping[str, Any], settings: Si
         fair_value = float(row.get("fair_value"))
         edge = float(row.get("edge"))
         agreement = float(row.get("model_agreement") or 0.0)
+        probability_stdev = float(row.get("probability_stdev") or 0.0)
     except (TypeError, ValueError):
+        return True
+    if (
+        settings.bounded_bucket_max_probability_stdev is not None
+        and probability_stdev > settings.bounded_bucket_max_probability_stdev
+    ):
         return True
     return (
         price < settings.bounded_bucket_min_price
@@ -4156,11 +4812,11 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _calibration_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _calibration_metrics(rows: list[dict[str, Any]], *, probability_key: str = "fair_value") -> dict[str, Any]:
     if not rows:
         return {"n": 0, "avg_market_price": None, "avg_fair_value": None, "actual_rate": None, "brier_fair_value": None, "brier_market": None}
     actual = [int(row["polymarket_payout"]) for row in rows]
-    fair_values = [float(row["fair_value"]) for row in rows]
+    fair_values = [float(row[probability_key]) for row in rows]
     prices = [float(row["market_price"]) for row in rows]
     return {
         "n": len(rows),
@@ -4185,11 +4841,16 @@ def _aggregate_score_groups(rows: list[dict[str, Any]], key: str, width: Optiona
     ]
 
 
-def _model_probability_accuracy(rows: list[dict[str, Any]], *, group_by: str = "model") -> list[dict[str, Any]]:
+def _model_probability_accuracy(
+    rows: list[dict[str, Any]],
+    *,
+    group_by: str = "model",
+    probability_key: str = "model_probabilities",
+) -> list[dict[str, Any]]:
     grouped: dict[str, list[tuple[float, int]]] = {}
     for row in rows:
         outcome = int(row["polymarket_payout"])
-        probabilities = row.get("model_probabilities") or {}
+        probabilities = row.get(probability_key) or {}
         if not isinstance(probabilities, dict):
             continue
         for name, probability in probabilities.items():
@@ -4359,6 +5020,149 @@ def _json_equity_snapshot(session_key: str, cash: float, positions: Mapping[str,
     }
 
 
+def _historical_equity_snapshot(
+    session_time: datetime,
+    cash: float,
+    positions: Mapping[str, HistoricalPosition],
+) -> dict[str, Any]:
+    open_value = sum(position.shares * position.last_price for position in positions.values())
+    return {
+        "session": session_time.isoformat(),
+        "cash": round(cash, 4),
+        "open_value": round(open_value, 4),
+        "equity": round(cash + open_value, 4),
+        "open_positions": len(positions),
+    }
+
+
+def _historical_final_equity_snapshot(
+    cash: float,
+    open_value: float,
+    positions: Mapping[str, HistoricalPosition],
+) -> dict[str, Any]:
+    return {
+        "session": "final",
+        "cash": round(cash, 4),
+        "open_value": round(open_value, 4),
+        "equity": round(cash + open_value, 4),
+        "open_positions": len(positions),
+    }
+
+
+def _performance_diagnostics_from_equity_curve(
+    equity_curve: list[dict[str, Any]],
+    starting_equity: float,
+) -> dict[str, Any]:
+    parseable_points: list[tuple[datetime, float]] = []
+    final_equity: Optional[float] = None
+    for point in equity_curve:
+        equity = _optional_float(point.get("equity"))
+        if equity is None:
+            continue
+        if point.get("session") == "final":
+            final_equity = equity
+            continue
+        session_time = _parse_dt(point.get("session"))
+        if session_time is not None:
+            parseable_points.append((session_time, equity))
+    parseable_points.sort(key=lambda item: item[0])
+    if not parseable_points or starting_equity <= 0:
+        return {
+            "method": "Calendar-day equity diagnostics from configured replay decision sessions; Sharpe is annualized with 365 trading days.",
+            "period_start": None,
+            "period_end": None,
+            "period_days": None,
+            "total_return_pct": None,
+            "annualized_return_pct": None,
+            "average_monthly_return_pct": None,
+            "annualized_from_average_monthly_pct": None,
+            "calendar_daily_sharpe_365": None,
+            "daily_return_count": 0,
+            "max_drawdown_usd": _equity_curve_drawdown(equity_curve)[0],
+            "max_drawdown_pct": _equity_curve_drawdown(equity_curve)[1],
+        }
+
+    ending_equity = final_equity if final_equity is not None else parseable_points[-1][1]
+    period_start = parseable_points[0][0]
+    period_end = parseable_points[-1][0]
+    period_days = max((period_end - period_start).total_seconds() / 86400.0, 1e-9)
+    total_return = ending_equity / starting_equity - 1.0
+    annualized_return = _annualized_return(ending_equity, starting_equity, period_days)
+
+    daily_equity: dict[date, float] = {}
+    for session_time, equity in parseable_points:
+        daily_equity[session_time.date()] = equity
+    if final_equity is not None:
+        daily_equity[period_end.date()] = final_equity
+    daily_returns = _period_returns_from_end_values(daily_equity, starting_equity)
+
+    monthly_equity: dict[str, float] = {}
+    for session_time, equity in parseable_points:
+        monthly_equity[session_time.strftime("%Y-%m")] = equity
+    if final_equity is not None:
+        monthly_equity[period_end.strftime("%Y-%m")] = final_equity
+    monthly_returns = _period_returns_from_end_values(monthly_equity, starting_equity)
+    average_monthly_return = sum(monthly_returns) / len(monthly_returns) if monthly_returns else None
+    annualized_from_average_monthly = (
+        (1.0 + average_monthly_return) ** 12 - 1.0
+        if average_monthly_return is not None and average_monthly_return > -1.0
+        else None
+    )
+    average_daily_return = sum(daily_returns) / len(daily_returns) if daily_returns else None
+    daily_volatility = _sample_standard_deviation(daily_returns)
+    sharpe = (
+        average_daily_return / daily_volatility * math.sqrt(365.0)
+        if average_daily_return is not None and daily_volatility and daily_volatility > 0
+        else None
+    )
+    max_drawdown_usd, max_drawdown_pct = _equity_curve_drawdown(equity_curve)
+    return {
+        "method": "Calendar-day equity diagnostics from configured replay decision sessions; Sharpe is annualized with 365 trading days.",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "period_days": round(period_days, 2),
+        "total_return_pct": round(total_return, 4),
+        "annualized_return_pct": round(annualized_return, 4) if annualized_return is not None else None,
+        "average_monthly_return_pct": round(average_monthly_return, 4) if average_monthly_return is not None else None,
+        "annualized_from_average_monthly_pct": round(annualized_from_average_monthly, 4) if annualized_from_average_monthly is not None else None,
+        "average_daily_return_pct": round(average_daily_return, 5) if average_daily_return is not None else None,
+        "daily_volatility_pct": round(daily_volatility, 5) if daily_volatility is not None else None,
+        "calendar_daily_sharpe_365": round(sharpe, 4) if sharpe is not None else None,
+        "daily_return_count": len(daily_returns),
+        "monthly_return_count": len(monthly_returns),
+        "max_drawdown_usd": max_drawdown_usd,
+        "max_drawdown_pct": max_drawdown_pct,
+    }
+
+
+def _period_returns_from_end_values(period_end_values: Mapping[Any, float], starting_equity: float) -> list[float]:
+    returns: list[float] = []
+    previous = starting_equity
+    for key in sorted(period_end_values):
+        current = period_end_values[key]
+        if previous > 0:
+            returns.append(current / previous - 1.0)
+        previous = current
+    return returns
+
+
+def _sample_standard_deviation(values: list[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+    return math.sqrt(variance)
+
+
+def _annualized_return(ending_equity: float, starting_equity: float, period_days: float) -> Optional[float]:
+    if starting_equity <= 0 or ending_equity <= 0 or period_days < 7:
+        return None
+    try:
+        return (ending_equity / starting_equity) ** (365.0 / period_days) - 1.0
+    except OverflowError:
+        return None
+
+
 def _equity_curve_min(equity_curve: list[dict[str, Any]]) -> Optional[float]:
     if not equity_curve:
         return None
@@ -4470,6 +5274,7 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
         "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
         "bounded_bucket_min_price": settings.bounded_bucket_min_price,
+        "bounded_bucket_max_probability_stdev": settings.bounded_bucket_max_probability_stdev,
         "allow_no_side_entries": settings.allow_no_side_entries,
         "no_side_min_edge": settings.no_side_min_edge,
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,

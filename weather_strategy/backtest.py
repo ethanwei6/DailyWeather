@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from weather_strategy.cities import find_city
+from weather_strategy.forecast import ProbabilityCalibration
 from weather_strategy.http import HttpClient
 from weather_strategy.models import CityConfig
 from weather_strategy.observations import ObservedHighClient, observed_outcome_for_bucket
@@ -40,6 +41,9 @@ class ResolvedForecastRow:
     entry_eligible: bool
     observed_outcome: int
     model_probabilities: dict[str, float]
+    raw_fair_value: Optional[float] = None
+    raw_probability_stdev: Optional[float] = None
+    raw_model_probabilities: Optional[dict[str, float]] = None
 
 
 @dataclass
@@ -75,6 +79,42 @@ def load_calibration_weights(path: str | Path | None) -> tuple[dict[str, float],
     _apply_weight_alias(source_weights, "open_meteo_gfs_hrrr", "open_meteo_gfs_best_match")
     _apply_model_weight_alias(model_weights, "open_meteo_gfs_hrrr", "open_meteo_gfs_best_match")
     return source_weights, model_weights
+
+
+def load_probability_calibration(path: str | Path | None) -> ProbabilityCalibration:
+    if not path:
+        return ProbabilityCalibration()
+    weights_path = Path(path)
+    if not weights_path.exists():
+        return ProbabilityCalibration()
+    payload = json.loads(weights_path.read_text(encoding="utf-8"))
+    calibration = payload.get("probability_calibration") or {}
+    if not isinstance(calibration, Mapping):
+        return ProbabilityCalibration()
+    return ProbabilityCalibration(
+        center_shrink_alpha=_float_or_default(calibration.get("center_shrink_alpha"), 1.0),
+        high_cap=_optional_float(calibration.get("high_cap")),
+        low_floor=_optional_float(calibration.get("low_floor")),
+        single_bucket_only=bool(calibration.get("single_bucket_only", True)),
+        tail_threshold=_optional_float(calibration.get("tail_threshold")),
+        tail_shrink_alpha=_float_or_default(calibration.get("tail_shrink_alpha"), 1.0),
+    )
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_weight_alias(weights: dict[str, float], old_key: str, new_key: str) -> None:
@@ -228,6 +268,12 @@ def load_resolved_forecast_rows(
         model_probabilities = _parse_model_probabilities(row["model_probabilities_json"])
         if not model_probabilities:
             continue
+        row_keys = set(row.keys())
+        raw_model_probabilities = (
+            _parse_model_probabilities(row["raw_model_probabilities_json"])
+            if "raw_model_probabilities_json" in row_keys
+            else {}
+        )
         resolved.append(
             ResolvedForecastRow(
                 id=int(row["id"]),
@@ -244,6 +290,13 @@ def load_resolved_forecast_rows(
                 entry_eligible=bool(row["entry_eligible"]),
                 observed_outcome=int(observed_outcome),
                 model_probabilities=model_probabilities,
+                raw_fair_value=float(row["raw_fair_value"]) if "raw_fair_value" in row_keys and row["raw_fair_value"] is not None else None,
+                raw_probability_stdev=(
+                    float(row["raw_probability_stdev"])
+                    if "raw_probability_stdev" in row_keys and row["raw_probability_stdev"] is not None
+                    else None
+                ),
+                raw_model_probabilities=raw_model_probabilities or None,
             )
         )
     return resolved
@@ -336,9 +389,10 @@ def fit_accuracy_weights(
     source_metrics: dict[str, AccuracyMetric] = {}
     model_metrics: dict[str, AccuracyMetric] = {}
     for row in rows:
-        for source, probability in _source_probability_views(row.model_probabilities).items():
+        probabilities = _accuracy_model_probabilities(row)
+        for source, probability in _source_probability_views(probabilities).items():
             source_metrics.setdefault(source, AccuracyMetric()).add(probability, row.observed_outcome)
-        for model_key, probability in row.model_probabilities.items():
+        for model_key, probability in probabilities.items():
             model_metrics.setdefault(model_key, AccuracyMetric()).add(probability, row.observed_outcome)
 
     source_baseline = _pooled_brier(source_metrics)
@@ -356,10 +410,15 @@ def fit_accuracy_weights(
         "model_baseline_brier": round(model_baseline, 6) if model_baseline is not None else None,
         "min_weight_samples": min_samples,
         "weight_prior_samples": prior_samples,
+        "probability_input": "raw_model_probabilities_when_available",
         "source_metrics": _metric_summary(source_metrics),
         "model_metrics": _metric_summary(model_metrics),
     }
     return source_weights, model_weights, diagnostics
+
+
+def _accuracy_model_probabilities(row: ResolvedForecastRow) -> dict[str, float]:
+    return row.raw_model_probabilities or row.model_probabilities
 
 
 def _prediction_report(rows: list[ResolvedForecastRow], source_weights: Mapping[str, float], model_weights: Mapping[str, float]) -> dict[str, Any]:
@@ -367,18 +426,30 @@ def _prediction_report(rows: list[ResolvedForecastRow], source_weights: Mapping[
     recorded = AccuracyMetric()
     default_recomputed = AccuracyMetric()
     calibrated = AccuracyMetric()
+    raw_default_recomputed = AccuracyMetric()
+    raw_calibrated = AccuracyMetric()
+    raw_rows = 0
     for row in rows:
         market.add(row.market_price, row.observed_outcome)
         recorded.add(row.fair_value, row.observed_outcome)
         default_recomputed.add(_weighted_consensus_probability(row.model_probabilities, {}, {}), row.observed_outcome)
         calibrated.add(_weighted_consensus_probability(row.model_probabilities, source_weights, model_weights), row.observed_outcome)
-    return {
+        if row.raw_model_probabilities:
+            raw_rows += 1
+            raw_default_recomputed.add(_weighted_consensus_probability(row.raw_model_probabilities, {}, {}), row.observed_outcome)
+            raw_calibrated.add(_weighted_consensus_probability(row.raw_model_probabilities, source_weights, model_weights), row.observed_outcome)
+    report = {
         "rows": len(rows),
+        "raw_probability_rows": raw_rows,
         "market": _metric_to_json(market),
         "recorded_fair_value": _metric_to_json(recorded),
         "default_recomputed_fair_value": _metric_to_json(default_recomputed),
         "calibrated_fair_value": _metric_to_json(calibrated),
     }
+    if raw_rows:
+        report["raw_default_recomputed_fair_value"] = _metric_to_json(raw_default_recomputed)
+        report["raw_weighted_recomputed_fair_value"] = _metric_to_json(raw_calibrated)
+    return report
 
 
 def _single_entry_kelly_replay(
@@ -698,6 +769,15 @@ def _write_weights(
 ) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    existing_probability_calibration: Optional[Mapping[str, Any]] = None
+    if path.exists():
+        try:
+            existing_payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing_payload = {}
+        existing_calibration = existing_payload.get("probability_calibration") if isinstance(existing_payload, Mapping) else None
+        if isinstance(existing_calibration, Mapping):
+            existing_probability_calibration = existing_calibration
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "train_rows": len(train_rows),
@@ -709,6 +789,8 @@ def _write_weights(
         "model_weights": dict(sorted(model_weights.items())),
         "diagnostics": diagnostics,
     }
+    if existing_probability_calibration is not None:
+        payload["probability_calibration"] = dict(existing_probability_calibration)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 

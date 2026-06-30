@@ -4,7 +4,14 @@ import unittest
 from datetime import date, datetime, timezone
 
 from weather_strategy.cities import DEFAULT_CITIES
-from weather_strategy.forecast import ConsensusForecastEngine, EmpiricalEnsembleModel, ForecastEngine, ForecastSettings, HourlyCurveMaxModel
+from weather_strategy.forecast import (
+    ConsensusForecastEngine,
+    EmpiricalEnsembleModel,
+    ForecastEngine,
+    ForecastSettings,
+    HourlyCurveMaxModel,
+    ProbabilityCalibration,
+)
 from weather_strategy.models import ForecastDistribution, TemperatureBucket
 from weather_strategy.observations import ObservedHigh, ObservedHighClient
 from weather_strategy.weather import extract_daily_temperature_samples
@@ -70,9 +77,80 @@ class ForecastTest(unittest.TestCase):
     def test_historical_single_run_source_weights_are_calibrated_for_long_replay(self) -> None:
         weights = ConsensusForecastEngine().source_weights
 
-        self.assertEqual(weights["single_run_best_match"], 1.50)
-        self.assertEqual(weights["single_run_ecmwf_ifs025"], 1.30)
-        self.assertEqual(weights["single_run_gfs_global"], 0.70)
+        self.assertEqual(weights["single_run_best_match"], 1.02)
+        self.assertEqual(weights["single_run_ecmwf_ifs025"], 1.08)
+        self.assertEqual(weights["single_run_gfs_global"], 0.90)
+
+    def test_probability_calibration_lightly_shrinks_single_binary_bucket(self) -> None:
+        city = DEFAULT_CITIES[0]
+        distribution = ForecastDistribution(
+            city=city,
+            target_date=date(2026, 6, 5),
+            samples_f=(90.0, 91.0, 92.0),
+            generated_at=datetime.now(timezone.utc),
+            source="fixture",
+        )
+        bucket = (TemperatureBucket("80 or above", 80, None),)
+        raw = ConsensusForecastEngine().consensus_by_bucket((distribution,), bucket)["80 or above"]
+        calibrated = ConsensusForecastEngine(
+            probability_calibration=ProbabilityCalibration(center_shrink_alpha=0.95),
+        ).consensus_by_bucket((distribution,), bucket)["80 or above"]
+
+        self.assertLess(calibrated.fair_value, raw.fair_value)
+        self.assertGreater(calibrated.fair_value, 0.90)
+        self.assertLess(
+            calibrated.model_probabilities["fixture.hourly_curve_max"],
+            raw.model_probabilities["fixture.hourly_curve_max"],
+        )
+
+    def test_probability_calibration_shrinks_only_extreme_tails(self) -> None:
+        calibration = ProbabilityCalibration(tail_threshold=0.90, tail_shrink_alpha=0.50)
+
+        self.assertAlmostEqual(calibration.transform(0.98), 0.94)
+        self.assertAlmostEqual(calibration.transform(0.02), 0.06)
+        self.assertAlmostEqual(calibration.transform(0.75), 0.75)
+
+    def test_consensus_preserves_raw_probabilities_before_calibration(self) -> None:
+        city = DEFAULT_CITIES[0]
+        distribution = ForecastDistribution(
+            city=city,
+            target_date=date(2026, 6, 5),
+            samples_f=(90.0, 91.0, 92.0),
+            generated_at=datetime.now(timezone.utc),
+            source="fixture",
+        )
+        bucket = (TemperatureBucket("80 or above", 80, None),)
+        consensus = ConsensusForecastEngine(
+            probability_calibration=ProbabilityCalibration(center_shrink_alpha=0.90),
+        ).consensus_by_bucket((distribution,), bucket)["80 or above"]
+
+        self.assertIsNotNone(consensus.raw_model_probabilities)
+        self.assertIsNotNone(consensus.raw_fair_value)
+        self.assertGreater(consensus.raw_fair_value, consensus.fair_value)
+        self.assertGreater(
+            consensus.raw_model_probabilities["fixture.hourly_curve_max"],
+            consensus.model_probabilities["fixture.hourly_curve_max"],
+        )
+
+    def test_probability_calibration_preserves_multi_bucket_normalization_by_default(self) -> None:
+        city = DEFAULT_CITIES[0]
+        distribution = ForecastDistribution(
+            city=city,
+            target_date=date(2026, 6, 5),
+            samples_f=(78.0, 80.0, 82.0),
+            generated_at=datetime.now(timezone.utc),
+            source="fixture",
+        )
+        buckets = (
+            TemperatureBucket("Under 80", None, 79.99),
+            TemperatureBucket("80-84", 80, 84),
+            TemperatureBucket("85 or above", 85, None),
+        )
+        consensus = ConsensusForecastEngine(
+            probability_calibration=ProbabilityCalibration(center_shrink_alpha=0.95),
+        ).consensus_by_bucket((distribution,), buckets)
+
+        self.assertAlmostEqual(sum(value.fair_value for value in consensus.values()), 1.0)
 
     def test_empirical_singleton_forecast_is_smoothed_not_point_mass(self) -> None:
         city = DEFAULT_CITIES[0]

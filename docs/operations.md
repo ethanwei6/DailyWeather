@@ -1,6 +1,6 @@
 # Operations Runbook
 
-This runbook describes how to operate DailyWeather as a paper-trading system.
+This runbook describes how to operate DailyWeather as a paper-trading system and, only after explicit approval, as a guarded live Polymarket strategy.
 
 ## Test Gate
 
@@ -12,17 +12,17 @@ python3 -m unittest discover -s tests
 
 ## Live Paper Run
 
-The recommended live run is bounded so API issues cannot hang the workflow indefinitely:
+The live run should optimize expected trading performance and market coverage over wall-clock speed. Highest-temperature markets resolve daily, so a run that takes tens of minutes is acceptable if it discovers and scores more real opportunities. Keep `--max-runtime-seconds` as a hang guard, not as a speed target:
 
 ```bash
 python3 -m weather_strategy.cli paper-run \
   --ledger work/data/weather_live_forward_100.sqlite \
   --strategy-profile live-forward-strict-no-tail-0.11-preserve-highconv-bounded-edge-0.10 \
-  --limit 250 \
+  --limit 2000 \
   --discovery-request-limit 50 \
-  --discovery-pages 1 \
-  --max-runtime-seconds 420 \
-  --progress-every 10 \
+  --discovery-pages 20 \
+  --max-runtime-seconds 3600 \
+  --progress-every 25 \
   --same-day-entry-start-hour 11 \
   --same-day-entry-cutoff-hour 17 \
   --weights-file work/data/model_weights.json \
@@ -30,6 +30,59 @@ python3 -m weather_strategy.cli paper-run \
 ```
 
 The named profile applies the Telonex-tested `$100` paper settings: explicit NO-token entries, `75%` fractional Kelly, current-equity compounding, a `25%` current-equity max-position cap with a `$175` absolute cap, `70%` minimum fair value, `100%` model-source agreement for new entries, an `11%` NO counter-event cap at every entry hour, preservation of valid existing holds, partial exits for invalid holds only when FV remains at least `90%` and quote is between `50c` and `65c`, a hold-only high-conviction exception for existing NO positions, and a `10c` minimum edge for bounded exact/range buckets. Use `--strategy-profile live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.10` to compare the stricter `10%` NO-tail profile, `--strategy-profile live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.15` to compare the stricter bounded-edge profile, `--strategy-profile live-forward-strict-no-tail-trim-highconv-bounded-edge-0.15` to compare the lower-exposure trim-to-Kelly hold variant, or `--strategy-profile live-forward-utc12-relaxed-no-tail-0.20-trim-highconv-bounded-edge-0.15` only as the higher-risk relaxed-tail comparison profile.
+
+The current `$50` forward-paper/live-money candidate is performance-first and uses a window-bankroll sizing layer:
+
+```bash
+python3 -m weather_strategy.cli paper-run \
+  --ledger work/data/weather_live_forward_50.sqlite \
+  --strategy-profile live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70 \
+  --limit 2000 \
+  --discovery-request-limit 50 \
+  --discovery-pages 20 \
+  --max-runtime-seconds 3600 \
+  --progress-every 25 \
+  --same-day-entry-start-hour 11 \
+  --same-day-entry-cutoff-hour 17 \
+  --weights-file work/data/model_weights.json \
+  --run-log-dir work/logs/live_forward_paper
+```
+
+It keeps the strict `14%` NO counter-event cap and bounded exact/range bucket confirmation at `98%` model FV and a `70c` market price, but sizes each automation window from `25%` of current sizing equity. The per-position cap is `25%` of that window bankroll, so the bot can spread one global window across more independent city/outcome bets while still allowing the full bankroll to be deployed over a full day if enough opportunities appear. Keep reviewing the `$50` live/paper ledger and generated live-like comparison artifacts for event hit rate, realized PnL, concentration, drawdown, cash exhaustion, and real-data quality out of sample.
+
+## Live Money Run
+
+Live execution is opt-in and fail-closed. It requires:
+
+- `.env.local` with `0600` permissions,
+- `DAILYWEATHER_LIVE_TRADING=1`,
+- funded Polymarket collateral/pUSD in the deposit wallet,
+- CLOB API credentials for the bot signer,
+- `--execution-mode live --confirm-live` on the command line.
+
+For the current `$50` profile, use:
+
+```bash
+.venv-live/bin/python -m weather_strategy.cli paper-run \
+  --ledger work/data/weather_live_money_50.sqlite \
+  --strategy-profile live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70 \
+  --limit 2000 \
+  --discovery-request-limit 50 \
+  --discovery-pages 20 \
+  --max-runtime-seconds 3600 \
+  --progress-every 25 \
+  --same-day-entry-start-hour 11 \
+  --same-day-entry-cutoff-hour 17 \
+  --weights-file work/data/model_weights.json \
+  --run-log-dir work/logs/live_money \
+  --execution-mode live \
+  --confirm-live \
+  --live-env-file .env.local
+```
+
+The live adapter submits FOK CLOB market orders only after the same weather model, timing, signal, and Kelly gates pass. It records successful live fills in the SQLite ledger with CLOB order IDs, transaction hashes, filled shares, filled notional, and average fill price. Failed live orders raise an error before the local ledger records a fill.
+
+Risk caps are read from `.env.local`: `DAILYWEATHER_MAX_BANKROLL_USD`, `DAILYWEATHER_MAX_ORDER_USD`, and `DAILYWEATHER_MAX_DAILY_LOSS_USD`. The active profile does not use a hard cash reserve; instead, each run sizes Kelly from a `25%` automation-window bankroll and caps new exposure to `25%` of current sizing equity. Keep the command on the four global windows used by the live-forward automation: `00:00`, `06:00`, `12:00`, and `18:00` UTC.
 
 ## Reporting
 
@@ -43,6 +96,8 @@ python3 -m weather_strategy.cli report \
 python3 -m weather_strategy.cli calibration \
   --ledger work/data/weather_live_forward_100.sqlite
 ```
+
+For the `$50` candidate, use `work/data/weather_live_forward_50.sqlite` and `--bankroll-usd 50`.
 
 ## Backtest And Model Weights
 
@@ -87,7 +142,7 @@ Each automated cycle writes analysis artifacts:
 - `work/logs/backtests/*.json` contains resolved-row counts, train/test accuracy, learned weights, and Kelly replay diagnostics.
 - `work/logs/live_forward_paper/*.json` contains loaded weights, settings, all scored outcomes, signal-filter counts, skipped-market reason counts, per-city and per-target-date coverage, local lead-day timing, signals, post-run positions, error counts, equity, and PnL.
 - `work/logs/paper_runs/*.json` contains the same paper-run schema when using the default log directory.
-- `work/logs/long_backtests/*.json` contains real historical Gamma/CLOB/Open-Meteo replay artifacts, including a strict `real_data_audit`, data-quality checks, PnL concentration, city/month/hour cohorts, sizing sensitivity, entry-hour-only counterfactuals, fresh-bankroll robustness slices, cap-fraction slices, and strategy recommendation diagnostics.
+- `work/logs/long_backtests/*.json` contains real historical Gamma/CLOB/Open-Meteo replay artifacts, including a strict `real_data_audit`, data-quality checks, PnL concentration, city/month/hour cohorts, sizing sensitivity, entry-hour-only counterfactuals, fresh-bankroll robustness slices, cap-fraction slices, and strategy recommendation diagnostics. Current long replays default to the same `00:00`, `06:00`, `12:00`, and `18:00` UTC cadence as the live automation and record `entry_hours_match_live_forward`.
 
 The automation reports the exact `run_log_path` values after each run. Use those files for performance analysis instead of relying only on the chat summary. Treat `entry_eligible` as timing-only; use `passes_signal_filter` and `signal_filter_reason` when deciding whether a row was tradable.
 
@@ -134,7 +189,7 @@ python3 -m weather_strategy.cli long-backtest \
   --limit-per-page 50 \
   --max-markets 8000 \
   --max-runtime-seconds 180 \
-  --entry-hours-utc 0,12 \
+  --entry-hours-utc 0,6,12,18 \
   --min-lead-days 1 \
   --max-lead-days 2 \
   --max-price-staleness-minutes 90 \
@@ -144,7 +199,32 @@ python3 -m weather_strategy.cli long-backtest \
   --summary-only
 ```
 
-Do not promote a parameter just because headline PnL improves. Check the long-run artifact for `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, weather cross-check status, timestamp-quality diagnostics, selected-candidate calibration, source/model-family calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, exit-management decision value, fresh-bankroll robustness slices, cap-fraction robustness slices, and whether the improvement survives the counterfactual variants. Settlement quality should show that traded tokens are independently weather-checked and matched, not merely Polymarket-only or ambiguous. The current forward-paper candidate is `live-forward-strict-no-tail-0.11-preserve-highconv-bounded-edge-0.10`: it uses an `11%` NO-entry counter-event cap at every entry hour, preserves valid existing holds instead of trimming them to a lower updated Kelly target, partially exits only invalid holds that still have at least `90%` model FV and a `50c` to `65c` quote, only widens existing NO-hold counter-event tolerance to `20%` when FV is at least `98%` and buffered edge is at least `35c`, requires at least `10c` edge for bounded exact/range buckets, and uses a `$175` absolute position cap with the unchanged `25%` current-equity cap. On the saved real Telonex/Open-Meteo replay, removing the UTC-12 relaxed `20%` NO-tail exception improved PnL, event hit rate, drawdown, and concentration across the full sample and every chronological slice. With strict entries, preserving valid holds improved PnL in the full sample, first half, second half, first 70%, last 30%, and every monthly slice while keeping the same trade count and event hit rate versus trim-to-Kelly holds. The promoted partial-exit rule improved broad replay PnL from `+$1,057.01` to `+$1,084.79` and the smaller time-aware artifact from `+$123.43` to `+$130.53`, without changing trade count or event hit rate. Raising the absolute cap from `$100` to `$175` improved broad replay PnL to `+$1,500.63`, left the smaller time-aware artifact unchanged, and kept the same trade count, event hit rate, weather ambiguity count, and max drawdown percentage; it increases absolute drawdown because position size can compound after gains. Lowering the bounded exact/range bucket edge floor from `15c` to `10c` improved the broad replay to `+$1,673.05` with `114` trades and an `85.96%` event hit rate, improved the smaller time-aware artifact to `+$137.42` with `13` trades and a `100%` event hit rate, and was flat on the latest Telonex slice. Moving the NO-entry counter-event cap from `10%` to `11%` improved or matched PnL in all `14` saved real-data artifacts checked, increased or matched trade count in all `14`, and did not increase weather ambiguity; on the broad replay it reached `+$2,074.34` with `128` trades and an `85.16%` event hit rate. Source-level diagnostics currently favor `single_run_ecmwf_ifs025`, but direct ECMWF overweighting and `hourly_curve_max` downweighting reduced end-to-end replay PnL, so do not promote model-weight changes from source Brier alone. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing historical forecast payloads cannot hang the workflow. It is paper-testable with explicit NO-token settlement, but real execution should remain disabled.
+Once a long replay has produced a real-data artifact with `scored_outcomes_detail`, use cached scored-outcome replay for fast strategy sweeps without refetching forecasts, prices, observations, or market metadata:
+
+```bash
+python3 -m weather_strategy.cli replay-scored-outcomes \
+  --source-run-log work/logs/long_backtests/<artifact>-long-backtest.json \
+  --strategy-profiles live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70,live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv95-edge08-stdev03 \
+  --run-log-dir work/logs/scored_replays \
+  --summary-only
+```
+
+The replay command writes one detailed `*-scored-replay.json` artifact per profile under `work/logs/scored_replays/`. The summary output is a compact scorecard; the detailed artifacts keep `executions_detail`, top trades, cached scored rows used for comparison, inherited real-data audit status, and proof that forecasts/prices/observations were not refetched. Use `--strategy-profiles all` to sweep every named preset except `manual`.
+
+New long-backtest and live-forward score rows include both calibrated `model_probabilities` and uncalibrated `raw_model_probabilities`. To test a new probability calibration without refetching weather or prices, replay a raw-aware artifact with:
+
+```bash
+python3 -m weather_strategy.cli replay-scored-outcomes \
+  --source-run-log work/logs/long_backtests/<raw-aware-artifact>-long-backtest.json \
+  --strategy-profile live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv95-edge08-stdev03 \
+  --recompute-from-raw-model-probabilities \
+  --weights-file work/data/model_weights.json \
+  --summary-only
+```
+
+The compact replay summary reports `raw_recalibration.rows_with_raw_model_probabilities` and `raw_recalibration.rows_recomputed`. Older artifacts that predate raw logging will show zero recomputed rows and are still valid for frozen-FV strategy replay, but they cannot validate new probability calibration exactly.
+
+Do not promote a parameter just because headline PnL improves. Use the live-like backtesting flow in `docs/backtesting_engine.md`, then check `real_data_audit.passed`, concentration, weak months/cities, drawdown, settlement-quality diagnostics, timestamp-quality diagnostics, selected-candidate calibration, source/model-family calibration, realized trade hit rate, event hit rate, profitable event-loser trades, unprofitable event-winner trades, exit-management decision value, fresh-bankroll robustness slices, cap-fraction robustness slices, region/side/city splits, and whether the improvement survives direct candidate-profile comparison. Market-blended Kelly sizing is available through `--kelly-market-blend`, but keep it at `0.0` unless future out-of-sample evidence says otherwise. Keep `--max-runtime-seconds` set on live refresh runs so missing forecast payloads cannot hang the workflow.
 
 ## Failure Handling
 

@@ -22,6 +22,46 @@ class SameDayPathSettings:
     adjustment_start_hour_local: float = 11.0
 
 
+@dataclass(frozen=True)
+class ProbabilityCalibration:
+    center_shrink_alpha: float = 1.0
+    high_cap: Optional[float] = None
+    low_floor: Optional[float] = None
+    single_bucket_only: bool = True
+    tail_threshold: Optional[float] = None
+    tail_shrink_alpha: float = 1.0
+
+    @property
+    def active(self) -> bool:
+        return (
+            self.center_shrink_alpha != 1.0
+            or self.high_cap is not None
+            or self.low_floor is not None
+            or (self.tail_threshold is not None and self.tail_shrink_alpha != 1.0)
+        )
+
+    def transform(self, probability: float) -> float:
+        calibrated = 0.5 + self.center_shrink_alpha * (float(probability) - 0.5)
+        calibrated = self._shrink_tail(calibrated)
+        if self.high_cap is not None and calibrated > 0.5:
+            calibrated = min(calibrated, self.high_cap)
+        if self.low_floor is not None and calibrated < 0.5:
+            calibrated = max(calibrated, self.low_floor)
+        return max(0.0, min(1.0, calibrated))
+
+    def _shrink_tail(self, probability: float) -> float:
+        if self.tail_threshold is None or self.tail_shrink_alpha == 1.0:
+            return probability
+        threshold = max(0.5, min(1.0, float(self.tail_threshold)))
+        alpha = max(0.0, min(1.0, float(self.tail_shrink_alpha)))
+        low_threshold = 1.0 - threshold
+        if probability >= threshold:
+            return threshold + alpha * (probability - threshold)
+        if probability <= low_threshold:
+            return low_threshold + alpha * (probability - low_threshold)
+        return probability
+
+
 class ForecastEngine:
     def __init__(self, settings: Optional[ForecastSettings] = None):
         self.settings = settings or ForecastSettings()
@@ -200,6 +240,7 @@ class ConsensusForecastEngine:
         same_day_path: Optional[SameDayPathSettings] = None,
         source_weights: Optional[Mapping[str, float]] = None,
         model_weights: Optional[Mapping[str, float]] = None,
+        probability_calibration: Optional[ProbabilityCalibration] = None,
     ):
         self.models = models or (
             EmpiricalEnsembleModel(),
@@ -220,14 +261,15 @@ class ConsensusForecastEngine:
             "open_meteo_ensemble_gfs_seamless": 1.20,
             "open_meteo_ensemble_gfs025": 1.15,
             "open_meteo_ensemble_ecmwf_ifs025": 1.35,
-            "single_run_best_match": 1.50,
-            "single_run_gfs_global": 0.70,
-            "single_run_ecmwf_ifs025": 1.30,
+            "single_run_best_match": 1.02,
+            "single_run_gfs_global": 0.90,
+            "single_run_ecmwf_ifs025": 1.08,
             "fixture": 1.0,
         }
         if source_weights:
             self.source_weights.update({key: float(value) for key, value in source_weights.items()})
         self.model_weights = {key: float(value) for key, value in (model_weights or {}).items()}
+        self.probability_calibration = probability_calibration or ProbabilityCalibration()
 
     def consensus_by_bucket(
         self,
@@ -247,9 +289,25 @@ class ConsensusForecastEngine:
 
         consensus = {}
         for bucket in buckets:
-            probabilities = model_values[bucket.label]
+            raw_probabilities = {
+                key: max(0.0, min(1.0, float(value)))
+                for key, value in model_values[bucket.label].items()
+            }
+            probabilities = _calibrated_probabilities(
+                raw_probabilities,
+                self.probability_calibration,
+                bucket_count=len(buckets),
+            )
             if not probabilities:
                 continue
+            raw_source_probabilities = _source_probability_views(raw_probabilities, self.model_weights)
+            raw_values = list(raw_source_probabilities.values())
+            raw_weighted_total = 0.0
+            raw_weight_sum = 0.0
+            for source_name, probability in raw_source_probabilities.items():
+                weight = self.source_weights.get(source_name, 1.0)
+                raw_weighted_total += probability * weight
+                raw_weight_sum += weight
             source_probabilities = _source_probability_views(probabilities, self.model_weights)
             values = list(source_probabilities.values())
             weighted_total = 0.0
@@ -264,6 +322,9 @@ class ConsensusForecastEngine:
                 model_probabilities=probabilities,
                 model_count=len(source_probabilities),
                 probability_stdev=statistics.pstdev(values) if len(values) >= 2 else 0.0,
+                raw_fair_value=raw_weighted_total / raw_weight_sum if raw_weight_sum else sum(raw_values) / len(raw_values),
+                raw_model_probabilities=raw_probabilities,
+                raw_probability_stdev=statistics.pstdev(raw_values) if len(raw_values) >= 2 else 0.0,
             )
         return consensus
 
@@ -295,22 +356,24 @@ class ConsensusForecastEngine:
                 for label, value in consensus_values.items()
             }
 
-        model_names = sorted({name for value in consensus_values.values() for name in value.model_probabilities})
-        adjusted_by_label: dict[str, dict[str, float]] = {bucket.label: {} for bucket in buckets}
-        for model_name in model_names:
-            raw = {bucket.label: consensus_values.get(bucket.label).model_probabilities.get(model_name, 0.0) if consensus_values.get(bucket.label) else 0.0 for bucket in buckets}
-            if certain_label is not None:
-                adjusted = {label: 1.0 if label == certain_label else 0.0 for label in raw}
-            else:
-                adjusted = {label: (0.0 if label in impossible_labels else probability) for label, probability in raw.items()}
-                if path_probabilities is not None:
-                    adjusted = _apply_same_day_path_caps(adjusted, buckets, observed_high, path_probabilities)
-                if len(buckets) > 1:
-                    remaining = sum(adjusted.values())
-                    if remaining > 0:
-                        adjusted = {label: probability / remaining for label, probability in adjusted.items()}
-            for label, probability in adjusted.items():
-                adjusted_by_label[label][model_name] = probability
+        adjusted_by_label = self._observed_probability_grid(
+            consensus_values,
+            buckets,
+            observed_high,
+            certain_label,
+            impossible_labels,
+            path_probabilities,
+            raw=False,
+        )
+        raw_adjusted_by_label = self._observed_probability_grid(
+            consensus_values,
+            buckets,
+            observed_high,
+            certain_label,
+            impossible_labels,
+            path_probabilities,
+            raw=True,
+        )
 
         adjusted_consensus = {}
         for bucket in buckets:
@@ -326,18 +389,81 @@ class ConsensusForecastEngine:
                 weight = self.source_weights.get(source_name, 1.0)
                 weighted_total += probability * weight
                 weight_sum += weight
+            raw_probabilities = raw_adjusted_by_label.get(bucket.label) or {}
+            raw_source_probabilities = _source_probability_views(raw_probabilities, self.model_weights)
+            raw_values = list(raw_source_probabilities.values())
+            raw_weighted_total = 0.0
+            raw_weight_sum = 0.0
+            for source_name, probability in raw_source_probabilities.items():
+                weight = self.source_weights.get(source_name, 1.0)
+                raw_weighted_total += probability * weight
+                raw_weight_sum += weight
             adjusted_consensus[bucket.label] = ConsensusValue(
                 bucket_label=bucket.label,
                 fair_value=weighted_total / weight_sum if weight_sum else sum(values) / len(values),
                 model_probabilities=probabilities,
                 model_count=original.model_count if original else len(source_probabilities),
                 probability_stdev=statistics.pstdev(values) if len(values) >= 2 else 0.0,
+                raw_fair_value=(
+                    raw_weighted_total / raw_weight_sum
+                    if raw_weight_sum
+                    else (sum(raw_values) / len(raw_values) if raw_values else None)
+                ),
+                raw_model_probabilities=raw_probabilities or None,
+                raw_probability_stdev=statistics.pstdev(raw_values) if len(raw_values) >= 2 else None,
                 observed_high_f=round(observed_high, 2),
                 observation_source=observed.source,
                 observation_final=observed.is_final,
                 observation_adjusted=True,
             )
         return adjusted_consensus
+
+    def _observed_probability_grid(
+        self,
+        consensus_values: Mapping[str, ConsensusValue],
+        buckets: tuple[TemperatureBucket, ...],
+        observed_high: float,
+        certain_label: Optional[str],
+        impossible_labels: set[str],
+        path_probabilities: Optional[Mapping[str, float]],
+        *,
+        raw: bool,
+    ) -> dict[str, dict[str, float]]:
+        def probabilities_for(value: ConsensusValue) -> Mapping[str, float]:
+            if raw:
+                return value.raw_model_probabilities or value.model_probabilities
+            return value.model_probabilities
+
+        model_names = sorted(
+            {
+                name
+                for value in consensus_values.values()
+                for name in probabilities_for(value)
+            }
+        )
+        adjusted_by_label: dict[str, dict[str, float]] = {bucket.label: {} for bucket in buckets}
+        for model_name in model_names:
+            prior = {
+                bucket.label: (
+                    probabilities_for(consensus_values[bucket.label]).get(model_name, 0.0)
+                    if bucket.label in consensus_values
+                    else 0.0
+                )
+                for bucket in buckets
+            }
+            if certain_label is not None:
+                adjusted = {label: 1.0 if label == certain_label else 0.0 for label in prior}
+            else:
+                adjusted = {label: (0.0 if label in impossible_labels else probability) for label, probability in prior.items()}
+                if path_probabilities is not None:
+                    adjusted = _apply_same_day_path_caps(adjusted, buckets, observed_high, path_probabilities)
+                if len(buckets) > 1:
+                    remaining = sum(adjusted.values())
+                    if remaining > 0:
+                        adjusted = {label: probability / remaining for label, probability in adjusted.items()}
+            for label, probability in adjusted.items():
+                adjusted_by_label[label][model_name] = probability
+        return adjusted_by_label
 
 
 def _normal_interval_probability(mean: float, sigma: float, lower: Optional[float], upper: Optional[float]) -> float:
@@ -446,6 +572,9 @@ def _with_observation(value: ConsensusValue, observed: ObservedHigh, observation
         model_probabilities=value.model_probabilities,
         model_count=value.model_count,
         probability_stdev=value.probability_stdev,
+        raw_fair_value=value.raw_fair_value,
+        raw_model_probabilities=value.raw_model_probabilities,
+        raw_probability_stdev=value.raw_probability_stdev,
         observed_high_f=round(observed.max_temperature_f, 2),
         observation_source=observed.source,
         observation_final=observed.is_final,
@@ -464,6 +593,24 @@ def _source_probability_views(model_probabilities: Mapping[str, float], model_we
         source: _weighted_mean(values, grouped_weights.get(source) or [])
         for source, values in grouped.items()
         if values
+    }
+
+
+def _calibrated_probabilities(
+    probabilities: Mapping[str, float],
+    calibration: ProbabilityCalibration,
+    *,
+    bucket_count: int,
+) -> dict[str, float]:
+    if not probabilities:
+        return {}
+    if not calibration.active:
+        return {key: max(0.0, min(1.0, float(value))) for key, value in probabilities.items()}
+    if calibration.single_bucket_only and bucket_count != 1:
+        return {key: max(0.0, min(1.0, float(value))) for key, value in probabilities.items()}
+    return {
+        key: calibration.transform(float(value))
+        for key, value in probabilities.items()
     }
 
 

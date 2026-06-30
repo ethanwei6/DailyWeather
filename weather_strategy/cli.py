@@ -12,10 +12,26 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from weather_strategy.backtest import load_calibration_weights, run_backtest
+from weather_strategy.backtest import load_calibration_weights, load_probability_calibration, run_backtest
+from weather_strategy.backtest_engine import (
+    CURRENT_LIVE_STRATEGY_PROFILE,
+    DEFAULT_STRATEGY_COMPARISON_PROFILES,
+    compare_strategy_replays,
+    live_like_backtest_dates,
+)
 from weather_strategy.cities import city_with_station_coordinates, find_city
+from weather_strategy.execution import PolymarketLiveExecutionAdapter
 from weather_strategy.forecast import ConsensusForecastEngine
-from weather_strategy.long_backtest import run_long_historical_backtest
+from weather_strategy.live_setup import (
+    LiveSetupError,
+    check_geoblock,
+    clob_readonly_smoke,
+    create_bot_wallet,
+    derive_clob_credentials,
+    live_status,
+)
+from weather_strategy.long_backtest import LIVE_FORWARD_ENTRY_HOURS_UTC, run_cached_scored_outcome_replay, run_long_historical_backtest
+from weather_strategy.model_validation import run_weather_model_validation
 from weather_strategy.models import ForecastDistribution, ScoredOutcome, TradeSignal, WeatherMarket
 from weather_strategy.observations import ObservedHigh, ObservedHighClient
 from weather_strategy.paper import PaperLedger
@@ -43,6 +59,19 @@ STRATEGY_PROFILE_CHOICES = (
     "live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.15",
     "live-forward-strict-no-tail-preserve-highconv-bounded-edge-0.10",
     "live-forward-strict-no-tail-0.11-preserve-highconv-bounded-edge-0.10",
+    "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94",
+    "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94-bounded-confirmed",
+    "live-forward-50-highwin-strict-no-tail-0.12-no-side-max-0.94-bounded-confirmed-cap-0.30",
+    "live-forward-50-highwin-strict-no-tail-0.14-no-side-max-0.94-bounded-confirmed-cap-0.35-bprice-0.70",
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv94-stdev03",
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv95-edge08-stdev03",
+    "live-forward-50-paced-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-paced-0.25-slots-2-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-paced-0.25-slots-4-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.50-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70",
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.20-strict-no-tail-0.14-bprice-0.70",
 )
 
 LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
@@ -75,6 +104,11 @@ LIVE_FORWARD_PROFILE_SETTINGS: dict[str, Any] = {
     "bankroll_usd": 100.0,
     "kelly_fraction": 0.75,
     "compound_kelly_sizing": True,
+    "cash_reserve_fraction": 0.0,
+    "max_new_exposure_fraction_per_run": None,
+    "max_new_exposure_usd_per_run": None,
+    "new_exposure_target_positions_per_run": None,
+    "kelly_sizing_bankroll_fraction_per_run": None,
     "max_position_usd": 175.0,
     "max_position_fraction": 0.25,
     "kelly_market_blend": 0.0,
@@ -149,6 +183,228 @@ STRATEGY_PROFILE_SETTINGS: dict[str, dict[str, Any]] = {
         "hold_no_side_high_conviction_counter_event_probability": 0.20,
         "bounded_bucket_min_edge": 0.10,
     },
+    "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "max_position_usd": 50.0,
+        "no_side_max_counter_event_probability": 0.11,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+    },
+    "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94-bounded-confirmed": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "max_position_usd": 50.0,
+        "no_side_max_counter_event_probability": 0.11,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.75,
+    },
+    "live-forward-50-highwin-strict-no-tail-0.12-no-side-max-0.94-bounded-confirmed-cap-0.30": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.30,
+        "no_side_max_counter_event_probability": 0.12,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.75,
+    },
+    "live-forward-50-highwin-strict-no-tail-0.14-no-side-max-0.94-bounded-confirmed-cap-0.35-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.35,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv94-stdev03": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.04,
+        "bounded_bucket_min_fair_value": 0.94,
+        "bounded_bucket_min_price": 0.70,
+        "bounded_bucket_max_probability_stdev": 0.03,
+    },
+    "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-bounded-fv95-edge08-stdev03": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.08,
+        "bounded_bucket_min_fair_value": 0.95,
+        "bounded_bucket_min_price": 0.70,
+        "bounded_bucket_max_probability_stdev": 0.03,
+    },
+    "live-forward-50-paced-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-paced-0.25-slots-2-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "new_exposure_target_positions_per_run": 2.0,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-paced-0.25-slots-4-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "new_exposure_target_positions_per_run": 4.0,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.50-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "kelly_sizing_bankroll_fraction_per_run": 0.25,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.50,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "kelly_sizing_bankroll_fraction_per_run": 0.25,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.25,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
+    "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.20-strict-no-tail-0.14-bprice-0.70": {
+        **LIVE_FORWARD_PROFILE_SETTINGS,
+        "bankroll_usd": 50.0,
+        "kelly_fraction": 0.50,
+        "cash_reserve_fraction": 0.0,
+        "kelly_sizing_bankroll_fraction_per_run": 0.25,
+        "max_new_exposure_fraction_per_run": 0.25,
+        "max_position_usd": 50.0,
+        "max_position_fraction": 0.20,
+        "no_side_max_counter_event_probability": 0.14,
+        "no_side_max_price": 0.94,
+        "no_side_high_confidence_min_edge": 0.05,
+        "hold_no_side_high_conviction_min_fair_value": 0.98,
+        "hold_no_side_high_conviction_min_edge": 0.35,
+        "hold_no_side_high_conviction_counter_event_probability": 0.20,
+        "bounded_bucket_min_edge": 0.10,
+        "bounded_bucket_min_fair_value": 0.98,
+        "bounded_bucket_min_price": 0.70,
+    },
 }
 
 
@@ -174,6 +430,72 @@ def _apply_strategy_profile(args: argparse.Namespace) -> None:
             setattr(args, key, value)
 
 
+def _add_cached_replay_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--bankroll-usd", type=float, default=100.0)
+    parser.add_argument("--kelly-fraction", type=float, default=0.25)
+    parser.add_argument("--compound-kelly-sizing", action="store_true", help="Size Kelly targets from current replay equity instead of the starting bankroll")
+    parser.add_argument("--cash-reserve-fraction", type=float, default=0.0, help="Accepted for strategy-profile compatibility; cached replay uses the already-scored rows")
+    parser.add_argument("--max-new-exposure-usd-per-run", type=float, default=None, help="Cap total new BUY notional per replay session")
+    parser.add_argument("--max-new-exposure-fraction-per-run", type=float, default=None, help="Cap total new BUY notional per replay session as a fraction of sizing bankroll/equity")
+    parser.add_argument("--new-exposure-target-positions-per-run", type=float, default=None, help="Divide the per-run new-exposure budget across at least this many new position slots")
+    parser.add_argument("--kelly-sizing-bankroll-fraction-per-run", type=float, default=None, help="Use this fraction of sizing bankroll for Kelly target calculations in each replay session")
+    parser.add_argument("--max-position-usd", type=float, default=100.0)
+    parser.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll/equity; the stricter of this and --max-position-usd is used")
+    parser.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
+    parser.add_argument("--edge-position-full-cap-edge", type=float, default=0.25, help="If >0, scale max position by buffered edge; full max-position applies at this edge")
+    parser.add_argument("--edge-position-min-multiplier", type=float, default=0.35, help="Minimum max-position multiplier when edge-scaled sizing is enabled")
+    parser.add_argument("--min-trade-usd", type=float, default=1.0)
+    parser.add_argument("--min-edge", type=float, default=0.08)
+    parser.add_argument("--uncertainty-buffer", type=float, default=0.03)
+    parser.add_argument("--min-model-count", type=int, default=3)
+    parser.add_argument("--min-model-agreement", type=float, default=1.0)
+    parser.add_argument("--hold-min-model-agreement", type=float, default=0.65)
+    parser.add_argument("--hold-min-fair-value", type=float, default=0.60)
+    parser.add_argument("--hold-market-confirmation-price", type=float, default=0.80)
+    parser.add_argument("--hold-market-confirmation-min-fair-value", type=float, default=0.50)
+    parser.add_argument("--trim-valid-holds-to-kelly-target", action="store_true")
+    parser.add_argument("--high-confidence-price-threshold", type=float, default=0.75)
+    parser.add_argument("--high-confidence-min-kelly-edge", type=float, default=0.02)
+    parser.add_argument("--low-price-exact-bucket-threshold", type=float, default=0.20)
+    parser.add_argument("--low-price-exact-bucket-min-fair-value", type=float, default=0.22)
+    parser.add_argument("--low-price-exact-bucket-min-edge", type=float, default=0.08)
+    parser.add_argument("--correlated-exact-bucket-max-price", type=float, default=0.15)
+    parser.add_argument("--correlated-exact-bucket-min-agreement", type=float, default=0.95)
+    parser.add_argument("--exact-bucket-max-width-f", type=float, default=2.25)
+    parser.add_argument("--min-price", type=float, default=0.125)
+    parser.add_argument("--yes-side-min-price", type=float, default=0.20)
+    parser.add_argument("--no-side-max-price", type=float, default=0.95, help="Maximum entry price for NO-token entries; set at or above --max-price to disable the side-specific cap")
+    parser.add_argument("--no-side-max-counter-event-probability", type=float, default=0.10, help="For NO-token entries, reject rows if any model view gives the opposite YES event more than this probability; set >=1 to disable")
+    parser.add_argument("--no-side-relaxed-counter-event-probability", type=float, default=None, help="Optional relaxed NO counter-event cap used only during --no-side-relaxed-counter-event-hours-utc")
+    parser.add_argument("--no-side-relaxed-counter-event-hours-utc", default="", help="Comma-separated UTC hours that may use --no-side-relaxed-counter-event-probability")
+    parser.add_argument("--hold-no-side-max-counter-event-probability", type=float, default=0.15, help="For existing NO-token positions, allow holding while the opposite YES tail is below this probability; set >=1 to disable")
+    parser.add_argument("--hold-no-side-high-conviction-min-fair-value", type=float, default=None, help="Optional FV floor for using the wider high-conviction NO hold counter-event cap")
+    parser.add_argument("--hold-no-side-high-conviction-min-edge", type=float, default=None, help="Optional edge floor for using the wider high-conviction NO hold counter-event cap")
+    parser.add_argument("--hold-no-side-high-conviction-counter-event-probability", type=float, default=None, help="Optional wider NO hold counter-event cap used only for high-conviction existing positions")
+    parser.add_argument("--invalid-hold-partial-exit-fraction", type=float, default=None, help="If set, sell only this fraction of an invalid existing hold when the FV/price partial-exit gate passes")
+    parser.add_argument("--invalid-hold-partial-exit-min-fair-value", type=float, default=0.90)
+    parser.add_argument("--invalid-hold-partial-exit-min-price", type=float, default=0.50)
+    parser.add_argument("--invalid-hold-partial-exit-max-price", type=float, default=0.65)
+    parser.add_argument("--min-signal-fair-value", type=float, default=0.70)
+    parser.add_argument("--allow-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_true", default=True)
+    parser.add_argument("--disable-bounded-bucket-entries", dest="allow_bounded_bucket_entries", action="store_false")
+    parser.add_argument("--allow-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_true", default=True)
+    parser.add_argument("--disable-bounded-no-side-entries", dest="allow_bounded_no_side_entries", action="store_false")
+    parser.add_argument("--bounded-bucket-min-edge", type=float, default=0.10)
+    parser.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
+    parser.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
+    parser.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
+    parser.add_argument("--bounded-bucket-max-probability-stdev", type=float, default=None)
+    parser.add_argument("--max-price", type=float, default=0.95)
+    parser.add_argument("--allow-no-side-entries", action="store_true", help="Evaluate buying real NO-token rows from the cached scored artifact")
+    parser.add_argument("--no-side-min-edge", type=float, default=0.10, help="Minimum absolute buffered edge required for NO-token entries")
+    parser.add_argument("--no-side-high-confidence-min-edge", type=float, default=0.02, help="Minimum absolute buffered edge for NO entries when the NO price is at or above --high-confidence-price-threshold")
+    parser.add_argument("--same-day-entry-start-hour", type=int, default=11)
+    parser.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
+    parser.add_argument("--min-lead-days", type=int, default=1, help="Recorded in settings for profile compatibility; source artifact controls replay timing")
+    parser.add_argument("--max-lead-days", type=int, default=2, help="Recorded in settings for profile compatibility; source artifact controls replay timing")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Weather Polymarket strategy tools")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -194,6 +516,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--bankroll-usd", type=float, default=1000.0)
     paper.add_argument("--kelly-fraction", type=float, default=0.25)
     paper.add_argument("--compound-kelly-sizing", action="store_true", help="Size Kelly targets from current paper equity instead of the starting bankroll")
+    paper.add_argument("--cash-reserve-fraction", type=float, default=0.0, help="Reserve this fraction of starting bankroll as untradeable cash for sizing and live buy caps")
+    paper.add_argument("--max-new-exposure-usd-per-run", type=float, default=None, help="Cap total new BUY notional in one automation run")
+    paper.add_argument("--max-new-exposure-fraction-per-run", type=float, default=None, help="Cap total new BUY notional in one automation run as a fraction of sizing bankroll/equity")
+    paper.add_argument("--new-exposure-target-positions-per-run", type=float, default=None, help="Divide the per-run new-exposure budget across at least this many new position slots")
+    paper.add_argument("--kelly-sizing-bankroll-fraction-per-run", type=float, default=None, help="Use this fraction of sizing bankroll for Kelly target calculations in this automation run")
     paper.add_argument("--max-position-usd", type=float, default=1000.0)
     paper.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll/equity; the stricter of this and --max-position-usd is used")
     paper.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
@@ -241,6 +568,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     paper.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
     paper.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
+    paper.add_argument("--bounded-bucket-max-probability-stdev", type=float, default=None)
     paper.add_argument("--max-price", type=float, default=0.95)
     paper.add_argument("--same-day-entry-start-hour", type=int, default=11)
     paper.add_argument("--same-day-entry-cutoff-hour", type=int, default=17)
@@ -251,6 +579,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     paper.add_argument("--weights-file", default="work/data/model_weights.json")
     paper.add_argument("--run-log-dir", default="work/logs/paper_runs", help="Directory for detailed JSON paper-run logs")
     paper.add_argument("--no-run-log", action="store_true", help="Disable detailed JSON paper-run log output")
+    paper.add_argument("--execution-mode", choices=("paper", "live"), default="paper", help="Default is paper. Live mode sends real CLOB market orders and requires --confirm-live plus DAILYWEATHER_LIVE_TRADING=1")
+    paper.add_argument("--confirm-live", action="store_true", help="Required with --execution-mode live to acknowledge real-money order placement")
+    paper.add_argument("--live-env-file", default=".env.local", help="Gitignored env file containing live Polymarket credentials and risk caps")
 
     live = subparsers.add_parser("scan-live", help="Discover live active weather markets")
     live.add_argument("--limit", type=int, default=50)
@@ -261,6 +592,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     debug.add_argument("--query", default="temperature")
     debug.add_argument("--limit", type=int, default=10)
     debug.add_argument("--page", type=int, default=1)
+
+    live_setup = subparsers.add_parser(
+        "live-setup",
+        help="Prepare and smoke-test local international Polymarket API credentials without placing orders",
+    )
+    live_setup.add_argument("--env-file", default=".env.local")
+    live_setup.add_argument("--create-wallet", action="store_true", help="Create a fresh local bot wallet if PRIVATE_KEY is absent")
+    live_setup.add_argument("--derive-clob-creds", action="store_true", help="Create or derive CLOB API credentials from the local bot key")
+    live_setup.add_argument("--check-geoblock", action="store_true", help="Check Polymarket international geoblock status for this machine")
+    live_setup.add_argument("--clob-readonly-smoke", action="store_true", help="Fetch open orders/trades using CLOB credentials; no orders are sent")
+    live_setup.add_argument("--overwrite", action="store_true", help="Overwrite existing .env.local keys for selected setup steps")
 
     report = subparsers.add_parser("report", help="Summarize paper-trading equity, PnL, and open positions")
     report.add_argument("--ledger", default="work/data/paper_trades.sqlite")
@@ -323,6 +665,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
     backtest.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
+    backtest.add_argument("--bounded-bucket-max-probability-stdev", type=float, default=None)
     backtest.add_argument("--max-price", type=float, default=0.95)
     backtest.add_argument("--train-fraction", type=float, default=0.70)
     backtest.add_argument("--output-weights", default="work/data/model_weights.json")
@@ -340,7 +683,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--limit-per-page", type=int, default=50)
     long_backtest.add_argument("--max-markets", type=int, default=8000)
     long_backtest.add_argument("--query", default="highest temperature")
-    long_backtest.add_argument("--entry-hours-utc", default="0,12", help="Comma-separated simulated run hours in UTC")
+    long_backtest.add_argument("--min-end-date", type=_parse_iso_date, default=None, help="Earliest market end date to include, YYYY-MM-DD")
+    long_backtest.add_argument("--max-end-date", type=_parse_iso_date, default=None, help="Latest market end date to include, YYYY-MM-DD")
+    long_backtest.add_argument(
+        "--market-selection",
+        choices=("end_date_asc", "end_date_desc", "month_balanced"),
+        default="end_date_asc",
+        help="How to choose Telonex markets after filtering and before --max-markets is applied",
+    )
+    long_backtest.add_argument(
+        "--entry-hours-utc",
+        default=",".join(str(hour) for hour in LIVE_FORWARD_ENTRY_HOURS_UTC),
+        help="Comma-separated simulated run hours in UTC; defaults to the live automation cadence",
+    )
     long_backtest.add_argument("--min-lead-days", type=int, default=1)
     long_backtest.add_argument("--max-lead-days", type=int, default=2)
     long_backtest.add_argument("--max-runtime-seconds", type=float, default=0.0)
@@ -356,11 +711,24 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="telonex",
         help="Historical market universe source. Telonex uses the markets dataset with actual quote availability; gamma uses public-search.",
     )
+    long_backtest.add_argument(
+        "--settlement-audit",
+        choices=("weather_crosscheck", "polymarket_only"),
+        default="weather_crosscheck",
+        help=(
+            "weather_crosscheck verifies station observations when available; "
+            "polymarket_only settles from resolved Polymarket payouts and skips slow weather QA."
+        ),
+    )
     long_backtest.add_argument("--max-price-staleness-minutes", type=int, default=90)
     long_backtest.add_argument("--historical-price-slippage", type=float, default=0.01)
     long_backtest.add_argument("--forecast-availability-lag-hours", type=int, default=6)
     long_backtest.add_argument("--kelly-fraction", type=float, default=0.25)
     long_backtest.add_argument("--compound-kelly-sizing", action="store_true", help="Size Kelly targets from current replay equity instead of the starting bankroll")
+    long_backtest.add_argument("--max-new-exposure-usd-per-run", type=float, default=None, help="Cap total new BUY notional per simulated run")
+    long_backtest.add_argument("--max-new-exposure-fraction-per-run", type=float, default=None, help="Cap total new BUY notional per simulated run as a fraction of sizing bankroll/equity")
+    long_backtest.add_argument("--new-exposure-target-positions-per-run", type=float, default=None, help="Divide the per-run new-exposure budget across at least this many new position slots")
+    long_backtest.add_argument("--kelly-sizing-bankroll-fraction-per-run", type=float, default=None, help="Use this fraction of sizing bankroll for Kelly target calculations in each simulated run")
     long_backtest.add_argument("--max-position-usd", type=float, default=100.0)
     long_backtest.add_argument("--max-position-fraction", type=float, default=0.15, help="Optional cap as a fraction of sizing bankroll/equity; the stricter of this and --max-position-usd is used")
     long_backtest.add_argument("--kelly-market-blend", type=float, default=0.0, help="Blend model FV toward market price for Kelly sizing only; 0 keeps raw FV, 1 sizes to zero model edge")
@@ -407,6 +775,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--bounded-bucket-min-fair-value", type=float, default=0.90)
     long_backtest.add_argument("--bounded-bucket-min-model-agreement", type=float, default=1.0)
     long_backtest.add_argument("--bounded-bucket-min-price", type=float, default=0.50)
+    long_backtest.add_argument("--bounded-bucket-max-probability-stdev", type=float, default=None)
     long_backtest.add_argument("--max-price", type=float, default=0.95)
     long_backtest.add_argument(
         "--allow-no-side-entries",
@@ -435,14 +804,113 @@ def main(argv: Optional[list[str]] = None) -> int:
     long_backtest.add_argument("--http-hard-timeout-seconds", type=int, default=30, help="Abort one stalled live API request after N seconds; <=0 disables")
     long_backtest.add_argument("--summary-only", action="store_true", help="Print a compact summary while preserving the full JSON run log")
 
+    replay = subparsers.add_parser(
+        "replay-scored-outcomes",
+        help="Replay one or more strategies from a saved long-backtest scored_outcomes_detail artifact without refetching data",
+    )
+    _add_strategy_profile_argument(replay)
+    replay.add_argument("--source-run-log", required=True, help="Path to a long-backtest JSON artifact containing scored_outcomes_detail")
+    replay.add_argument("--weights-file", default="work/data/model_weights.json", help="Weights/calibration file used when recomputing cached rows from raw model probabilities")
+    replay.add_argument("--recompute-from-raw-model-probabilities", action="store_true", help="If raw_model_probabilities are present, recompute FV/edge/agreement from raw probabilities before replaying")
+    replay.add_argument(
+        "--strategy-profiles",
+        default="",
+        help="Comma-separated profile names to sweep. Use 'all' for every named profile except manual. Defaults to --strategy-profile.",
+    )
+    _add_cached_replay_arguments(replay)
+    replay.add_argument("--run-log-dir", default="work/logs/scored_replays")
+    replay.add_argument("--summary-only", action="store_true", help="Print compact replay summaries while preserving detailed JSON run logs")
+
+    live_like = subparsers.add_parser(
+        "build-live-like-backtest",
+        help="Build a broad Telonex/Open-Meteo historical artifact using the same timing semantics as the live trader",
+    )
+    _add_strategy_profile_argument(live_like)
+    _add_cached_replay_arguments(live_like)
+    live_like.set_defaults(bankroll_usd=50.0, compound_kelly_sizing=True)
+    live_like.add_argument("--lookback-days", type=int, default=365)
+    live_like.add_argument("--min-end-date", type=_parse_iso_date, default=None)
+    live_like.add_argument("--max-end-date", type=_parse_iso_date, default=None)
+    live_like.add_argument("--pages", type=int, default=20)
+    live_like.add_argument("--limit-per-page", type=int, default=50)
+    live_like.add_argument("--max-markets", type=int, default=50000)
+    live_like.add_argument("--query", default="highest temperature")
+    live_like.add_argument(
+        "--market-selection",
+        choices=("end_date_asc", "end_date_desc", "month_balanced"),
+        default="month_balanced",
+    )
+    live_like.add_argument(
+        "--entry-hours-utc",
+        default=",".join(str(hour) for hour in LIVE_FORWARD_ENTRY_HOURS_UTC),
+        help="Comma-separated simulated run hours in UTC; defaults to the live automation cadence",
+    )
+    live_like.add_argument("--max-runtime-seconds", type=float, default=0.0)
+    live_like.add_argument("--max-price-staleness-minutes", type=int, default=90)
+    live_like.add_argument("--historical-price-slippage", type=float, default=0.01)
+    live_like.add_argument("--forecast-availability-lag-hours", type=int, default=6)
+    live_like.add_argument("--min-volume-usd", type=float, default=0.0)
+    live_like.add_argument("--weights-file", default="work/data/model_weights.json")
+    live_like.add_argument("--cache-dir", default="work/cache/live_like_backtest")
+    live_like.add_argument("--run-log-dir", default="work/logs/live_like_backtests")
+    live_like.add_argument("--progress-every", type=int, default=250)
+    live_like.add_argument("--http-hard-timeout-seconds", type=int, default=30)
+    live_like.add_argument("--price-source", choices=("telonex", "clob", "auto"), default="telonex")
+    live_like.add_argument("--market-source", choices=("telonex", "gamma"), default="telonex")
+    live_like.add_argument(
+        "--settlement-audit",
+        choices=("weather_crosscheck", "polymarket_only"),
+        default="polymarket_only",
+        help="Default is polymarket_only so year-scale replay builds are not blocked on station-weather QA.",
+    )
+    live_like.add_argument("--summary-only", action="store_true")
+
+    compare_live_like = subparsers.add_parser(
+        "compare-live-like-strategies",
+        help="Replay current and candidate strategies from a saved live-like scored-outcome artifact and write comparison artifacts",
+    )
+    _add_strategy_profile_argument(compare_live_like)
+    compare_live_like.add_argument("--source-run-log", required=True)
+    compare_live_like.add_argument("--weights-file", default="work/data/model_weights.json")
+    compare_live_like.add_argument("--recompute-from-raw-model-probabilities", action="store_true")
+    compare_live_like.add_argument(
+        "--strategy-profiles",
+        default=",".join(DEFAULT_STRATEGY_COMPARISON_PROFILES),
+        help="Comma-separated profile names. Defaults to current live plus important candidates.",
+    )
+    _add_cached_replay_arguments(compare_live_like)
+    compare_live_like.set_defaults(bankroll_usd=50.0, compound_kelly_sizing=True)
+    compare_live_like.add_argument("--run-log-dir", default="work/logs/live_like_strategy_replays")
+    compare_live_like.add_argument("--output-dir", default="work/reports/live_like_strategy_comparison")
+    compare_live_like.add_argument("--summary-only", action="store_true")
+
+    model_validate = subparsers.add_parser(
+        "model-validate",
+        help="Validate weather-only probabilities against market Brier on a saved scored_outcomes_detail artifact",
+    )
+    model_validate.add_argument("--source-run-log", required=True, help="Path to a long-backtest JSON artifact containing scored_outcomes_detail")
+    model_validate.add_argument("--train-fraction", type=float, default=0.70)
+    model_validate.add_argument(
+        "--probability-key",
+        choices=("auto", "raw_model_probabilities", "model_probabilities"),
+        default="auto",
+        help="Probability map to use. auto prefers raw_model_probabilities when available, then model_probabilities.",
+    )
+    model_validate.add_argument("--run-log-dir", default="work/logs/model_validation")
+    model_validate.add_argument("--max-coordinate-epochs", type=int, default=4)
+    model_validate.add_argument("--summary-only", action="store_true")
+
     args = parser.parse_args(argv)
-    _apply_strategy_profile(args)
+    if hasattr(args, "strategy_profile") and args.command not in ("replay-scored-outcomes", "compare-live-like-strategies"):
+        _apply_strategy_profile(args)
     if args.command == "paper-run":
         return run_paper(args)
     if args.command == "scan-live":
         return run_scan_live(args)
     if args.command == "debug-search":
         return run_debug_search(args)
+    if args.command == "live-setup":
+        return run_live_setup(args)
     if args.command == "report":
         return run_report(args)
     if args.command == "calibration":
@@ -451,6 +919,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return run_backtest_command(args)
     if args.command == "long-backtest":
         return run_long_backtest_command(args)
+    if args.command == "replay-scored-outcomes":
+        return run_replay_scored_outcomes_command(args)
+    if args.command == "build-live-like-backtest":
+        return run_build_live_like_backtest_command(args)
+    if args.command == "compare-live-like-strategies":
+        return run_compare_live_like_strategies_command(args)
+    if args.command == "model-validate":
+        return run_model_validate_command(args)
     raise ValueError(args.command)
 
 
@@ -463,6 +939,30 @@ def run_scan_live(args: argparse.Namespace) -> int:
         output.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps({"markets_found": len(markets), "markets": payload[:10]}, indent=2, sort_keys=True))
     return 0
+
+
+def run_live_setup(args: argparse.Namespace) -> int:
+    result: dict[str, Any] = {}
+    try:
+        if args.create_wallet:
+            result["wallet"] = create_bot_wallet(args.env_file, overwrite=args.overwrite)
+        if args.derive_clob_creds:
+            result["clob_credentials"] = derive_clob_credentials(args.env_file, overwrite=args.overwrite)
+        if args.check_geoblock:
+            result["geoblock"] = check_geoblock()
+        if args.clob_readonly_smoke:
+            result["clob_readonly_smoke"] = clob_readonly_smoke(args.env_file)
+        result["status"] = live_status(args.env_file)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    except LiveSetupError as error:
+        result["error"] = str(error)
+        try:
+            result["status"] = live_status(args.env_file)
+        except Exception:
+            pass
+        print(json.dumps(result, indent=2, sort_keys=True), file=sys.stderr)
+        return 1
 
 
 def run_debug_search(args: argparse.Namespace) -> int:
@@ -541,6 +1041,7 @@ def run_backtest_command(args: argparse.Namespace) -> int:
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
         bounded_bucket_min_price=args.bounded_bucket_min_price,
+        bounded_bucket_max_probability_stdev=args.bounded_bucket_max_probability_stdev,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
         hold_min_fair_value=args.hold_min_fair_value,
@@ -576,8 +1077,8 @@ def run_backtest_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def run_long_backtest_command(args: argparse.Namespace) -> int:
-    settings = SignalSettings(
+def _long_backtest_signal_settings_from_args(args: argparse.Namespace) -> SignalSettings:
+    return SignalSettings(
         min_edge=args.min_edge,
         uncertainty_buffer=args.uncertainty_buffer,
         min_model_count=args.min_model_count,
@@ -599,6 +1100,7 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
         bounded_bucket_min_price=args.bounded_bucket_min_price,
+        bounded_bucket_max_probability_stdev=args.bounded_bucket_max_probability_stdev,
         allow_no_side_entries=args.allow_no_side_entries,
         no_side_min_edge=args.no_side_min_edge,
         no_side_high_confidence_min_edge=args.no_side_high_confidence_min_edge,
@@ -624,12 +1126,19 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         same_day_latest_entry_hour_local=args.same_day_entry_cutoff_hour,
         enforce_entry_timing_filter=True,
     )
+
+
+def run_long_backtest_command(args: argparse.Namespace) -> int:
+    settings = _long_backtest_signal_settings_from_args(args)
     result = run_long_historical_backtest(
         bankroll_usd=args.bankroll_usd,
         pages=args.pages,
         limit_per_page=args.limit_per_page,
         max_markets=args.max_markets,
         query=args.query,
+        min_end_date=args.min_end_date,
+        max_end_date=args.max_end_date,
+        market_selection=args.market_selection,
         entry_hours_utc=_parse_entry_hours(args.entry_hours_utc),
         min_lead_days=args.min_lead_days,
         max_lead_days=args.max_lead_days,
@@ -639,6 +1148,10 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         forecast_availability_lag_hours=args.forecast_availability_lag_hours,
         kelly_fraction=args.kelly_fraction,
         compound_kelly_sizing=args.compound_kelly_sizing,
+        max_new_exposure_usd_per_run=args.max_new_exposure_usd_per_run,
+        max_new_exposure_fraction_per_run=args.max_new_exposure_fraction_per_run,
+        new_exposure_target_positions_per_run=args.new_exposure_target_positions_per_run,
+        kelly_sizing_bankroll_fraction_per_run=args.kelly_sizing_bankroll_fraction_per_run,
         max_position_usd=args.max_position_usd,
         max_position_fraction=args.max_position_fraction,
         kelly_market_blend=args.kelly_market_blend,
@@ -654,10 +1167,184 @@ def run_long_backtest_command(args: argparse.Namespace) -> int:
         http_hard_timeout_seconds=args.http_hard_timeout_seconds,
         price_source=args.price_source,
         market_source=args.market_source,
+        settlement_audit=args.settlement_audit,
         strategy_profile=args.strategy_profile,
     )
     print(json.dumps(_long_backtest_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
     return 0
+
+
+def run_build_live_like_backtest_command(args: argparse.Namespace) -> int:
+    min_end_date, max_end_date = live_like_backtest_dates(
+        lookback_days=args.lookback_days,
+        min_end_date=args.min_end_date,
+        max_end_date=args.max_end_date,
+    )
+    args.min_end_date = min_end_date
+    args.max_end_date = max_end_date
+    result = run_long_historical_backtest(
+        bankroll_usd=args.bankroll_usd,
+        pages=args.pages,
+        limit_per_page=args.limit_per_page,
+        max_markets=args.max_markets,
+        query=args.query,
+        min_end_date=min_end_date,
+        max_end_date=max_end_date,
+        market_selection=args.market_selection,
+        entry_hours_utc=_parse_entry_hours(args.entry_hours_utc),
+        min_lead_days=args.min_lead_days,
+        max_lead_days=args.max_lead_days,
+        max_runtime_seconds=args.max_runtime_seconds,
+        max_price_staleness_minutes=args.max_price_staleness_minutes,
+        historical_price_slippage=args.historical_price_slippage,
+        forecast_availability_lag_hours=args.forecast_availability_lag_hours,
+        kelly_fraction=args.kelly_fraction,
+        compound_kelly_sizing=args.compound_kelly_sizing,
+        max_new_exposure_usd_per_run=args.max_new_exposure_usd_per_run,
+        max_new_exposure_fraction_per_run=args.max_new_exposure_fraction_per_run,
+        new_exposure_target_positions_per_run=args.new_exposure_target_positions_per_run,
+        kelly_sizing_bankroll_fraction_per_run=args.kelly_sizing_bankroll_fraction_per_run,
+        max_position_usd=args.max_position_usd,
+        max_position_fraction=args.max_position_fraction,
+        kelly_market_blend=args.kelly_market_blend,
+        edge_position_full_cap_edge=args.edge_position_full_cap_edge,
+        edge_position_min_multiplier=args.edge_position_min_multiplier,
+        min_trade_usd=args.min_trade_usd,
+        settings=_long_backtest_signal_settings_from_args(args),
+        min_volume_usd=args.min_volume_usd,
+        weights_file=args.weights_file,
+        cache_dir=args.cache_dir,
+        run_log_dir=args.run_log_dir,
+        progress_every=args.progress_every,
+        http_hard_timeout_seconds=args.http_hard_timeout_seconds,
+        price_source=args.price_source,
+        market_source=args.market_source,
+        settlement_audit=args.settlement_audit,
+        strategy_profile=args.strategy_profile,
+    )
+    print(json.dumps(_long_backtest_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
+    return 0
+
+
+def run_replay_scored_outcomes_command(args: argparse.Namespace) -> int:
+    profiles = _replay_strategy_profiles(args.strategy_profiles, args.strategy_profile)
+    results = []
+    for profile in profiles:
+        profile_args = argparse.Namespace(**vars(args))
+        profile_args.strategy_profile = profile
+        _apply_strategy_profile(profile_args)
+        settings = _long_backtest_signal_settings_from_args(profile_args)
+        results.append(
+            run_cached_scored_outcome_replay(
+                snapshot_path=profile_args.source_run_log,
+                settings=settings,
+                strategy_profile=profile,
+                bankroll_usd=profile_args.bankroll_usd,
+                kelly_fraction=profile_args.kelly_fraction,
+                compound_kelly_sizing=profile_args.compound_kelly_sizing,
+                max_new_exposure_usd_per_run=profile_args.max_new_exposure_usd_per_run,
+                max_new_exposure_fraction_per_run=profile_args.max_new_exposure_fraction_per_run,
+                new_exposure_target_positions_per_run=profile_args.new_exposure_target_positions_per_run,
+                kelly_sizing_bankroll_fraction_per_run=profile_args.kelly_sizing_bankroll_fraction_per_run,
+                max_position_usd=profile_args.max_position_usd,
+                max_position_fraction=profile_args.max_position_fraction,
+                kelly_market_blend=profile_args.kelly_market_blend,
+                edge_position_full_cap_edge=profile_args.edge_position_full_cap_edge,
+                edge_position_min_multiplier=profile_args.edge_position_min_multiplier,
+                min_trade_usd=profile_args.min_trade_usd,
+                run_log_dir=profile_args.run_log_dir,
+                recompute_from_raw_model_probabilities=profile_args.recompute_from_raw_model_probabilities,
+                weights_file=profile_args.weights_file,
+            )
+        )
+    if len(results) == 1 and not args.summary_only:
+        print(json.dumps(results[0], indent=2, sort_keys=True))
+        return 0
+    summaries = [_scored_replay_summary(result) for result in results]
+    ranked = sorted(
+        summaries,
+        key=lambda item: (
+            float(item.get("pnl_usd") or 0.0),
+            float(item.get("event_hit_rate") or 0.0),
+            -float(item.get("max_drawdown_usd") or 0.0),
+        ),
+        reverse=True,
+    )
+    output = {
+        "source_run_log": args.source_run_log,
+        "replay_count": len(results),
+        "profiles": summaries,
+        "ranked_profiles": [_scored_replay_rank_row(row) for row in ranked],
+    }
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0
+
+
+def run_compare_live_like_strategies_command(args: argparse.Namespace) -> int:
+    profiles = _replay_strategy_profiles(args.strategy_profiles, args.strategy_profile)
+    results = []
+    for profile in profiles:
+        profile_args = argparse.Namespace(**vars(args))
+        profile_args.strategy_profile = profile
+        _apply_strategy_profile(profile_args)
+        settings = _long_backtest_signal_settings_from_args(profile_args)
+        results.append(
+            run_cached_scored_outcome_replay(
+                snapshot_path=profile_args.source_run_log,
+                settings=settings,
+                strategy_profile=profile,
+                bankroll_usd=profile_args.bankroll_usd,
+                kelly_fraction=profile_args.kelly_fraction,
+                compound_kelly_sizing=profile_args.compound_kelly_sizing,
+                max_new_exposure_usd_per_run=profile_args.max_new_exposure_usd_per_run,
+                max_new_exposure_fraction_per_run=profile_args.max_new_exposure_fraction_per_run,
+                new_exposure_target_positions_per_run=profile_args.new_exposure_target_positions_per_run,
+                kelly_sizing_bankroll_fraction_per_run=profile_args.kelly_sizing_bankroll_fraction_per_run,
+                max_position_usd=profile_args.max_position_usd,
+                max_position_fraction=profile_args.max_position_fraction,
+                kelly_market_blend=profile_args.kelly_market_blend,
+                edge_position_full_cap_edge=profile_args.edge_position_full_cap_edge,
+                edge_position_min_multiplier=profile_args.edge_position_min_multiplier,
+                min_trade_usd=profile_args.min_trade_usd,
+                run_log_dir=profile_args.run_log_dir,
+                recompute_from_raw_model_probabilities=profile_args.recompute_from_raw_model_probabilities,
+                weights_file=profile_args.weights_file,
+            )
+        )
+    report = compare_strategy_replays(
+        results,
+        output_dir=args.output_dir,
+        current_live_strategy_profile=CURRENT_LIVE_STRATEGY_PROFILE,
+        source_run_log=args.source_run_log,
+    )
+    print(json.dumps(report["summary"] if args.summary_only else report, indent=2, sort_keys=True))
+    return 0
+
+
+def run_model_validate_command(args: argparse.Namespace) -> int:
+    result = run_weather_model_validation(
+        source_run_log=args.source_run_log,
+        train_fraction=args.train_fraction,
+        probability_key=args.probability_key,
+        run_log_dir=args.run_log_dir,
+        max_coordinate_epochs=args.max_coordinate_epochs,
+    )
+    print(json.dumps(_model_validation_summary(result) if args.summary_only else result, indent=2, sort_keys=True))
+    return 0
+
+
+def _replay_strategy_profiles(value: str, fallback: str) -> list[str]:
+    raw_profiles = [item.strip() for item in value.split(",") if item.strip()] if value else [fallback]
+    if any(item.lower() == "all" for item in raw_profiles):
+        return [profile for profile in STRATEGY_PROFILE_CHOICES if profile != "manual"]
+    invalid = [profile for profile in raw_profiles if profile not in STRATEGY_PROFILE_CHOICES]
+    if invalid:
+        raise ValueError(f"Unknown strategy profile(s): {', '.join(invalid)}")
+    profiles: list[str] = []
+    for profile in raw_profiles:
+        if profile not in profiles:
+            profiles.append(profile)
+    return profiles
 
 
 def _parse_entry_hours(value: str) -> tuple[int, ...]:
@@ -681,8 +1368,16 @@ def _parse_optional_entry_hours(value: str) -> tuple[int, ...]:
     return _parse_entry_hours(value)
 
 
+def _parse_iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"Expected YYYY-MM-DD date, got {value!r}") from error
+
+
 def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
     keys = (
+        "strategy_profile",
         "bankroll_usd",
         "ending_equity_usd",
         "pnl_usd",
@@ -729,14 +1424,276 @@ def _long_backtest_summary(result: dict[str, Any]) -> dict[str, Any]:
         "score_calibration_diagnostics": result.get("score_calibration_diagnostics"),
         "signal_filter_diagnostics": result.get("signal_filter_diagnostics"),
         "signal_opportunity_diagnostics": result.get("signal_opportunity_diagnostics"),
-        "strategy_sensitivity_diagnostics": result.get("strategy_sensitivity_diagnostics"),
-        "robustness_diagnostics": result.get("robustness_diagnostics"),
-        "strategy_recommendation_diagnostics": result.get("strategy_recommendation_diagnostics"),
+        "strategy_sensitivity_diagnostics": _compact_dict(
+            result.get("strategy_sensitivity_diagnostics"),
+            ("method", "baseline", "recommended_profile", "selected_profile"),
+        ),
+        "robustness_diagnostics": _compact_dict(
+            result.get("robustness_diagnostics"),
+            ("method", "summary", "passed", "warnings"),
+        ),
+        "strategy_recommendation_diagnostics": _compact_dict(
+            result.get("strategy_recommendation_diagnostics"),
+            ("method", "recommended_profile", "recommendation", "warnings"),
+        ),
         "real_data_audit": result.get("real_data_audit"),
-        "top_trades": result.get("top_trades", [])[:10],
-        "top_scored_outcomes": result.get("scored_outcomes_detail", [])[:10],
+        "top_trades": _compact_replay_trade_rows(result.get("top_trades", [])[:10]),
+        "top_scored_outcomes": _compact_scored_rows(result.get("scored_outcomes_detail", [])[:10]),
         "skipped_examples": result.get("skipped_examples", [])[:10],
     }
+
+
+def _scored_replay_summary(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "strategy_profile",
+        "variant",
+        "bankroll_usd",
+        "ending_equity_usd",
+        "pnl_usd",
+        "return_pct",
+        "signals",
+        "trade_count",
+        "executions",
+        "buys",
+        "sells",
+        "settlements",
+        "hit_rate",
+        "event_hit_rate",
+        "event_winning_trades",
+        "event_losing_trades",
+        "buy_notional_usd",
+        "return_on_buy_notional",
+        "min_cash_usd",
+        "min_cash_pct",
+        "max_drawdown_usd",
+        "max_drawdown_pct",
+        "weather_mismatch_trades",
+        "weather_ambiguous_trades",
+        "source_scored_outcomes_detail_count",
+        "source_strategy_profile",
+        "source_session_count",
+        "source_markets_scored",
+        "source_outcomes_scored",
+        "elapsed_seconds",
+        "run_log_path",
+        "run_log_write_error",
+    )
+    audit = result.get("real_data_audit") if isinstance(result.get("real_data_audit"), dict) else {}
+    return {
+        **{key: result.get(key) for key in keys},
+        "source_run_log_path": result.get("source_run_log_path"),
+        "source_settings": _compact_source_replay_settings(result.get("source_settings")),
+        "cache_replay": result.get("cache_replay"),
+        "raw_recalibration": _compact_dict(
+            result.get("raw_recalibration"),
+            ("enabled", "rows_with_raw_model_probabilities", "rows_recomputed", "weights_file"),
+        ),
+        "settings": _compact_replay_settings(result.get("settings")),
+        "performance_diagnostics": _compact_dict(
+            result.get("performance_diagnostics"),
+            (
+                "period_start",
+                "period_end",
+                "period_days",
+                "total_return_pct",
+                "average_monthly_return_pct",
+                "annualized_from_average_monthly_pct",
+                "calendar_daily_sharpe_365",
+                "max_drawdown_usd",
+                "max_drawdown_pct",
+            ),
+        ),
+        "real_data_audit": {
+            "passed": audit.get("passed"),
+            "source_real_data_audit_passed": audit.get("source_real_data_audit_passed"),
+            "replay_weather_mismatch_trades": audit.get("replay_weather_mismatch_trades"),
+            "replay_weather_ambiguous_trades": audit.get("replay_weather_ambiguous_trades"),
+        },
+        "selected_candidate_weather_validation": _compact_dict(
+            result.get("selected_candidate_weather_validation"),
+            ("selected_candidate_count", "weather_mismatch_count", "weather_ambiguous_count", "passed"),
+        ),
+        "trade_diagnostics": _compact_dict(
+            result.get("trade_diagnostics"),
+            ("trade_count", "realized_trade_count", "winning_trades", "hit_rate", "event_hit_rate", "pnl_concentration"),
+        ),
+        "score_calibration_diagnostics": _compact_calibration(result.get("score_calibration_diagnostics")),
+        "top_trades": _compact_replay_trade_rows(result.get("top_trades", [])[:3]),
+        "top_scored_outcomes": _compact_scored_rows(result.get("top_scored_outcomes", [])[:3]),
+    }
+
+
+def _model_validation_summary(result: dict[str, Any]) -> dict[str, Any]:
+    metrics = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
+
+    def brier_row(name: str) -> dict[str, Any]:
+        predictor_metrics = metrics.get(name) if isinstance(metrics.get(name), dict) else {}
+        return {
+            "train_all": _compact_dict(predictor_metrics.get("train_all"), ("n", "avg_prediction", "actual_rate", "brier", "log_loss")),
+            "test_all": _compact_dict(predictor_metrics.get("test_all"), ("n", "avg_prediction", "actual_rate", "brier", "log_loss")),
+            "test_signal": _compact_dict(predictor_metrics.get("test_signal"), ("n", "avg_prediction", "actual_rate", "brier", "log_loss")),
+            "test_high_recorded_fv": _compact_dict(
+                predictor_metrics.get("test_high_recorded_fv"),
+                ("n", "avg_prediction", "actual_rate", "brier", "log_loss"),
+            ),
+        }
+
+    fitted = result.get("fitted_weather_only_weights") if isinstance(result.get("fitted_weather_only_weights"), dict) else {}
+    return {
+        "source_run_log": result.get("source_run_log"),
+        "run_log_path": result.get("run_log_path"),
+        "rows": result.get("rows"),
+        "train_rows": result.get("train_rows"),
+        "test_rows": result.get("test_rows"),
+        "range": result.get("range"),
+        "probability_key": result.get("probability_key"),
+        "selected_weather_only_candidate": result.get("selected_weather_only_candidate"),
+        "best_weather_by_slice": result.get("best_weather_by_slice"),
+        "beats_market_brier": result.get("beats_market_brier"),
+        "recorded_fair_value": brier_row("recorded_fair_value"),
+        "weighted_weather_ensemble": brier_row("weighted_weather_ensemble"),
+        "weighted_tail_calibrated_weather_ensemble": brier_row("weighted_tail_calibrated_weather_ensemble"),
+        "market_price": brier_row("market_price"),
+        "fitted_weather_only_weights": {
+            "source_weights": fitted.get("source_weights"),
+            "model_family_weights": fitted.get("model_family_weights"),
+            "tail_calibration": fitted.get("tail_calibration"),
+        },
+        "interpretation": result.get("interpretation"),
+    }
+
+
+def _scored_replay_rank_row(result: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "strategy_profile",
+        "ending_equity_usd",
+        "pnl_usd",
+        "return_pct",
+        "trade_count",
+        "event_hit_rate",
+        "hit_rate",
+        "max_drawdown_usd",
+        "min_cash_pct",
+        "buy_notional_usd",
+        "return_on_buy_notional",
+        "weather_mismatch_trades",
+        "weather_ambiguous_trades",
+        "run_log_path",
+    )
+    return {key: result.get(key) for key in keys}
+
+
+def _compact_source_replay_settings(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in (
+            "entry_hours_utc",
+            "entry_hours_match_live_forward",
+            "min_lead_days",
+            "max_lead_days",
+            "price_source",
+            "market_source",
+        )
+        if key in value
+    }
+
+
+def _compact_replay_settings(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    keys = (
+        "compound_kelly_sizing",
+        "max_new_exposure_usd_per_run",
+        "max_new_exposure_fraction_per_run",
+        "new_exposure_target_positions_per_run",
+        "kelly_sizing_bankroll_fraction_per_run",
+        "max_position_usd",
+        "max_position_fraction",
+        "kelly_market_blend",
+        "edge_position_full_cap_edge",
+        "edge_position_min_multiplier",
+        "min_price",
+        "yes_side_min_price",
+        "min_signal_fair_value",
+        "min_model_agreement",
+        "allow_no_side_entries",
+        "no_side_min_edge",
+        "no_side_high_confidence_min_edge",
+        "no_side_max_price",
+        "no_side_max_counter_event_probability",
+        "bounded_bucket_min_edge",
+        "bounded_bucket_min_fair_value",
+        "bounded_bucket_min_price",
+        "bounded_bucket_max_probability_stdev",
+        "invalid_hold_partial_exit_fraction",
+    )
+    return {key: value.get(key) for key in keys if key in value}
+
+
+def _compact_dict(value: Any, keys: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {key: value.get(key) for key in keys if key in value}
+
+
+def _compact_calibration(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        "resolved_count": value.get("resolved_count"),
+        "signal_eligible_count": value.get("signal_eligible_count"),
+        "overall": _compact_dict(
+            value.get("overall"),
+            ("n", "avg_market_price", "avg_fair_value", "actual_rate", "brier_fair_value", "brier_market"),
+        ),
+        "signal_eligible": _compact_dict(
+            value.get("signal_eligible"),
+            ("n", "avg_market_price", "avg_fair_value", "actual_rate", "brier_fair_value", "brier_market"),
+        ),
+    }
+
+
+def _compact_replay_trade_rows(rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    keys = (
+        "token_id",
+        "question",
+        "city",
+        "target_date",
+        "side",
+        "price",
+        "notional_usd",
+        "realized_pnl_usd",
+        "fair_value",
+        "edge",
+        "polymarket_payout",
+        "weather_outcome",
+    )
+    return [{key: row.get(key) for key in keys if isinstance(row, dict) and key in row} for row in rows]
+
+
+def _compact_scored_rows(rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        return []
+    keys = (
+        "generated_at",
+        "token_id",
+        "question",
+        "city",
+        "target_date",
+        "side",
+        "market_price",
+        "fair_value",
+        "edge",
+        "model_agreement",
+        "signal_filter_reason",
+        "polymarket_payout",
+        "weather_outcome",
+    )
+    return [{key: row.get(key) for key in keys if isinstance(row, dict) and key in row} for row in rows]
 
 
 def run_paper(args: argparse.Namespace) -> int:
@@ -744,10 +1701,33 @@ def run_paper(args: argparse.Namespace) -> int:
     run_started_at = datetime.now(timezone.utc)
     deadline = None if args.max_runtime_seconds <= 0 else started + args.max_runtime_seconds
     fixture_mode = bool(args.fixture)
+    execution_mode = getattr(args, "execution_mode", "paper")
+    if execution_mode == "live":
+        if fixture_mode:
+            raise RuntimeError("Live execution cannot run from fixtures")
+        if not getattr(args, "confirm_live", False):
+            raise RuntimeError("--confirm-live is required for --execution-mode live")
     ledger = PaperLedger(args.ledger)
-    source_weights, model_weights = load_calibration_weights(args.weights_file if not fixture_mode else None)
-    run_log_path = None if args.no_run_log else _make_run_log_path(args.run_log_dir, "paper-run")
-    forecast_engine = ConsensusForecastEngine(source_weights=source_weights, model_weights=model_weights)
+    live_executor = None
+    live_collateral_start = None
+    cash_reserve_fraction = max(0.0, min(1.0, float(getattr(args, "cash_reserve_fraction", 0.0) or 0.0)))
+    cash_reserve_usd = round(float(args.bankroll_usd) * cash_reserve_fraction, 2)
+    if execution_mode == "live":
+        live_executor = PolymarketLiveExecutionAdapter(
+            getattr(args, "live_env_file", ".env.local"),
+            min_collateral_reserve_usd=cash_reserve_usd,
+        )
+        live_collateral_start = live_executor.collateral_balance_usd()
+    weights_file = args.weights_file if not fixture_mode else None
+    source_weights, model_weights = load_calibration_weights(weights_file)
+    probability_calibration = load_probability_calibration(weights_file)
+    run_log_prefix = "live-run" if execution_mode == "live" else "paper-run"
+    run_log_path = None if args.no_run_log else _make_run_log_path(args.run_log_dir, run_log_prefix)
+    forecast_engine = ConsensusForecastEngine(
+        source_weights=source_weights,
+        model_weights=model_weights,
+        probability_calibration=probability_calibration,
+    )
     weather_client = OpenMeteoClient()
     observation_client = ObservedHighClient()
     clob_client = PolymarketClobClient()
@@ -808,6 +1788,7 @@ def run_paper(args: argparse.Namespace) -> int:
         bounded_bucket_min_fair_value=args.bounded_bucket_min_fair_value,
         bounded_bucket_min_model_agreement=args.bounded_bucket_min_model_agreement,
         bounded_bucket_min_price=args.bounded_bucket_min_price,
+        bounded_bucket_max_probability_stdev=args.bounded_bucket_max_probability_stdev,
         max_price=args.max_price,
         hold_min_model_agreement=args.hold_min_model_agreement,
         hold_min_fair_value=args.hold_min_fair_value,
@@ -903,13 +1884,18 @@ def run_paper(args: argparse.Namespace) -> int:
     coverage_diagnostics = _paper_coverage_diagnostics(all_scored, markets_to_process, skipped_markets)
 
     score_rows = ledger.record_forecast_scores(all_scored)
-    sizing_bankroll_usd = round(ledger.equity_usd(args.bankroll_usd), 2) if args.compound_kelly_sizing else args.bankroll_usd
+    gross_sizing_bankroll_usd = round(ledger.equity_usd(args.bankroll_usd), 2) if args.compound_kelly_sizing else args.bankroll_usd
+    sizing_bankroll_usd = max(0.0, round(gross_sizing_bankroll_usd - cash_reserve_usd, 2))
     executions = ledger.rebalance_kelly(
         all_scored,
         bankroll_usd=sizing_bankroll_usd,
         kelly_fraction=args.kelly_fraction,
         max_position_usd=args.max_position_usd,
         max_position_fraction=args.max_position_fraction,
+        max_new_exposure_usd_per_run=args.max_new_exposure_usd_per_run,
+        max_new_exposure_fraction_per_run=args.max_new_exposure_fraction_per_run,
+        new_exposure_target_positions_per_run=args.new_exposure_target_positions_per_run,
+        kelly_sizing_bankroll_fraction_per_run=args.kelly_sizing_bankroll_fraction_per_run,
         kelly_market_blend=args.kelly_market_blend,
         edge_position_full_cap_edge=args.edge_position_full_cap_edge,
         edge_position_min_multiplier=args.edge_position_min_multiplier,
@@ -922,6 +1908,25 @@ def run_paper(args: argparse.Namespace) -> int:
         min_price=signal_settings.min_price,
         max_price=signal_settings.max_price,
         settings=signal_settings,
+        execution_callback=_live_execution_callback(live_executor) if live_executor is not None else None,
+    )
+    max_new_exposure_budget_usd = _new_exposure_budget_usd(
+        sizing_bankroll_usd,
+        args.max_new_exposure_usd_per_run,
+        args.max_new_exposure_fraction_per_run,
+    )
+    max_new_exposure_per_position_budget_usd = _new_exposure_per_position_budget_usd(
+        max_new_exposure_budget_usd,
+        args.new_exposure_target_positions_per_run,
+    )
+    kelly_sizing_bankroll_usd = _kelly_sizing_bankroll_usd(
+        sizing_bankroll_usd,
+        args.kelly_sizing_bankroll_fraction_per_run,
+    )
+    live_collateral_end = _live_collateral_balance_after_executions(
+        live_executor,
+        executions=executions,
+        starting_balance=live_collateral_start,
     )
     rows = ledger.record_signals(
         all_signals,
@@ -933,7 +1938,7 @@ def run_paper(args: argparse.Namespace) -> int:
             "processed_market_count": processed_markets,
             "skipped_market_count": len(skipped_markets),
             "model_consensus": True,
-            "weights_file": args.weights_file if source_weights or model_weights else None,
+            "weights_file": args.weights_file if source_weights or model_weights or probability_calibration.active else None,
         },
     )
     equity = ledger.record_run(
@@ -953,19 +1958,33 @@ def run_paper(args: argparse.Namespace) -> int:
             "settlement_error_count": settlement_error_count,
             "runtime_limited": runtime_limited,
             "elapsed_seconds": round(time.monotonic() - started, 2),
-            "weights_file": args.weights_file if source_weights or model_weights else None,
+            "weights_file": args.weights_file if source_weights or model_weights or probability_calibration.active else None,
             "strategy_profile": args.strategy_profile,
             "compound_kelly_sizing": args.compound_kelly_sizing,
+            "gross_sizing_bankroll_usd": gross_sizing_bankroll_usd,
             "sizing_bankroll_usd": sizing_bankroll_usd,
+            "cash_reserve_fraction": cash_reserve_fraction,
+            "cash_reserve_usd": cash_reserve_usd,
+            "max_new_exposure_usd_per_run": args.max_new_exposure_usd_per_run,
+            "max_new_exposure_fraction_per_run": args.max_new_exposure_fraction_per_run,
+            "max_new_exposure_budget_usd": max_new_exposure_budget_usd,
+            "new_exposure_target_positions_per_run": args.new_exposure_target_positions_per_run,
+            "max_new_exposure_per_position_budget_usd": max_new_exposure_per_position_budget_usd,
+            "kelly_sizing_bankroll_fraction_per_run": args.kelly_sizing_bankroll_fraction_per_run,
+            "kelly_sizing_bankroll_usd": kelly_sizing_bankroll_usd,
             "max_position_fraction": args.max_position_fraction,
             "kelly_market_blend": args.kelly_market_blend,
             "edge_position_full_cap_edge": args.edge_position_full_cap_edge,
             "edge_position_min_multiplier": args.edge_position_min_multiplier,
             "run_log_path": str(run_log_path) if run_log_path is not None else None,
+            "execution_mode": execution_mode,
+            "live_collateral_start_usd": round(live_collateral_start, 6) if live_collateral_start is not None else None,
+            "live_collateral_end_usd": round(live_collateral_end, 6) if live_collateral_end is not None else None,
         },
     )
     summary = {
         "fixture_mode": fixture_mode,
+        "execution_mode": execution_mode,
         "run_started_at": run_started_at.isoformat(),
         "run_finished_at": datetime.now(timezone.utc).isoformat(),
         "markets_discovered": len(markets),
@@ -990,15 +2009,28 @@ def run_paper(args: argparse.Namespace) -> int:
         "open_positions": len(ledger.positions()),
         "ledger": args.ledger,
         "strategy_profile": args.strategy_profile,
-        "weights_file": args.weights_file if source_weights or model_weights else None,
+        "weights_file": args.weights_file if source_weights or model_weights or probability_calibration.active else None,
         "source_weights_loaded": len(source_weights),
         "model_weights_loaded": len(model_weights),
+        "probability_calibration": _probability_calibration_to_json(probability_calibration),
         "compound_kelly_sizing": args.compound_kelly_sizing,
+        "gross_sizing_bankroll_usd": gross_sizing_bankroll_usd,
         "max_position_fraction": args.max_position_fraction,
+        "cash_reserve_fraction": cash_reserve_fraction,
+        "cash_reserve_usd": cash_reserve_usd,
+        "max_new_exposure_usd_per_run": args.max_new_exposure_usd_per_run,
+        "max_new_exposure_fraction_per_run": args.max_new_exposure_fraction_per_run,
+        "max_new_exposure_budget_usd": max_new_exposure_budget_usd,
+        "new_exposure_target_positions_per_run": args.new_exposure_target_positions_per_run,
+        "max_new_exposure_per_position_budget_usd": max_new_exposure_per_position_budget_usd,
+        "kelly_sizing_bankroll_fraction_per_run": args.kelly_sizing_bankroll_fraction_per_run,
+        "kelly_sizing_bankroll_usd": kelly_sizing_bankroll_usd,
         "kelly_market_blend": args.kelly_market_blend,
         "edge_position_full_cap_edge": args.edge_position_full_cap_edge,
         "edge_position_min_multiplier": args.edge_position_min_multiplier,
         "run_log_path": str(run_log_path) if run_log_path is not None else None,
+        "live_collateral_start_usd": round(live_collateral_start, 6) if live_collateral_start is not None else None,
+        "live_collateral_end_usd": round(live_collateral_end, 6) if live_collateral_end is not None else None,
         "top_signals": [_signal_to_json(signal) for signal in all_signals[:10]],
         "top_scored_outcomes": scored_detail[:10],
         "signal_filter_counts": signal_filter_counts,
@@ -1018,10 +2050,11 @@ def run_paper(args: argparse.Namespace) -> int:
                     "polymarket_quote_source": "CLOB live order book midpoint for YES and explicit NO tokens",
                     "forecast_source": "Open-Meteo live forecast APIs via weather_strategy.weather.OpenMeteoClient",
                     "observation_source": "ObservedHighClient current/final observations when enabled",
-                    "execution_mode": "paper-only Kelly ledger; no real orders are sent",
+                    "execution_mode": "live CLOB market orders" if execution_mode == "live" else "paper-only Kelly ledger; no real orders are sent",
                 },
                 "source_weights": {key: round(value, 6) for key, value in sorted(source_weights.items())},
                 "model_weights": {key: round(value, 6) for key, value in sorted(model_weights.items())},
+                "probability_calibration": _probability_calibration_to_json(probability_calibration),
                 "signals_detail": [_signal_to_json(signal) for signal in all_signals],
                 "scored_outcomes_detail": scored_detail,
                 "skipped_markets_detail": skipped_markets,
@@ -1032,6 +2065,42 @@ def run_paper(args: argparse.Namespace) -> int:
         )
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
+
+
+def _live_execution_callback(live_executor: PolymarketLiveExecutionAdapter):
+    def execute(order: dict[str, Any]) -> dict[str, Any]:
+        result = live_executor.execute_rebalance_order(order)
+        return {
+            "filled_shares": result.filled_shares,
+            "filled_notional_usd": result.filled_notional_usd,
+            "average_price": result.average_price,
+            "metadata": result.to_metadata(),
+        }
+
+    return execute
+
+
+def _live_collateral_balance_after_executions(
+    live_executor: Optional[PolymarketLiveExecutionAdapter],
+    *,
+    executions: int,
+    starting_balance: Optional[float],
+    poll_delay_seconds: float = 2.0,
+) -> Optional[float]:
+    if live_executor is None:
+        return None
+    balance = live_executor.collateral_balance_usd()
+    if executions <= 0 or starting_balance is None:
+        return balance
+    if abs(balance - starting_balance) > 1e-6:
+        return balance
+    for _ in range(3):
+        if poll_delay_seconds > 0:
+            time.sleep(poll_delay_seconds)
+        balance = live_executor.collateral_balance_usd()
+        if abs(balance - starting_balance) > 1e-6:
+            break
+    return balance
 
 
 def _make_run_log_path(log_dir: str, prefix: str) -> Path:
@@ -1141,6 +2210,7 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
         "bounded_bucket_min_fair_value": settings.bounded_bucket_min_fair_value,
         "bounded_bucket_min_model_agreement": settings.bounded_bucket_min_model_agreement,
         "bounded_bucket_min_price": settings.bounded_bucket_min_price,
+        "bounded_bucket_max_probability_stdev": settings.bounded_bucket_max_probability_stdev,
         "allow_no_side_entries": settings.allow_no_side_entries,
         "no_side_min_edge": settings.no_side_min_edge,
         "no_side_high_confidence_min_edge": settings.no_side_high_confidence_min_edge,
@@ -1177,12 +2247,59 @@ def _signal_settings_to_json(settings: SignalSettings) -> dict[str, Any]:
     }
 
 
+def _probability_calibration_to_json(calibration: Any) -> dict[str, Any]:
+    return {
+        "active": bool(getattr(calibration, "active", False)),
+        "center_shrink_alpha": getattr(calibration, "center_shrink_alpha", 1.0),
+        "high_cap": getattr(calibration, "high_cap", None),
+        "low_floor": getattr(calibration, "low_floor", None),
+        "single_bucket_only": getattr(calibration, "single_bucket_only", True),
+        "tail_threshold": getattr(calibration, "tail_threshold", None),
+        "tail_shrink_alpha": getattr(calibration, "tail_shrink_alpha", 1.0),
+    }
+
+
 def _paper_args_to_json(args: argparse.Namespace) -> dict[str, Any]:
     return {
         key: _json_default(value) if isinstance(value, Path) else value
         for key, value in sorted(vars(args).items())
         if key != "command"
     }
+
+
+def _new_exposure_budget_usd(
+    sizing_bankroll_usd: float,
+    max_new_exposure_usd_per_run: Optional[float],
+    max_new_exposure_fraction_per_run: Optional[float],
+) -> Optional[float]:
+    caps: list[float] = []
+    if max_new_exposure_usd_per_run is not None and max_new_exposure_usd_per_run > 0:
+        caps.append(float(max_new_exposure_usd_per_run))
+    if max_new_exposure_fraction_per_run is not None and max_new_exposure_fraction_per_run > 0:
+        caps.append(max(0.0, float(sizing_bankroll_usd) * float(max_new_exposure_fraction_per_run)))
+    if not caps:
+        return None
+    return round(max(0.0, min(caps)), 4)
+
+
+def _new_exposure_per_position_budget_usd(
+    max_new_exposure_budget_usd: Optional[float],
+    target_positions_per_run: Optional[float],
+) -> Optional[float]:
+    if max_new_exposure_budget_usd is None:
+        return None
+    if target_positions_per_run is None or target_positions_per_run <= 0:
+        return None
+    return round(max_new_exposure_budget_usd / float(target_positions_per_run), 4)
+
+
+def _kelly_sizing_bankroll_usd(
+    sizing_bankroll_usd: float,
+    fraction_per_run: Optional[float],
+) -> float:
+    if fraction_per_run is None or fraction_per_run <= 0:
+        return round(max(0.0, sizing_bankroll_usd), 4)
+    return round(max(0.0, sizing_bankroll_usd * float(fraction_per_run)), 4)
 
 
 def _deadline_exceeded(deadline: Optional[float]) -> bool:
@@ -1418,11 +2535,13 @@ def _scored_to_json(outcome, settings: Optional[SignalSettings] = None) -> dict[
         "resolution_unit": outcome.resolution_unit,
         "resolution_precision": outcome.resolution_precision,
         "fair_value_probability": outcome.fair_value,
+        "raw_fair_value_probability": outcome.raw_fair_value,
         "market_probability": outcome.market_price,
         "edge_after_buffer": outcome.edge,
         "model_agreement": outcome.model_agreement,
         "model_count": outcome.model_count,
         "probability_stdev": outcome.probability_stdev,
+        "raw_probability_stdev": outcome.raw_probability_stdev,
         "timing_entry_eligible": outcome.entry_eligible,
         "entry_eligible": outcome.entry_eligible,
         "entry_filter_reason": outcome.entry_filter_reason,
@@ -1438,6 +2557,10 @@ def _scored_to_json(outcome, settings: Optional[SignalSettings] = None) -> dict[
         "model_probabilities": {
             key: round(value, 4)
             for key, value in sorted(outcome.model_probabilities.items())
+        },
+        "raw_model_probabilities": {
+            key: round(value, 4)
+            for key, value in sorted((outcome.raw_model_probabilities or {}).items())
         },
     }
 

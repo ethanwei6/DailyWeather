@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 from weather_strategy.models import ConsensusValue, ScoredOutcome
 from weather_strategy.models import OrderBookQuote
+from weather_strategy.execution import _cap_live_buy_order, _parse_live_order_response
 from weather_strategy.observations import ObservedHigh
 from weather_strategy.paper import PaperLedger
 from weather_strategy.parser import parse_weather_market
@@ -199,6 +201,381 @@ class TradingLayersTest(unittest.TestCase):
             positions = ledger.positions()
             self.assertEqual(len(positions), 1)
             self.assertGreater(positions[0]["shares"], 0)
+
+    def test_kelly_rebalance_caps_new_exposure_per_run(self) -> None:
+        scored = [
+            ScoredOutcome(
+                market_id="m1",
+                market_slug="market-one",
+                question="Will the highest temperature in Tokyo be 35°C or higher on July 1?",
+                bucket_label="35°C or higher",
+                token_id="tok-1",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.50,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Tokyo",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+            ScoredOutcome(
+                market_id="m2",
+                market_slug="market-two",
+                question="Will the highest temperature in Singapore be 34°C or higher on July 1?",
+                bucket_label="34°C or higher",
+                token_id="tok-2",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.49,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Singapore",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(
+                scored,
+                bankroll_usd=100,
+                kelly_fraction=1.0,
+                max_position_usd=100,
+                max_new_exposure_fraction_per_run=0.25,
+                min_trade_usd=1,
+                settings=settings,
+            )
+
+            positions = ledger.positions()
+            self.assertEqual(executions, 1)
+            self.assertEqual(len(positions), 1)
+            self.assertLessEqual(sum(float(position["cost_basis"]) for position in positions), 25.0)
+
+    def test_kelly_rebalance_divides_new_exposure_across_position_slots(self) -> None:
+        scored = [
+            ScoredOutcome(
+                market_id="m1",
+                market_slug="market-one",
+                question="Will the highest temperature in Tokyo be 35°C or higher on July 1?",
+                bucket_label="35°C or higher",
+                token_id="tok-1",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.50,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Tokyo",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+            ScoredOutcome(
+                market_id="m2",
+                market_slug="market-two",
+                question="Will the highest temperature in Singapore be 34°C or higher on July 1?",
+                bucket_label="34°C or higher",
+                token_id="tok-2",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.49,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Singapore",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(
+                scored,
+                bankroll_usd=100,
+                kelly_fraction=1.0,
+                max_position_usd=100,
+                max_new_exposure_fraction_per_run=0.25,
+                new_exposure_target_positions_per_run=4,
+                min_trade_usd=1,
+                settings=settings,
+            )
+
+            positions = ledger.positions()
+            self.assertEqual(executions, 2)
+            self.assertEqual(len(positions), 2)
+            self.assertLessEqual(max(float(position["cost_basis"]) for position in positions), 6.25)
+            self.assertEqual(sum(float(position["cost_basis"]) for position in positions), 12.5)
+
+    def test_kelly_rebalance_can_size_from_automation_window_bankroll(self) -> None:
+        scored = [
+            ScoredOutcome(
+                market_id="m1",
+                market_slug="market-one",
+                question="Will the highest temperature in Tokyo be 35°C or higher on July 1?",
+                bucket_label="35°C or higher",
+                token_id="tok-1",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.50,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Tokyo",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+            ScoredOutcome(
+                market_id="m2",
+                market_slug="market-two",
+                question="Will the highest temperature in Singapore be 34°C or higher on July 1?",
+                bucket_label="34°C or higher",
+                token_id="tok-2",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.49,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=datetime(2026, 6, 30, 0, 0, tzinfo=timezone.utc),
+                city="Singapore",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(
+                scored,
+                bankroll_usd=100,
+                kelly_fraction=1.0,
+                max_position_usd=100,
+                max_position_fraction=0.50,
+                max_new_exposure_fraction_per_run=0.25,
+                kelly_sizing_bankroll_fraction_per_run=0.25,
+                min_trade_usd=1,
+                settings=settings,
+            )
+
+            positions = ledger.positions()
+            self.assertEqual(executions, 2)
+            self.assertEqual(len(positions), 2)
+            self.assertEqual(sum(float(position["cost_basis"]) for position in positions), 25.0)
+            self.assertEqual(max(float(position["cost_basis"]) for position in positions), 12.5)
+
+    def test_kelly_rebalance_records_live_callback_fill(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in New York City be 80°F or above on June 5?",
+                "slug": "highest-temperature-new-york-june-5-80-or-above",
+                "description": "Official weather station.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.30", "0.70"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        consensus = {
+            market.buckets[0].label: ConsensusValue(
+                bucket_label=market.buckets[0].label,
+                fair_value=0.70,
+                model_probabilities={"a": 0.68, "b": 0.72, "c": 0.75},
+                model_count=3,
+                probability_stdev=0.02,
+            )
+        }
+        scored = score_outcomes(market, consensus, settings=SignalSettings(min_edge=0.05, uncertainty_buffer=0.01, enforce_entry_timing_filter=False))
+
+        def fake_live_executor(order):
+            self.assertEqual(order["action"], "BUY")
+            return {
+                "filled_shares": 3.0,
+                "filled_notional_usd": 1.05,
+                "average_price": 0.35,
+                "metadata": {"execution_mode": "live", "order_id": "order-1"},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            executions = ledger.rebalance_kelly(
+                scored,
+                bankroll_usd=1000,
+                kelly_fraction=0.25,
+                max_position_usd=50,
+                execution_callback=fake_live_executor,
+            )
+            self.assertEqual(executions, 1)
+            positions = ledger.positions()
+            self.assertEqual(positions[0]["shares"], 3.0)
+            self.assertEqual(positions[0]["cost_basis"], 1.05)
+            import sqlite3
+
+            with sqlite3.connect(str(ledger.path)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute("SELECT * FROM paper_executions").fetchone()
+            self.assertEqual(float(row["price"]), 0.35)
+            metadata = json.loads(row["metadata_json"])
+            self.assertEqual(metadata["execution_mode"], "live")
+            self.assertEqual(metadata["order_id"], "order-1")
+
+    def test_live_rebalance_commits_successful_fill_before_later_live_failure(self) -> None:
+        first = ScoredOutcome(
+            market_id="m1",
+            market_slug="market-one",
+            question="Will the highest temperature in Taipei be 37°C on July 1?",
+            bucket_label="NO: Will the highest temperature in Taipei be 37°C on July 1?",
+            token_id="tok-live-1",
+            fair_value=0.99,
+            market_price=0.80,
+            edge=0.19,
+            model_count=3,
+            model_agreement=1.0,
+            probability_stdev=0.01,
+            generated_at=datetime(2026, 6, 30, tzinfo=timezone.utc),
+            city="Taipei, TW",
+            target_date=date(2026, 7, 1),
+            rule_excerpt="test",
+            model_probabilities={"a": 0.99, "b": 0.98, "c": 0.99},
+        )
+        second = replace(
+            first,
+            market_id="m2",
+            market_slug="market-two",
+            question="Will the highest temperature in Seoul be 26°C on July 1?",
+            bucket_label="NO: Will the highest temperature in Seoul be 26°C on July 1?",
+            token_id="tok-live-2",
+            city="Seoul, KR",
+        )
+        calls = []
+
+        def flaky_live_executor(order):
+            calls.append(order)
+            if order["token_id"] == "tok-live-2":
+                raise RuntimeError("simulated live cap failure")
+            return {
+                "filled_shares": 2.0,
+                "filled_notional_usd": 1.60,
+                "average_price": 0.80,
+                "metadata": {"execution_mode": "live", "order_id": "order-1"},
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = PaperLedger(Path(directory) / "paper.sqlite")
+            with self.assertRaisesRegex(RuntimeError, "simulated live cap failure"):
+                ledger.rebalance_kelly(
+                    [first, second],
+                    bankroll_usd=1000,
+                    kelly_fraction=0.25,
+                    max_position_usd=50,
+                    execution_callback=flaky_live_executor,
+                )
+            self.assertEqual([call["token_id"] for call in calls], ["tok-live-1", "tok-live-2"])
+            positions = ledger.positions()
+            self.assertEqual(len(positions), 1)
+            self.assertEqual(positions[0]["token_id"], "tok-live-1")
+            self.assertEqual(positions[0]["shares"], 2.0)
+            import sqlite3
+
+            with sqlite3.connect(str(ledger.path)) as conn:
+                execution_count = conn.execute("SELECT COUNT(*) FROM paper_executions").fetchone()[0]
+            self.assertEqual(execution_count, 1)
+
+    def test_live_order_response_parses_buy_and_sell_fills(self) -> None:
+        buy = _parse_live_order_response(
+            "BUY",
+            "tok",
+            1.0,
+            10.0,
+            {"success": True, "status": "matched", "orderID": "buy", "makingAmount": "1.00", "takingAmount": "4.00", "transactionsHashes": ["0x1"]},
+        )
+        self.assertEqual(buy.filled_notional_usd, 1.0)
+        self.assertEqual(buy.filled_shares, 4.0)
+        self.assertEqual(buy.average_price, 0.25)
+        sell = _parse_live_order_response(
+            "SELL",
+            "tok",
+            1.0,
+            4.0,
+            {"success": True, "status": "matched", "orderID": "sell", "makingAmount": "4.00", "takingAmount": "0.80", "transactionsHashes": ["0x2"]},
+        )
+        self.assertEqual(sell.filled_shares, 4.0)
+        self.assertEqual(sell.filled_notional_usd, 0.8)
+        self.assertEqual(sell.average_price, 0.2)
+
+    def test_live_buy_order_is_downsized_to_safety_caps(self) -> None:
+        notional, shares, metadata = _cap_live_buy_order(
+            "BUY",
+            16.0,
+            20.0,
+            max_order_usd=15.0,
+            max_bankroll_usd=50.0,
+            balance_usd=17.0,
+        )
+        self.assertEqual(notional, 15.0)
+        self.assertAlmostEqual(shares, 18.75)
+        assert metadata is not None
+        self.assertTrue(metadata["downsized_to_safety_cap"])
+        self.assertEqual(metadata["original_requested_notional_usd"], 16.0)
+        self.assertEqual(metadata["capped_requested_notional_usd"], 15.0)
+
+    def test_live_buy_order_respects_collateral_reserve(self) -> None:
+        notional, shares, metadata = _cap_live_buy_order(
+            "BUY",
+            12.0,
+            24.0,
+            max_order_usd=15.0,
+            max_bankroll_usd=50.0,
+            balance_usd=20.0,
+            min_collateral_reserve_usd=12.5,
+        )
+
+        self.assertEqual(notional, 7.5)
+        self.assertEqual(shares, 15.0)
+        assert metadata is not None
+        self.assertEqual(metadata["collateral_balance_usd"], 20.0)
+        self.assertEqual(metadata["min_collateral_reserve_usd"], 12.5)
+        self.assertEqual(metadata["available_after_reserve_usd"], 7.5)
 
     def test_kelly_rebalance_applies_fractional_position_cap(self) -> None:
         market = parse_weather_market(
@@ -994,6 +1371,51 @@ class TradingLayersTest(unittest.TestCase):
 
         self.assertEqual(signals_from_scored_outcomes(scored, settings), [])
         self.assertEqual("bounded exact/range bucket price below 0.5", signal_filter_reason(scored[0], settings))
+
+    def test_bounded_temperature_bucket_can_require_low_model_dispersion(self) -> None:
+        market = parse_weather_market(
+            {
+                "id": "123",
+                "question": "Will the highest temperature in London be 31°C on June 5?",
+                "slug": "highest-temperature-london-june-5-31c",
+                "description": "Resolved to the nearest whole degree Celsius.",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["tok3", "tok-no"]',
+                "outcomePrices": '["0.80", "0.20"]',
+            },
+            today=date(2026, 6, 4),
+        )
+        assert market is not None
+        settings = SignalSettings(
+            min_edge=0.02,
+            uncertainty_buffer=0.01,
+            min_signal_fair_value=0.70,
+            allow_bounded_bucket_entries=True,
+            bounded_bucket_min_edge=0.04,
+            bounded_bucket_min_fair_value=0.94,
+            bounded_bucket_min_model_agreement=1.0,
+            bounded_bucket_min_price=0.70,
+            bounded_bucket_max_probability_stdev=0.03,
+            enforce_entry_timing_filter=False,
+        )
+        consensus = {
+            market.buckets[0].label: ConsensusValue(
+                bucket_label=market.buckets[0].label,
+                fair_value=0.96,
+                model_probabilities={"source_a.model": 0.94, "source_b.model": 0.96, "source_c.model": 0.98},
+                model_count=3,
+                probability_stdev=0.02,
+            )
+        }
+
+        scored = score_outcomes(market, consensus, settings=settings)
+
+        self.assertIsNone(signal_filter_reason(scored[0], settings))
+        high_dispersion = replace(scored[0], probability_stdev=0.08)
+        self.assertEqual(
+            signal_filter_reason(high_dispersion, settings),
+            "bounded exact/range bucket model dispersion above 0.03",
+        )
 
     def test_correlated_exact_temperature_bucket_rejects_full_source_agreement(self) -> None:
         market = parse_weather_market(

@@ -5,7 +5,7 @@ import math
 import sqlite3
 from pathlib import Path
 from datetime import date, datetime, timezone
-from typing import Iterable, Optional, Union
+from typing import Any, Callable, Iterable, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from weather_strategy.cities import find_city
@@ -95,11 +95,13 @@ CREATE TABLE IF NOT EXISTS forecast_scores (
     bucket_label TEXT NOT NULL,
     token_id TEXT,
     fair_value REAL NOT NULL,
+    raw_fair_value REAL,
     market_price REAL NOT NULL,
     edge REAL NOT NULL,
     model_count INTEGER NOT NULL,
     model_agreement REAL NOT NULL,
     probability_stdev REAL NOT NULL,
+    raw_probability_stdev REAL,
     entry_eligible INTEGER NOT NULL,
     entry_filter_reason TEXT,
     observed_high_f REAL,
@@ -107,7 +109,8 @@ CREATE TABLE IF NOT EXISTS forecast_scores (
     observation_final INTEGER NOT NULL DEFAULT 0,
     observation_adjusted INTEGER NOT NULL DEFAULT 0,
     observed_outcome INTEGER,
-    model_probabilities_json TEXT NOT NULL DEFAULT '{}'
+    model_probabilities_json TEXT NOT NULL DEFAULT '{}',
+    raw_model_probabilities_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_forecast_scores_market ON forecast_scores(market_id, bucket_label);
 CREATE INDEX IF NOT EXISTS idx_forecast_scores_target ON forecast_scores(city, target_date);
@@ -169,12 +172,12 @@ class PaperLedger:
                     """
                     INSERT INTO forecast_scores (
                         generated_at, market_id, market_slug, question, city, target_date,
-                        bucket_label, token_id, fair_value, market_price, edge,
-                        model_count, model_agreement, probability_stdev, entry_eligible,
+                        bucket_label, token_id, fair_value, raw_fair_value, market_price, edge,
+                        model_count, model_agreement, probability_stdev, raw_probability_stdev, entry_eligible,
                         entry_filter_reason, observed_high_f, observation_source,
                         observation_final, observation_adjusted, observed_outcome,
-                        model_probabilities_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        model_probabilities_json, raw_model_probabilities_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         outcome.generated_at.isoformat(),
@@ -186,11 +189,13 @@ class PaperLedger:
                         outcome.bucket_label,
                         outcome.token_id,
                         outcome.fair_value,
+                        outcome.raw_fair_value,
                         outcome.market_price,
                         outcome.edge,
                         outcome.model_count,
                         outcome.model_agreement,
                         outcome.probability_stdev,
+                        outcome.raw_probability_stdev,
                         1 if outcome.entry_eligible else 0,
                         outcome.entry_filter_reason,
                         outcome.observed_high_f,
@@ -199,6 +204,7 @@ class PaperLedger:
                         1 if outcome.observation_adjusted else 0,
                         outcome.observed_outcome,
                         json.dumps(outcome.model_probabilities, sort_keys=True),
+                        json.dumps(outcome.raw_model_probabilities or {}, sort_keys=True),
                     ),
                 )
                 rows += 1
@@ -261,7 +267,12 @@ class PaperLedger:
         hold_no_side_max_counter_event_probability: float = 0.15,
         min_signal_fair_value: float = 0.70,
         max_price: float = 0.95,
+        max_new_exposure_usd_per_run: Optional[float] = None,
+        max_new_exposure_fraction_per_run: Optional[float] = None,
+        new_exposure_target_positions_per_run: Optional[float] = None,
+        kelly_sizing_bankroll_fraction_per_run: Optional[float] = None,
         settings: Optional[SignalSettings] = None,
+        execution_callback: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     ) -> int:
         scored = [outcome for outcome in scored_outcomes if outcome.token_id]
         settings = settings or SignalSettings(
@@ -280,6 +291,16 @@ class PaperLedger:
         )
         selected_entry_tokens = self._selected_entry_tokens(scored, settings)
         executions = 0
+        live_execution = execution_callback is not None
+        buy_budget_remaining = _new_exposure_budget_usd(
+            bankroll_usd,
+            max_new_exposure_usd_per_run,
+            max_new_exposure_fraction_per_run,
+        )
+        per_buy_budget = _new_exposure_per_buy_budget_usd(
+            buy_budget_remaining,
+            new_exposure_target_positions_per_run,
+        )
         with sqlite3.connect(str(self.path)) as conn:
             conn.row_factory = sqlite3.Row
             for outcome in scored:
@@ -290,9 +311,13 @@ class PaperLedger:
                 hold_eligible = current_shares > 0 and self._is_hold_eligible(outcome, settings)
                 target_notional = 0.0
                 if outcome.token_id in selected_entry_tokens:
+                    target_sizing_bankroll = _kelly_sizing_bankroll_usd(
+                        bankroll_usd,
+                        kelly_sizing_bankroll_fraction_per_run,
+                    )
                     target_notional = self._kelly_target_notional(
                         outcome,
-                        bankroll_usd,
+                        target_sizing_bankroll,
                         kelly_fraction,
                         max_position_usd,
                         max_position_fraction,
@@ -312,18 +337,65 @@ class PaperLedger:
                 if target_notional <= 0 and current_shares > 0 and abs(delta_notional) >= current_notional - 1e-9:
                     self._sell(conn, outcome, current, current_shares)
                     executions += 1
+                    if live_execution:
+                        conn.commit()
                     continue
                 if abs(delta_notional) < min_trade_usd:
                     self._mark_position(conn, outcome, current)
                     continue
                 if delta_notional > 0:
+                    if buy_budget_remaining is not None:
+                        delta_notional = min(delta_notional, buy_budget_remaining)
+                    if per_buy_budget is not None:
+                        delta_notional = min(delta_notional, per_buy_budget)
+                    if buy_budget_remaining is not None or per_buy_budget is not None:
+                        if delta_notional < min_trade_usd:
+                            self._mark_position(conn, outcome, current)
+                            continue
                     shares = delta_notional / outcome.market_price
-                    self._buy(conn, outcome, shares)
+                    fill = _execute_live_callback(
+                        execution_callback,
+                        outcome,
+                        action="BUY",
+                        shares=shares,
+                        price=outcome.market_price,
+                        notional=delta_notional,
+                    )
+                    self._buy(
+                        conn,
+                        outcome,
+                        fill["shares"],
+                        price=fill["price"],
+                        notional=fill["notional"],
+                        metadata=fill["metadata"],
+                    )
+                    if buy_budget_remaining is not None:
+                        buy_budget_remaining = max(0.0, buy_budget_remaining - fill["notional"])
                     executions += 1
+                    if live_execution:
+                        conn.commit()
                 elif current_shares > 0:
                     shares = min(current_shares, abs(delta_notional) / outcome.market_price)
-                    self._sell(conn, outcome, current, shares)
+                    fill = _execute_live_callback(
+                        execution_callback,
+                        outcome,
+                        action="SELL",
+                        shares=shares,
+                        price=outcome.market_price,
+                        notional=shares * outcome.market_price,
+                    )
+                    self._sell(
+                        conn,
+                        outcome,
+                        current,
+                        fill["shares"],
+                        price=fill["price"],
+                        notional=fill["notional"],
+                        metadata=fill["metadata"],
+                    )
                     executions += 1
+                    if live_execution:
+                        conn.commit()
         return executions
 
     def record_run(self, bankroll_usd: float, markets_scored: int, outcomes_scored: int, signals: int, executions: int, metadata: Optional[dict] = None) -> float:
@@ -477,31 +549,52 @@ class PaperLedger:
                 selected[group_key] = outcome
         return {outcome.token_id for outcome in selected.values() if outcome.token_id}
 
-    def _buy(self, conn: sqlite3.Connection, outcome: ScoredOutcome, shares: float) -> None:
+    def _buy(
+        self,
+        conn: sqlite3.Connection,
+        outcome: ScoredOutcome,
+        shares: float,
+        *,
+        price: Optional[float] = None,
+        notional: Optional[float] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         current = conn.execute("SELECT * FROM paper_positions WHERE token_id = ?", (outcome.token_id,)).fetchone()
-        notional = shares * outcome.market_price
+        execution_price = outcome.market_price if price is None else price
+        execution_notional = shares * execution_price if notional is None else notional
         if current:
             new_shares = float(current["shares"]) + shares
-            new_cost = float(current["cost_basis"]) + notional
+            new_cost = float(current["cost_basis"]) + execution_notional
         else:
             new_shares = shares
-            new_cost = notional
+            new_cost = execution_notional
         self._upsert_position(conn, outcome, new_shares, new_cost)
-        self._record_execution(conn, outcome, "BUY", shares, outcome.market_price, notional, 0.0, "kelly target increase")
+        self._record_execution(conn, outcome, "BUY", shares, execution_price, execution_notional, 0.0, "kelly target increase", metadata=metadata)
 
-    def _sell(self, conn: sqlite3.Connection, outcome: ScoredOutcome, current: sqlite3.Row, shares: float) -> None:
+    def _sell(
+        self,
+        conn: sqlite3.Connection,
+        outcome: ScoredOutcome,
+        current: sqlite3.Row,
+        shares: float,
+        *,
+        price: Optional[float] = None,
+        notional: Optional[float] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
         current_shares = float(current["shares"])
         current_cost = float(current["cost_basis"])
         cost_reduction = current_cost * (shares / current_shares) if current_shares else 0.0
-        notional = shares * outcome.market_price
-        realized_pnl = notional - cost_reduction
+        execution_price = outcome.market_price if price is None else price
+        execution_notional = shares * execution_price if notional is None else notional
+        realized_pnl = execution_notional - cost_reduction
         remaining_shares = current_shares - shares
         remaining_cost = current_cost - cost_reduction
         if remaining_shares <= 1e-9:
             conn.execute("DELETE FROM paper_positions WHERE token_id = ?", (outcome.token_id,))
         else:
             self._upsert_position(conn, outcome, remaining_shares, remaining_cost)
-        self._record_execution(conn, outcome, "SELL", shares, outcome.market_price, notional, realized_pnl, "kelly target reduction")
+        self._record_execution(conn, outcome, "SELL", shares, execution_price, execution_notional, realized_pnl, "kelly target reduction", metadata=metadata)
 
     def _mark_position(self, conn: sqlite3.Connection, outcome: ScoredOutcome, current: Optional[sqlite3.Row]) -> None:
         if current:
@@ -566,6 +659,7 @@ class PaperLedger:
         notional: float,
         realized_pnl: float,
         reason: str,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         conn.execute(
             """
@@ -586,13 +680,16 @@ class PaperLedger:
                 notional,
                 realized_pnl,
                 reason,
-                json.dumps({"fair_value": outcome.fair_value, "edge": outcome.edge}, sort_keys=True),
+                json.dumps({"fair_value": outcome.fair_value, "edge": outcome.edge, **(metadata or {})}, sort_keys=True),
             ),
         )
 
     def _initialize(self) -> None:
         with sqlite3.connect(str(self.path)) as conn:
             conn.executescript(SCHEMA)
+            _ensure_column(conn, "forecast_scores", "raw_fair_value", "REAL")
+            _ensure_column(conn, "forecast_scores", "raw_probability_stdev", "REAL")
+            _ensure_column(conn, "forecast_scores", "raw_model_probabilities_json", "TEXT NOT NULL DEFAULT '{}'")
 
 
 def _log_loss(probability: float, outcome: int) -> float:
@@ -600,6 +697,48 @@ def _log_loss(probability: float, outcome: int) -> float:
     if outcome:
         return -math.log(probability)
     return -math.log(1 - probability)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _execute_live_callback(
+    execution_callback: Optional[Callable[[dict[str, Any]], dict[str, Any]]],
+    outcome: ScoredOutcome,
+    *,
+    action: str,
+    shares: float,
+    price: float,
+    notional: float,
+) -> dict[str, Any]:
+    if execution_callback is None:
+        return {"shares": shares, "price": price, "notional": notional, "metadata": {}}
+    payload = {
+        "action": action,
+        "token_id": outcome.token_id,
+        "market_id": outcome.market_id,
+        "market_slug": outcome.market_slug,
+        "question": outcome.question,
+        "bucket_label": outcome.bucket_label,
+        "shares": shares,
+        "price": price,
+        "notional_usd": notional,
+        "fair_value": outcome.fair_value,
+        "edge": outcome.edge,
+    }
+    result = execution_callback(payload)
+    filled_shares = float(result.get("filled_shares", shares))
+    filled_notional = float(result.get("filled_notional_usd", notional))
+    filled_price = float(result.get("average_price", filled_notional / filled_shares if filled_shares else price))
+    return {
+        "shares": filled_shares,
+        "price": filled_price,
+        "notional": filled_notional,
+        "metadata": dict(result.get("metadata") or {}),
+    }
 
 
 def _effective_max_position_usd(
@@ -616,6 +755,41 @@ def _effective_max_position_usd(
         caps.append(max(0.0, bankroll_usd * max_position_fraction))
     base_cap = min(caps)
     return _edge_scaled_position_cap(base_cap, edge, edge_position_full_cap_edge, edge_position_min_multiplier)
+
+
+def _new_exposure_budget_usd(
+    bankroll_usd: float,
+    max_new_exposure_usd_per_run: Optional[float],
+    max_new_exposure_fraction_per_run: Optional[float],
+) -> Optional[float]:
+    caps = []
+    if max_new_exposure_usd_per_run is not None and max_new_exposure_usd_per_run > 0:
+        caps.append(float(max_new_exposure_usd_per_run))
+    if max_new_exposure_fraction_per_run is not None and max_new_exposure_fraction_per_run > 0:
+        caps.append(max(0.0, float(bankroll_usd) * float(max_new_exposure_fraction_per_run)))
+    if not caps:
+        return None
+    return max(0.0, min(caps))
+
+
+def _new_exposure_per_buy_budget_usd(
+    run_budget_usd: Optional[float],
+    target_positions_per_run: Optional[float],
+) -> Optional[float]:
+    if run_budget_usd is None:
+        return None
+    if target_positions_per_run is None or target_positions_per_run <= 0:
+        return None
+    return max(0.0, run_budget_usd / float(target_positions_per_run))
+
+
+def _kelly_sizing_bankroll_usd(
+    bankroll_usd: float,
+    fraction_per_run: Optional[float],
+) -> float:
+    if fraction_per_run is None or fraction_per_run <= 0:
+        return bankroll_usd
+    return max(0.0, bankroll_usd * float(fraction_per_run))
 
 
 def _edge_scaled_position_cap(

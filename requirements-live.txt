@@ -1,0 +1,6 @@
+eth-account
+polars>=1.0.0
+py-clob-client-v2==1.0.1
+py-builder-relayer-client==0.0.2
+python-dotenv
+requests

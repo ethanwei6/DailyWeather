@@ -8,8 +8,9 @@ from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
-from weather_strategy.cli import _apply_strategy_profile, _make_run_log_path, _parse_markets, main
+from weather_strategy.cli import _apply_strategy_profile, _live_collateral_balance_after_executions, _long_backtest_summary, _make_run_log_path, _parse_markets, main
 from weather_strategy.cli import _should_process_market
 from weather_strategy.paper import PaperLedger
 from weather_strategy.parser import parse_weather_market
@@ -219,6 +220,402 @@ class CliTest(unittest.TestCase):
         self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
         self.assertEqual(args.bounded_bucket_min_edge, 0.10)
 
+    def test_strategy_profile_can_use_50_highwin_no_side_max_094_settings(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            max_position_usd=175.0,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            no_side_relaxed_counter_event_probability=0.20,
+            no_side_relaxed_counter_event_hours_utc="12",
+            trim_valid_holds_to_kelly_target=True,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.11)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertIsNone(args.no_side_relaxed_counter_event_probability)
+        self.assertEqual(args.no_side_relaxed_counter_event_hours_utc, "")
+        self.assertFalse(args.trim_valid_holds_to_kelly_target)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+
+    def test_strategy_profile_can_require_confirmed_bounded_buckets_for_50_highwin(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94-bounded-confirmed",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            max_position_usd=175.0,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.11)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.75)
+
+    def test_strategy_profile_can_use_50_highwin_012_tail_cap_030_position_cap(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-highwin-strict-no-tail-0.12-no-side-max-0.94-bounded-confirmed-cap-0.30",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.25,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.max_position_fraction, 0.30)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.12)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.75)
+
+    def test_strategy_profile_can_use_50_highwin_014_tail_cap_035_bprice_070(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-highwin-strict-no-tail-0.14-no-side-max-0.94-bounded-confirmed-cap-0.35-bprice-0.70",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.25,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.max_position_fraction, 0.35)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.hold_no_side_high_conviction_min_fair_value, 0.98)
+        self.assertEqual(args.hold_no_side_high_conviction_min_edge, 0.35)
+        self.assertEqual(args.hold_no_side_high_conviction_counter_event_probability, 0.20)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+
+    def test_strategy_profile_can_use_50_reserved_live_money_sizing(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.25)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.max_position_fraction, 0.20)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+
+    def test_strategy_profile_can_pace_new_exposure_across_global_runs(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-paced-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.25,
+            max_new_exposure_fraction_per_run=None,
+            max_new_exposure_usd_per_run=None,
+            new_exposure_target_positions_per_run=None,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.0)
+        self.assertEqual(args.max_new_exposure_fraction_per_run, 0.25)
+        self.assertIsNone(args.max_new_exposure_usd_per_run)
+        self.assertIsNone(args.new_exposure_target_positions_per_run)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.max_position_fraction, 0.20)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+
+    def test_strategy_profile_can_pace_new_exposure_into_position_slots(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-paced-0.25-slots-4-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.25,
+            max_new_exposure_fraction_per_run=None,
+            max_new_exposure_usd_per_run=None,
+            new_exposure_target_positions_per_run=None,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.0)
+        self.assertEqual(args.max_new_exposure_fraction_per_run, 0.25)
+        self.assertEqual(args.new_exposure_target_positions_per_run, 4.0)
+        self.assertEqual(args.max_position_usd, 50.0)
+        self.assertEqual(args.max_position_fraction, 0.20)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.no_side_max_price, 0.94)
+        self.assertEqual(args.no_side_high_confidence_min_edge, 0.05)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.10)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.98)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+
+    def test_strategy_profile_can_use_two_position_slot_live_pacing(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-paced-0.25-slots-2-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.25,
+            max_new_exposure_fraction_per_run=None,
+            max_new_exposure_usd_per_run=None,
+            new_exposure_target_positions_per_run=None,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.0)
+        self.assertEqual(args.max_new_exposure_fraction_per_run, 0.25)
+        self.assertEqual(args.new_exposure_target_positions_per_run, 2.0)
+        self.assertEqual(args.max_position_fraction, 0.20)
+
+    def test_strategy_profile_can_use_window_bankroll_kelly_sizing(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.50-strict-no-tail-0.14-bprice-0.70",
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.25,
+            kelly_sizing_bankroll_fraction_per_run=None,
+            max_new_exposure_fraction_per_run=None,
+            max_new_exposure_usd_per_run=None,
+            new_exposure_target_positions_per_run=2.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.20,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.0)
+        self.assertEqual(args.kelly_sizing_bankroll_fraction_per_run, 0.25)
+        self.assertEqual(args.max_new_exposure_fraction_per_run, 0.25)
+        self.assertIsNone(args.new_exposure_target_positions_per_run)
+        self.assertEqual(args.max_position_fraction, 0.50)
+
+    def test_strategy_profile_can_use_smaller_window_bankroll_position_cap(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile="live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70",
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.25,
+            kelly_sizing_bankroll_fraction_per_run=None,
+            max_new_exposure_fraction_per_run=None,
+            max_new_exposure_usd_per_run=None,
+            new_exposure_target_positions_per_run=2.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.20,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.0)
+        self.assertEqual(args.kelly_sizing_bankroll_fraction_per_run, 0.25)
+        self.assertEqual(args.max_new_exposure_fraction_per_run, 0.25)
+        self.assertIsNone(args.new_exposure_target_positions_per_run)
+        self.assertEqual(args.max_position_fraction, 0.25)
+
+    def test_strategy_profile_can_use_bounded_low_dispersion_candidate(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile=(
+                "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-"
+                "bounded-fv94-stdev03"
+            ),
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+            bounded_bucket_max_probability_stdev=None,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.25)
+        self.assertEqual(args.max_position_fraction, 0.20)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.04)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.94)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+        self.assertEqual(args.bounded_bucket_max_probability_stdev, 0.03)
+
+    def test_strategy_profile_can_use_strict_bounded_low_dispersion_candidate(self) -> None:
+        args = argparse.Namespace(
+            strategy_profile=(
+                "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70-"
+                "bounded-fv95-edge08-stdev03"
+            ),
+            allow_no_side_entries=False,
+            bankroll_usd=100.0,
+            kelly_fraction=0.75,
+            cash_reserve_fraction=0.0,
+            max_position_usd=175.0,
+            max_position_fraction=0.35,
+            no_side_max_counter_event_probability=0.05,
+            no_side_max_price=0.95,
+            no_side_high_confidence_min_edge=0.02,
+            hold_no_side_high_conviction_min_fair_value=None,
+            hold_no_side_high_conviction_min_edge=None,
+            hold_no_side_high_conviction_counter_event_probability=None,
+            bounded_bucket_min_edge=0.15,
+            bounded_bucket_min_fair_value=0.90,
+            bounded_bucket_min_price=0.50,
+            bounded_bucket_max_probability_stdev=None,
+        )
+
+        _apply_strategy_profile(args)
+
+        self.assertTrue(args.allow_no_side_entries)
+        self.assertEqual(args.bankroll_usd, 50.0)
+        self.assertEqual(args.kelly_fraction, 0.50)
+        self.assertEqual(args.cash_reserve_fraction, 0.25)
+        self.assertEqual(args.max_position_fraction, 0.20)
+        self.assertEqual(args.no_side_max_counter_event_probability, 0.14)
+        self.assertEqual(args.bounded_bucket_min_edge, 0.08)
+        self.assertEqual(args.bounded_bucket_min_fair_value, 0.95)
+        self.assertEqual(args.bounded_bucket_min_price, 0.70)
+        self.assertEqual(args.bounded_bucket_max_probability_stdev, 0.03)
+
     def test_manual_strategy_profile_leaves_explicit_settings_unchanged(self) -> None:
         args = argparse.Namespace(
             strategy_profile="manual",
@@ -232,6 +629,129 @@ class CliTest(unittest.TestCase):
         self.assertFalse(args.allow_no_side_entries)
         self.assertIsNone(args.no_side_relaxed_counter_event_probability)
         self.assertEqual(args.bankroll_usd, 250.0)
+
+    def test_long_backtest_summary_includes_strategy_profile(self) -> None:
+        summary = _long_backtest_summary(
+            {
+                "strategy_profile": "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94-bounded-confirmed",
+                "bankroll_usd": 50.0,
+                "ending_equity_usd": 50.0,
+            }
+        )
+
+        self.assertEqual(
+            summary["strategy_profile"],
+            "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94-bounded-confirmed",
+        )
+
+    def test_build_live_like_backtest_uses_year_window_live_cadence_and_polymarket_settlement(self) -> None:
+        with patch("weather_strategy.cli.run_long_historical_backtest") as run_backtest:
+            run_backtest.return_value = {
+                "strategy_profile": "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70",
+                "bankroll_usd": 50.0,
+                "ending_equity_usd": 50.0,
+                "run_log_path": "run.json",
+            }
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "build-live-like-backtest",
+                        "--strategy-profile",
+                        "live-forward-50-windowbank-0.25-kelly-0.50-poscap-0.25-strict-no-tail-0.14-bprice-0.70",
+                        "--lookback-days",
+                        "365",
+                        "--max-end-date",
+                        "2026-06-29",
+                        "--summary-only",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        kwargs = run_backtest.call_args.kwargs
+        self.assertEqual(kwargs["min_end_date"], date(2025, 6, 30))
+        self.assertEqual(kwargs["max_end_date"], date(2026, 6, 29))
+        self.assertEqual(kwargs["entry_hours_utc"], (0, 6, 12, 18))
+        self.assertEqual(kwargs["settlement_audit"], "polymarket_only")
+        output = json.loads(stdout.getvalue())
+        self.assertEqual(output["run_log_path"], "run.json")
+
+    def test_replay_scored_outcomes_cli_sweeps_profiles_from_saved_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "long-backtest.json"
+            log_dir = Path(directory) / "replays"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "strategy_profile": "source-profile",
+                        "run_log_path": str(source_path),
+                        "session_count": 1,
+                        "markets_scored": 1,
+                        "outcomes_scored": 1,
+                        "settings": {
+                            "entry_hours_utc": [0, 6, 12, 18],
+                            "entry_hours_match_live_forward": True,
+                            "min_lead_days": 1,
+                            "max_lead_days": 2,
+                            "price_source": "telonex",
+                            "market_source": "telonex",
+                        },
+                        "real_data_audit": {"passed": True},
+                        "scored_outcomes_detail": [
+                            {
+                                "generated_at": "2026-01-01T00:00:00+00:00",
+                                "token_id": "tok-yes-1",
+                                "question": "Will the highest temperature in Test City be 80°F or above on January 2?",
+                                "bucket": "80°F or higher",
+                                "city": "Test City",
+                                "target_date": "2026-01-02",
+                                "market_price": 0.40,
+                                "exit_price": 0.39,
+                                "fair_value": 0.86,
+                                "edge": 0.43,
+                                "model_count": 3,
+                                "model_agreement": 1.0,
+                                "entry_eligible": True,
+                                "bucket_width_f": None,
+                                "polymarket_payout": 1,
+                                "payout": 1,
+                                "weather_outcome": 1,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    [
+                        "replay-scored-outcomes",
+                        "--source-run-log",
+                        str(source_path),
+                        "--strategy-profiles",
+                        "manual,live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70",
+                        "--bankroll-usd",
+                        "100",
+                        "--kelly-fraction",
+                        "0.50",
+                        "--compound-kelly-sizing",
+                        "--max-position-usd",
+                        "50",
+                        "--max-position-fraction",
+                        "0.25",
+                        "--run-log-dir",
+                        str(log_dir),
+                        "--summary-only",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            output = json.loads(stdout.getvalue())
+            self.assertEqual(output["replay_count"], 2)
+            self.assertEqual({profile["strategy_profile"] for profile in output["profiles"]}, {"manual", "live-forward-50-reserve-0.25-kelly-0.50-cap-0.20-strict-no-tail-0.14-bprice-0.70"})
+            self.assertTrue(all(profile["cache_replay"]["uses_cached_scored_outcomes_only"] for profile in output["profiles"]))
+            self.assertTrue(all(Path(profile["run_log_path"]).exists() for profile in output["profiles"]))
 
     def test_fixture_paper_run_records_trade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -300,6 +820,22 @@ class CliTest(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue(first.name.endswith("-paper-run.json"))
         self.assertTrue(second.name.endswith("-paper-run.json"))
+
+    def test_live_collateral_balance_after_executions_polls_stale_balance(self) -> None:
+        class FakeLiveExecutor:
+            def __init__(self) -> None:
+                self.values = [17.0, 17.0, 2.0]
+
+            def collateral_balance_usd(self) -> float:
+                return self.values.pop(0)
+
+        balance = _live_collateral_balance_after_executions(
+            FakeLiveExecutor(),
+            executions=1,
+            starting_balance=17.0,
+            poll_delay_seconds=0.0,
+        )
+        self.assertEqual(balance, 2.0)
 
     def test_fixture_paper_run_can_record_explicit_no_token_position(self) -> None:
         fixture = [

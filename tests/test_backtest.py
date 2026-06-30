@@ -8,17 +8,28 @@ import unittest
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from weather_strategy.backtest import (
     ResolvedForecastRow,
     _effective_max_position_usd as recorded_effective_max_position_usd,
     _single_entry_kelly_replay,
+    _write_weights,
     load_calibration_weights,
+    load_probability_calibration,
+)
+from weather_strategy.backtest_engine import (
+    CURRENT_LIVE_STRATEGY_PROFILE,
+    compare_strategy_replays,
+    live_like_backtest_dates,
+    strategy_summary_row,
+    world_region,
 )
 from weather_strategy.long_backtest import (
     CachedHttpClient,
     HistoricalPosition,
+    LIVE_FORWARD_ENTRY_HOURS_UTC,
     _binary_no_token,
     _cached_price_history,
     _candidate_replay_times,
@@ -28,6 +39,8 @@ from weather_strategy.long_backtest import (
     _historical_observed_high_for_session,
     _invert_binary_scored_outcome,
     _json_kelly_replay,
+    _json_signal_candidate,
+    _load_telonex_market_records,
     _make_run_log_path,
     _market_parse_today,
     _pnl_concentration,
@@ -48,6 +61,8 @@ from weather_strategy.long_backtest import (
     _telonex_market_record_to_raw,
     _trade_performance_diagnostics,
     forecast_run_time,
+    load_scored_outcome_snapshot,
+    run_cached_scored_outcome_replay,
     run_long_historical_backtest,
     select_entry_price,
 )
@@ -60,6 +75,22 @@ from weather_strategy.signals import SignalSettings
 
 
 class BacktestTest(unittest.TestCase):
+    def test_live_like_backtest_dates_defaults_to_full_lookback_window(self) -> None:
+        start, end = live_like_backtest_dates(
+            lookback_days=365,
+            min_end_date=None,
+            max_end_date=None,
+            today=date(2026, 6, 30),
+        )
+
+        self.assertEqual(start, date(2025, 6, 30))
+        self.assertEqual(end, date(2026, 6, 29))
+
+    def test_long_backtest_default_entry_hours_match_live_automation(self) -> None:
+        signature = inspect.signature(run_long_historical_backtest)
+
+        self.assertEqual(signature.parameters["entry_hours_utc"].default, LIVE_FORWARD_ENTRY_HOURS_UTC)
+
     def test_replay_times_mark_target_day_as_maintenance_only(self) -> None:
         raw = {
             "id": "m1",
@@ -72,12 +103,13 @@ class BacktestTest(unittest.TestCase):
         market = parse_weather_market(raw, today=date(2026, 6, 1))
         assert market is not None
 
-        replay_times = _candidate_replay_times(market, (0, 12), min_lead_days=1, max_lead_days=2)
+        replay_times = _candidate_replay_times(market, LIVE_FORWARD_ENTRY_HOURS_UTC, min_lead_days=1, max_lead_days=2)
         maintenance_times = [timestamp for timestamp, maintenance_only in replay_times if maintenance_only]
         entry_times = [timestamp for timestamp, maintenance_only in replay_times if not maintenance_only]
 
         self.assertTrue(maintenance_times)
         self.assertTrue(entry_times)
+        self.assertTrue({timestamp.hour for timestamp, _ in replay_times}.issubset(set(LIVE_FORWARD_ENTRY_HOURS_UTC)))
         city_zone = ZoneInfo(market.city.timezone)
         self.assertTrue(all(timestamp.astimezone(city_zone).date() == market.target_date for timestamp in maintenance_times))
         self.assertTrue(all((market.target_date - timestamp.astimezone(city_zone).date()).days >= 1 for timestamp in entry_times))
@@ -170,6 +202,146 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual([], executions)
         self.assertEqual(100.0, cash_ref["cash"])
 
+    def test_historical_rebalance_caps_new_exposure_per_session(self) -> None:
+        generated_at = datetime(2026, 6, 24, 0, 0, tzinfo=timezone.utc)
+        outcomes = [
+            ScoredOutcome(
+                market_id="m1",
+                market_slug="market-one",
+                question="Will the highest temperature in Tokyo be 35°C or higher on July 1?",
+                bucket_label="35°C or higher",
+                token_id="tok-1",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.50,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=generated_at,
+                city="Tokyo",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+            ScoredOutcome(
+                market_id="m2",
+                market_slug="market-two",
+                question="Will the highest temperature in Singapore be 34°C or higher on July 1?",
+                bucket_label="34°C or higher",
+                token_id="tok-2",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.49,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=generated_at,
+                city="Singapore",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+        ]
+        positions: dict[str, HistoricalPosition] = {}
+        executions: list[dict[str, object]] = []
+        cash_ref = {"cash": 100.0}
+
+        _rebalance_session(
+            outcomes,
+            {"tok-1", "tok-2"},
+            {},
+            positions,
+            executions,
+            cash_ref,
+            bankroll_usd=100.0,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=100.0,
+            max_position_fraction=None,
+            kelly_market_blend=0.0,
+            edge_position_full_cap_edge=0.0,
+            edge_position_min_multiplier=0.35,
+            min_trade_usd=1.0,
+            settings=SignalSettings(),
+            max_new_exposure_fraction_per_run=0.25,
+        )
+
+        buys = [execution for execution in executions if execution["action"] == "BUY"]
+        self.assertEqual(len(buys), 1)
+        self.assertLessEqual(sum(float(execution["notional_usd"]) for execution in buys), 25.0)
+        self.assertEqual(cash_ref["cash"], 75.0)
+
+    def test_historical_rebalance_divides_new_exposure_across_position_slots(self) -> None:
+        generated_at = datetime(2026, 6, 24, 0, 0, tzinfo=timezone.utc)
+        outcomes = [
+            ScoredOutcome(
+                market_id="m1",
+                market_slug="market-one",
+                question="Will the highest temperature in Tokyo be 35°C or higher on July 1?",
+                bucket_label="35°C or higher",
+                token_id="tok-1",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.50,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=generated_at,
+                city="Tokyo",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+            ScoredOutcome(
+                market_id="m2",
+                market_slug="market-two",
+                question="Will the highest temperature in Singapore be 34°C or higher on July 1?",
+                bucket_label="34°C or higher",
+                token_id="tok-2",
+                fair_value=1.0,
+                market_price=0.50,
+                edge=0.49,
+                model_count=3,
+                model_agreement=1.0,
+                probability_stdev=0.0,
+                generated_at=generated_at,
+                city="Singapore",
+                target_date=date(2026, 7, 1),
+                rule_excerpt="",
+                model_probabilities={"fixture.a": 1.0, "fixture.b": 1.0, "fixture.c": 1.0},
+            ),
+        ]
+        positions: dict[str, HistoricalPosition] = {}
+        executions: list[dict[str, object]] = []
+        cash_ref = {"cash": 100.0}
+
+        _rebalance_session(
+            outcomes,
+            {"tok-1", "tok-2"},
+            {},
+            positions,
+            executions,
+            cash_ref,
+            bankroll_usd=100.0,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_position_usd=100.0,
+            max_position_fraction=None,
+            kelly_market_blend=0.0,
+            edge_position_full_cap_edge=0.0,
+            edge_position_min_multiplier=0.35,
+            min_trade_usd=1.0,
+            settings=SignalSettings(),
+            max_new_exposure_fraction_per_run=0.25,
+            new_exposure_target_positions_per_run=4,
+        )
+
+        buys = [execution for execution in executions if execution["action"] == "BUY"]
+        self.assertEqual(len(buys), 2)
+        self.assertLessEqual(max(float(execution["notional_usd"]) for execution in buys), 6.25)
+        self.assertEqual(sum(float(execution["notional_usd"]) for execution in buys), 12.5)
+        self.assertEqual(cash_ref["cash"], 87.5)
+
     def test_load_calibration_weights_aliases_legacy_gfs_source(self) -> None:
         payload = {
             "source_weights": {"open_meteo_gfs_hrrr": 0.62},
@@ -185,6 +357,73 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(source_weights["open_meteo_gfs_best_match"], 0.62)
         self.assertEqual(model_weights["open_meteo_gfs_hrrr.kernel_wide"], 1.08)
         self.assertEqual(model_weights["open_meteo_gfs_best_match.kernel_wide"], 1.08)
+
+    def test_load_probability_calibration_reads_light_shrink_profile(self) -> None:
+        payload = {
+            "probability_calibration": {
+                "center_shrink_alpha": 0.95,
+                "high_cap": 0.98,
+                "low_floor": 0.02,
+                "single_bucket_only": True,
+                "tail_threshold": 0.95,
+                "tail_shrink_alpha": 0.86,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+
+            calibration = load_probability_calibration(path)
+
+        self.assertTrue(calibration.active)
+        self.assertEqual(calibration.center_shrink_alpha, 0.95)
+        self.assertEqual(calibration.high_cap, 0.98)
+        self.assertEqual(calibration.low_floor, 0.02)
+        self.assertTrue(calibration.single_bucket_only)
+        self.assertEqual(calibration.tail_threshold, 0.95)
+        self.assertEqual(calibration.tail_shrink_alpha, 0.86)
+
+    def test_write_weights_preserves_existing_probability_calibration(self) -> None:
+        existing = {
+            "probability_calibration": {
+                "center_shrink_alpha": 0.97,
+                "single_bucket_only": True,
+                "tail_threshold": 0.95,
+                "tail_shrink_alpha": 0.86,
+            }
+        }
+        row = ResolvedForecastRow(
+            id=1,
+            generated_at=datetime(2026, 6, 5, tzinfo=timezone.utc),
+            city="New York",
+            target_date=date(2026, 6, 6),
+            bucket_label="80 or above",
+            token_id="token",
+            fair_value=0.8,
+            market_price=0.7,
+            model_count=3,
+            model_agreement=1.0,
+            probability_stdev=0.01,
+            entry_eligible=True,
+            observed_outcome=1,
+            model_probabilities={"open_meteo_ecmwf.kernel_wide": 0.8},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.json"
+            path.write_text(json.dumps(existing), encoding="utf-8")
+
+            _write_weights(
+                path,
+                {"open_meteo_ecmwf": 1.2},
+                {"open_meteo_ecmwf.kernel_wide": 1.1},
+                {},
+                [row],
+            )
+
+            written = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(written["probability_calibration"], existing["probability_calibration"])
+        self.assertEqual(written["source_weights"]["open_meteo_ecmwf"], 1.2)
 
     def test_recorded_backtest_applies_no_side_min_edge_floor(self) -> None:
         row = ResolvedForecastRow(
@@ -464,6 +703,78 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(signature.parameters["max_price_staleness_minutes"].default, 90)
         self.assertEqual(signature.parameters["price_source"].default, "telonex")
 
+    def test_long_backtest_result_mirrors_strategy_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("weather_strategy.long_backtest._discover_telonex_raw_temperature_markets", return_value=[]):
+                result = run_long_historical_backtest(
+                    max_markets=0,
+                    max_runtime_seconds=1,
+                    cache_dir=Path(directory) / "cache",
+                    run_log_dir=Path(directory) / "logs",
+                    progress_every=0,
+                    strategy_profile="live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94",
+                )
+
+        self.assertEqual(
+            result["strategy_profile"],
+            "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94",
+        )
+        self.assertEqual(
+            result["settings"]["strategy_profile"],
+            "live-forward-50-highwin-strict-no-tail-0.11-no-side-max-0.94",
+        )
+
+    def test_json_signal_candidate_respects_bounded_no_side_disable(self) -> None:
+        row = {
+            "polymarket_payout": 1,
+            "entry_eligible": True,
+            "side": "NO",
+            "market_price": 0.80,
+            "fair_value": 0.98,
+            "edge": 0.17,
+            "model_count": 3,
+            "model_agreement": 1.0,
+            "model_probabilities": {"a.model": 0.98, "b.model": 0.99, "c.model": 0.97},
+            "bucket_lower_f": 40.0,
+            "bucket_upper_f": 41.0,
+            "bucket_width_f": 1.0,
+        }
+
+        self.assertTrue(_json_signal_candidate(row, SignalSettings()))
+        self.assertFalse(
+            _json_signal_candidate(
+                row,
+                SignalSettings(allow_bounded_no_side_entries=False),
+            )
+        )
+
+    def test_json_signal_candidate_respects_bounded_model_dispersion_gate(self) -> None:
+        row = {
+            "polymarket_payout": 1,
+            "entry_eligible": True,
+            "side": "NO",
+            "market_price": 0.80,
+            "fair_value": 0.95,
+            "edge": 0.14,
+            "model_count": 3,
+            "model_agreement": 1.0,
+            "probability_stdev": 0.02,
+            "model_probabilities": {"a.model": 0.95, "b.model": 0.96, "c.model": 0.94},
+            "bucket_lower_f": 40.0,
+            "bucket_upper_f": 41.0,
+            "bucket_width_f": 1.0,
+        }
+        settings = SignalSettings(
+            allow_no_side_entries=True,
+            bounded_bucket_min_edge=0.04,
+            bounded_bucket_min_fair_value=0.94,
+            bounded_bucket_min_price=0.70,
+            bounded_bucket_max_probability_stdev=0.03,
+        )
+
+        self.assertTrue(_json_signal_candidate(row, settings))
+        self.assertFalse(_json_signal_candidate({**row, "probability_stdev": 0.08}, settings))
+
     def test_long_backtest_run_log_paths_are_unique_for_parameter_sweeps(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             first = _make_run_log_path(directory, "long-backtest")
@@ -613,6 +924,179 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["buy_notional_usd"], 25.0)
         self.assertEqual(result["pnl_usd"], 25.0)
         self.assertEqual(result["settings"]["max_position_fraction"], 0.25)
+
+    def test_json_kelly_replay_caps_new_exposure_per_session(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-1",
+                "city": "Tokyo",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.50,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-2",
+                "city": "Singapore",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.49,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        result = _json_kelly_replay(
+            "paced",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_new_exposure_fraction_per_run=0.25,
+            max_position_usd=100,
+            min_trade_usd=1,
+        )
+
+        self.assertEqual(result["buy_notional_usd"], 25.0)
+        self.assertEqual(result["pnl_usd"], 25.0)
+        self.assertEqual(result["settings"]["max_new_exposure_fraction_per_run"], 0.25)
+
+    def test_json_kelly_replay_divides_new_exposure_across_position_slots(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-1",
+                "city": "Tokyo",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.50,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-2",
+                "city": "Singapore",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.49,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        result = _json_kelly_replay(
+            "slot-paced",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=1.0,
+            compound_kelly_sizing=False,
+            max_new_exposure_fraction_per_run=0.25,
+            new_exposure_target_positions_per_run=4,
+            max_position_usd=100,
+            min_trade_usd=1,
+        )
+
+        self.assertEqual(result["buy_notional_usd"], 12.5)
+        self.assertEqual(result["pnl_usd"], 12.5)
+        self.assertEqual(result["buys"], 2)
+        self.assertEqual(result["settings"]["new_exposure_target_positions_per_run"], 4)
+
+    def test_json_kelly_replay_can_size_from_automation_window_bankroll(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-1",
+                "city": "Tokyo",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.50,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+            {
+                "generated_at": "2026-06-04T12:00:00+00:00",
+                "token_id": "tok-2",
+                "city": "Singapore",
+                "target_date": "2026-06-05",
+                "market_price": 0.50,
+                "fair_value": 1.0,
+                "edge": 0.49,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "polymarket_payout": 1,
+                "payout": 1,
+            },
+        ]
+        settings = SignalSettings(
+            min_edge=0.0,
+            uncertainty_buffer=0.0,
+            min_price=0.0,
+            yes_side_min_price=0.0,
+            min_signal_fair_value=0.5,
+            enforce_entry_timing_filter=False,
+        )
+
+        result = _json_kelly_replay(
+            "window-bankroll",
+            rows,
+            settings,
+            bankroll_usd=100,
+            kelly_fraction=0.50,
+            compound_kelly_sizing=False,
+            max_new_exposure_fraction_per_run=0.25,
+            kelly_sizing_bankroll_fraction_per_run=0.25,
+            max_position_usd=100,
+            max_position_fraction=0.50,
+            min_trade_usd=1,
+        )
+
+        self.assertEqual(result["buy_notional_usd"], 25.0)
+        self.assertEqual(result["pnl_usd"], 25.0)
+        self.assertEqual(result["buys"], 2)
+        self.assertEqual(result["settings"]["kelly_sizing_bankroll_fraction_per_run"], 0.25)
 
     def test_effective_position_cap_scales_after_fractional_cap(self) -> None:
         helpers = (
@@ -1423,6 +1907,58 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(parsed.target_date, date(2025, 8, 16))
         self.assertEqual(parsed.buckets[0].token_id, "yes-token")
 
+    def test_telonex_market_loader_filters_by_end_date_window_before_limit(self) -> None:
+        try:
+            import polars as pl  # type: ignore
+        except ModuleNotFoundError:
+            self.skipTest("polars is required for this parquet loader regression test")
+
+        def epoch_us(value: date) -> int:
+            return int(datetime(value.year, value.month, value.day, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
+        base = {
+            "description": "Resolved by official station.",
+            "event_slug": "weather",
+            "event_title": "Highest temperature",
+            "outcome_0": "Yes",
+            "outcome_1": "No",
+            "asset_id_0": "yes-token",
+            "asset_id_1": "no-token",
+            "status": "resolved",
+            "result_id": "1",
+            "quotes_from": "2026-01-19",
+            "quotes_to": "2026-06-24",
+        }
+        records = [
+            {
+                **base,
+                "market_id": "jan",
+                "slug": "highest-temperature-in-london-on-january-28",
+                "question": "Will the highest temperature in London be 68°F or below on January 28?",
+                "end_date_us": epoch_us(date(2026, 1, 28)),
+            },
+            {
+                **base,
+                "market_id": "mar",
+                "slug": "highest-temperature-in-london-on-march-15",
+                "question": "Will the highest temperature in London be 68°F or below on March 15?",
+                "end_date_us": epoch_us(date(2026, 3, 15)),
+            },
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "markets.parquet"
+            pl.DataFrame(records).write_parquet(path)
+
+            loaded = _load_telonex_market_records(
+                path,
+                query="highest temperature",
+                max_candidates=1,
+                min_end_date=date(2026, 3, 1),
+                max_end_date=date(2026, 3, 31),
+            )
+
+        self.assertEqual([record["market_id"] for record in loaded], ["mar"])
+
     def test_runtime_limited_backtest_marks_open_positions_instead_of_force_settling(self) -> None:
         positions = {
             "token-1": HistoricalPosition(
@@ -1729,6 +2265,50 @@ class BacktestTest(unittest.TestCase):
         self.assertIn("no_side_rows_use_explicit_no_tokens", audit["failure_reasons"])
         self.assertIn("traded_tokens_weather_matched", audit["failure_reasons"])
 
+    def test_real_data_audit_can_accept_polymarket_only_settlement_mode(self) -> None:
+        scored = [
+            {
+                "token_id": "yes-token",
+                "side": "YES",
+                "generated_at": "2026-06-02T12:00:00+00:00",
+                "entry_price_timestamp": "2026-06-02T11:30:00+00:00",
+                "entry_price_stale_seconds": 1800,
+                "forecast_run_time": "2026-06-02T06:00:00+00:00",
+                "forecast_sources": ["single_run_gfs_global"],
+                "signal_filter_reason": None,
+                "polymarket_payout": 1,
+                "weather_outcome": None,
+                "settlement_source": None,
+            }
+        ]
+        executions = [{**scored[0], "action": "BUY"}, {**scored[0], "action": "SETTLE"}]
+        data_quality = _data_quality_diagnostics(
+            executions,
+            scored,
+            max_price_staleness_minutes=90,
+            forecast_availability_lag_hours=6,
+        )
+        settlement_quality = _settlement_quality_diagnostics(scored, executions)
+
+        strict_audit = _real_data_audit(
+            scored,
+            executions,
+            data_quality_diagnostics=data_quality,
+            settlement_quality_diagnostics=settlement_quality,
+        )
+        polymarket_only_audit = _real_data_audit(
+            scored,
+            executions,
+            data_quality_diagnostics=data_quality,
+            settlement_quality_diagnostics=settlement_quality,
+            require_weather_crosscheck=False,
+        )
+
+        self.assertFalse(strict_audit["passed"])
+        self.assertTrue(polymarket_only_audit["passed"])
+        self.assertFalse(polymarket_only_audit["require_weather_crosscheck"])
+        self.assertTrue(polymarket_only_audit["checks"]["traded_tokens_weather_matched"]["passed"])
+
     def test_strategy_sensitivity_diagnostics_show_fair_value_threshold_quality(self) -> None:
         rows = [
             {
@@ -1784,7 +2364,11 @@ class BacktestTest(unittest.TestCase):
         self.assertIn("looser_no_side_counter_event_0.30", replay_by_variant)
         self.assertIn("max_position_fraction_0.05", replay_by_variant)
         self.assertIn("max_position_fraction_0.10", replay_by_variant)
+        self.assertIn("live_forward_entry_hours_utc_0_6_12_18", replay_by_variant)
+        self.assertIn("entry_hours_utc_0_only", replay_by_variant)
+        self.assertIn("entry_hours_utc_6_only", replay_by_variant)
         self.assertIn("entry_hours_utc_12_only", replay_by_variant)
+        self.assertIn("entry_hours_utc_18_only", replay_by_variant)
         self.assertIn("entry_hours_utc_12_no_side_counter_event_0.13", replay_by_variant)
         self.assertIn("entry_hours_utc_12_no_side_counter_event_0.20", replay_by_variant)
         self.assertIn("utc12_relaxed_no_side_counter_event_0.15", replay_by_variant)
@@ -2478,6 +3062,40 @@ class BacktestTest(unittest.TestCase):
         self.assertIsNone(result["weather_outcome"])
         self.assertIsNone(result["settlement_source"])
 
+    def test_resolve_market_outcome_can_skip_weather_crosscheck_for_broad_replays(self) -> None:
+        raw = {
+            "id": "2416222",
+            "question": "Will the highest temperature in Beijing be 25°C or below on June 4?",
+            "slug": "highest-temperature-in-beijing-on-june-4-2026-25corbelow",
+            "description": "Resolution source: https://www.wunderground.com/history/daily/cn/beijing/ZBAA",
+            "resolutionSource": "https://www.wunderground.com/history/daily/cn/beijing/ZBAA",
+            "outcomes": '["Yes","No"]',
+            "outcomePrices": '["0","1"]',
+            "clobTokenIds": '["yes-token","no-token"]',
+        }
+        market = parse_weather_market(raw, today=date(2026, 6, 1))
+        assert market is not None
+
+        class RaisingObservationClient:
+            def fetch_historical_station_high(self, *args, **kwargs):
+                raise AssertionError("weather cross-check should be skipped")
+
+            def fetch_observed_high(self, *args, **kwargs):
+                raise AssertionError("weather cross-check should be skipped")
+
+        result = _resolve_market_outcome(
+            market,
+            raw,
+            market.buckets[0],
+            RaisingObservationClient(),
+            fetch_weather_crosscheck=False,
+        )
+
+        self.assertEqual(result["payout"], 0)
+        self.assertEqual(result["polymarket_payout"], 0)
+        self.assertIsNone(result["weather_outcome"])
+        self.assertIsNone(result["settlement_source"])
+
     def test_station_market_uses_actual_historical_station_crosscheck(self) -> None:
         raw = {
             "id": "2416222",
@@ -2622,6 +3240,239 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["payout"], 1)
         self.assertEqual(result["weather_outcome"], 1)
         self.assertEqual(result["settlement_source"], "historical_metar_KLGA")
+
+    def test_cached_scored_outcome_replay_uses_saved_rows_and_writes_log(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "token_id": "tok-yes-1",
+                "question": "Will the highest temperature in Test City be 80°F or above on January 2?",
+                "bucket": "80°F or higher",
+                "city": "Test City",
+                "target_date": "2026-01-02",
+                "market_price": 0.40,
+                "exit_price": 0.39,
+                "fair_value": 0.86,
+                "edge": 0.43,
+                "model_count": 3,
+                "model_agreement": 1.0,
+                "entry_eligible": True,
+                "bucket_width_f": None,
+                "polymarket_payout": 1,
+                "payout": 1,
+                "weather_outcome": 1,
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "long-backtest.json"
+            replay_dir = Path(directory) / "replays"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "strategy_profile": "source-profile",
+                        "run_log_path": str(source_path),
+                        "session_count": 1,
+                        "markets_scored": 1,
+                        "outcomes_scored": 1,
+                        "runtime_limited": False,
+                        "settings": {
+                            "entry_hours_utc": [0, 6, 12, 18],
+                            "entry_hours_match_live_forward": True,
+                            "min_lead_days": 1,
+                            "max_lead_days": 2,
+                            "price_source": "telonex",
+                            "market_source": "telonex",
+                        },
+                        "real_data_audit": {"passed": True},
+                        "scored_outcomes_detail": rows,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = run_cached_scored_outcome_replay(
+                snapshot_path=source_path,
+                settings=SignalSettings(min_signal_fair_value=0.70, min_model_agreement=1.0),
+                strategy_profile="cached-test",
+                bankroll_usd=100,
+                kelly_fraction=0.50,
+                compound_kelly_sizing=True,
+                max_position_usd=50,
+                max_position_fraction=0.25,
+                min_trade_usd=1,
+                run_log_dir=replay_dir,
+            )
+
+            self.assertEqual(result["source_strategy_profile"], "source-profile")
+            self.assertEqual(result["source_scored_outcomes_detail_count"], 1)
+            self.assertGreaterEqual(result["executions"], 2)
+            self.assertGreater(result["pnl_usd"], 0)
+            self.assertIn("equity_curve", result)
+            self.assertGreaterEqual(len(result["equity_curve"]), 2)
+            self.assertTrue(result["cache_replay"]["uses_cached_scored_outcomes_only"])
+            self.assertTrue(Path(result["run_log_path"]).exists())
+            written = json.loads(Path(result["run_log_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(written["strategy_profile"], "cached-test")
+            self.assertIn("executions_detail", written)
+
+    def test_cached_scored_outcome_replay_can_recompute_from_raw_model_probabilities(self) -> None:
+        rows = [
+            {
+                "generated_at": "2026-01-01T00:00:00+00:00",
+                "token_id": "tok-yes-1",
+                "question": "Will the highest temperature in Test City be 80°F or above on January 2?",
+                "bucket": "80°F or higher",
+                "city": "Test City",
+                "target_date": "2026-01-02",
+                "market_price": 0.40,
+                "exit_price": 0.39,
+                "fair_value": 0.50,
+                "edge": 0.10,
+                "model_count": 3,
+                "model_agreement": 0.0,
+                "entry_eligible": True,
+                "bucket_width_f": None,
+                "polymarket_payout": 1,
+                "payout": 1,
+                "weather_outcome": 1,
+                "raw_model_probabilities": {
+                    "source_a.model": 1.0,
+                    "source_b.model": 1.0,
+                    "source_c.model": 1.0,
+                },
+            }
+        ]
+        weights = {
+            "probability_calibration": {
+                "center_shrink_alpha": 0.90,
+                "single_bucket_only": True,
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "long-backtest.json"
+            weights_path = Path(directory) / "weights.json"
+            source_path.write_text(json.dumps({"scored_outcomes_detail": rows}), encoding="utf-8")
+            weights_path.write_text(json.dumps(weights), encoding="utf-8")
+
+            result = run_cached_scored_outcome_replay(
+                snapshot_path=source_path,
+                settings=SignalSettings(min_signal_fair_value=0.70, min_model_agreement=1.0),
+                strategy_profile="raw-recompute-test",
+                bankroll_usd=100,
+                kelly_fraction=0.50,
+                max_position_usd=50,
+                max_position_fraction=0.25,
+                min_trade_usd=1,
+                run_log_dir=Path(directory) / "replays",
+                recompute_from_raw_model_probabilities=True,
+                weights_file=weights_path,
+            )
+
+        self.assertTrue(result["raw_recalibration"]["enabled"])
+        self.assertEqual(result["raw_recalibration"]["rows_recomputed"], 1)
+        self.assertAlmostEqual(result["top_scored_outcomes"][0]["fair_value"], 0.95)
+        self.assertEqual(result["top_scored_outcomes"][0]["model_agreement"], 1.0)
+
+    def test_live_like_strategy_report_writes_summary_breakdowns_and_chart(self) -> None:
+        result = {
+            "strategy_profile": CURRENT_LIVE_STRATEGY_PROFILE,
+            "bankroll_usd": 50.0,
+            "ending_equity_usd": 60.0,
+            "pnl_usd": 10.0,
+            "return_pct": 0.20,
+            "trade_count": 1,
+            "executions": 2,
+            "buys": 1,
+            "settlements": 1,
+            "buy_notional_usd": 20.0,
+            "event_hit_rate": 1.0,
+            "max_drawdown_pct": 0.02,
+            "performance_diagnostics": {
+                "period_start": "2026-01-01T00:00:00+00:00",
+                "period_end": "2026-01-02T00:00:00+00:00",
+                "period_days": 1.0,
+                "average_monthly_return_pct": 0.10,
+                "annualized_return_pct": 10.0,
+                "calendar_daily_sharpe_365": 2.5,
+            },
+            "equity_curve": [
+                {"session": "2026-01-01T00:00:00+00:00", "cash": 50.0, "equity": 50.0},
+                {"session": "2026-01-02T00:00:00+00:00", "cash": 60.0, "equity": 60.0},
+            ],
+            "executions_detail": [
+                {
+                    "action": "BUY",
+                    "token_id": "tok",
+                    "shares": 25.0,
+                    "price": 0.80,
+                    "notional_usd": 20.0,
+                    "realized_pnl_usd": 0.0,
+                    "row": {
+                        "generated_at": "2026-01-01T00:00:00+00:00",
+                        "question": "Will the highest temperature in Seoul be 30°C or higher?",
+                        "city": "Seoul",
+                        "target_date": "2026-01-02",
+                        "bucket": "30°C or higher",
+                        "side": "NO",
+                        "fair_value": 0.98,
+                        "edge": 0.18,
+                        "model_agreement": 1.0,
+                        "polymarket_payout": 1,
+                    },
+                },
+                {
+                    "action": "SETTLE",
+                    "token_id": "tok",
+                    "shares": 25.0,
+                    "price": 1.0,
+                    "notional_usd": 0.0,
+                    "realized_pnl_usd": 10.0,
+                    "row": {
+                        "generated_at": "2026-01-01T00:00:00+00:00",
+                        "city": "Seoul",
+                        "target_date": "2026-01-02",
+                        "side": "NO",
+                        "polymarket_payout": 1,
+                    },
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            report = compare_strategy_replays([result], output_dir=directory, source_run_log="source.json")
+
+            self.assertTrue(Path(report["artifact_paths"]["summary_json"]).exists())
+            self.assertTrue(Path(report["artifact_paths"]["summary_md"]).exists())
+            self.assertTrue(Path(report["artifact_paths"]["equity_curves_svg"]).exists())
+            self.assertTrue(report["summary"]["summary_rows"][0]["current_live_strategy"])
+            self.assertEqual(report["breakdowns"][CURRENT_LIVE_STRATEGY_PROFILE]["by_region"][0]["region"], "Asia-Pacific")
+
+        row = strategy_summary_row(result, CURRENT_LIVE_STRATEGY_PROFILE)
+        self.assertTrue(row["current_live_strategy"])
+        self.assertEqual(world_region("New York, NY"), "North America")
+
+    def test_load_scored_outcome_snapshot_normalizes_legacy_edge_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "rows.json"
+            source_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "generated_at": "2026-01-01T00:00:00+00:00",
+                            "token_id": "tok",
+                            "fair_value_probability": 0.7,
+                            "market_probability": 0.5,
+                            "edge_after_buffer": 0.17,
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            _source, rows = load_scored_outcome_snapshot(source_path)
+
+        self.assertEqual(rows[0]["fair_value"], 0.7)
+        self.assertEqual(rows[0]["market_price"], 0.5)
+        self.assertEqual(rows[0]["edge"], 0.17)
 
 
 if __name__ == "__main__":

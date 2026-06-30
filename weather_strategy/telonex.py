@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, TypeVar
@@ -154,18 +155,14 @@ class TelonexClient:
         identifier_params = {"asset_id": token_id} if token_id else {"slug": slug, "outcome": outcome}
         local_slug = None if token_id else slug
         local_outcome = None if token_id else outcome
-        for day in _date_range(start.date(), end.date()):
-            try:
-                path = self.download_parquet(
-                    exchange="polymarket",
-                    channel="quotes",
-                    day=day,
-                    params=identifier_params,
-                )
-            except RuntimeError as error:
-                if _is_missing_telonex_file(error):
-                    continue
-                raise
+        for path in self._download_quote_paths(
+            exchange="polymarket",
+            channel="quotes",
+            days=list(_date_range(start.date(), end.date())),
+            params=identifier_params,
+        ):
+            if path is None:
+                continue
             records = _load_parquet_records(path)
             points.extend(
                 _quote_records_to_price_history(
@@ -178,6 +175,53 @@ class TelonexClient:
                 )
             )
         return _dedupe_price_history(points)
+
+    def _download_quote_paths(
+        self,
+        *,
+        exchange: str,
+        channel: str,
+        days: list[date],
+        params: Mapping[str, Any],
+    ) -> list[Optional[Path]]:
+        if len(days) <= 1:
+            return [self._download_optional_quote_path(exchange=exchange, channel=channel, day=day, params=params) for day in days]
+        workers = _quote_download_workers(len(days))
+        paths: list[Optional[Path]] = [None] * len(days)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._download_optional_quote_path,
+                    exchange=exchange,
+                    channel=channel,
+                    day=day,
+                    params=params,
+                ): index
+                for index, day in enumerate(days)
+            }
+            for future in as_completed(futures):
+                paths[futures[future]] = future.result()
+        return paths
+
+    def _download_optional_quote_path(
+        self,
+        *,
+        exchange: str,
+        channel: str,
+        day: date,
+        params: Mapping[str, Any],
+    ) -> Optional[Path]:
+        try:
+            return self.download_parquet(
+                exchange=exchange,
+                channel=channel,
+                day=day,
+                params=params,
+            )
+        except RuntimeError as error:
+            if _is_missing_telonex_file(error):
+                return None
+            raise
 
     def _headers(self, *, accept: str = "application/json") -> dict[str, str]:
         return {"Authorization": f"Bearer {self.api_key}", "Accept": accept}
@@ -209,6 +253,14 @@ class TelonexClient:
         if ok:
             return value  # type: ignore[return-value]
         raise value
+
+
+def _quote_download_workers(day_count: int) -> int:
+    try:
+        configured = int(os.environ.get("TELONEX_QUOTE_DOWNLOAD_WORKERS", "4"))
+    except ValueError:
+        configured = 4
+    return max(1, min(day_count, configured))
 
 
 def load_local_env(path: str | Path = ".env") -> None:

@@ -25,6 +25,7 @@ class SignalSettings:
     bounded_bucket_min_fair_value: float = 0.90
     bounded_bucket_min_model_agreement: float = 1.0
     bounded_bucket_min_price: float = 0.50
+    bounded_bucket_max_probability_stdev: Optional[float] = None
     min_model_count: int = 3
     min_model_agreement: float = 1.0
     hold_min_model_agreement: float = 0.65
@@ -98,6 +99,7 @@ def generate_signals(
             edge=edge,
             market_price=market_price,
             model_agreement=1.0,
+            probability_stdev=None,
             lower_f=bucket.lower_f,
             upper_f=bucket.upper_f,
             settings=settings,
@@ -178,6 +180,9 @@ def score_outcomes(
                 target_date=market.target_date,
                 rule_excerpt=market.resolution_rules[:500],
                 model_probabilities=consensus.model_probabilities,
+                raw_fair_value=round(consensus.raw_fair_value, 4) if consensus.raw_fair_value is not None else None,
+                raw_model_probabilities=consensus.raw_model_probabilities,
+                raw_probability_stdev=round(consensus.raw_probability_stdev, 4) if consensus.raw_probability_stdev is not None else None,
                 entry_eligible=entry_eligible,
                 entry_filter_reason=entry_filter_reason,
                 observed_high_f=consensus.observed_high_f,
@@ -342,6 +347,14 @@ def _bounded_bucket_quality_filter_reason(outcome: ScoredOutcome, settings: Sign
         return f"bounded exact/range bucket edge below {settings.bounded_bucket_min_edge:.2f}"
     if outcome.model_agreement < settings.bounded_bucket_min_model_agreement:
         return f"bounded exact/range bucket agreement below {settings.bounded_bucket_min_model_agreement:.2f}"
+    if (
+        settings.bounded_bucket_max_probability_stdev is not None
+        and outcome.probability_stdev > settings.bounded_bucket_max_probability_stdev
+    ):
+        return (
+            "bounded exact/range bucket model dispersion above "
+            f"{settings.bounded_bucket_max_probability_stdev:.2f}"
+        )
     return None
 
 
@@ -351,17 +364,24 @@ def _fails_bounded_bucket_quality_gate(
     edge: float,
     market_price: float,
     model_agreement: float,
+    probability_stdev: Optional[float],
     lower_f: Optional[float],
     upper_f: Optional[float],
     settings: SignalSettings,
 ) -> bool:
     if not _is_bounded_bucket(lower_f, upper_f):
         return False
+    too_dispersed = (
+        probability_stdev is not None
+        and settings.bounded_bucket_max_probability_stdev is not None
+        and probability_stdev > settings.bounded_bucket_max_probability_stdev
+    )
     return (
         market_price < settings.bounded_bucket_min_price
         or fair_value < settings.bounded_bucket_min_fair_value
         or edge < settings.bounded_bucket_min_edge
         or model_agreement < settings.bounded_bucket_min_model_agreement
+        or too_dispersed
     )
 
 
@@ -416,7 +436,16 @@ def invert_binary_scored_outcome(
         model_name: 1.0 - max(0.0, min(1.0, float(probability)))
         for model_name, probability in outcome.model_probabilities.items()
     }
+    raw_model_probabilities = (
+        {
+            model_name: 1.0 - max(0.0, min(1.0, float(probability)))
+            for model_name, probability in outcome.raw_model_probabilities.items()
+        }
+        if outcome.raw_model_probabilities
+        else None
+    )
     fair_value = 1.0 - outcome.fair_value
+    raw_fair_value = 1.0 - outcome.raw_fair_value if outcome.raw_fair_value is not None else None
     buffer = _price_adjusted_uncertainty_buffer(price, settings)
     agreement = ConsensusValue(
         bucket_label=outcome.bucket_label,
@@ -435,6 +464,8 @@ def invert_binary_scored_outcome(
         edge=round(fair_value - price - buffer, 4),
         model_agreement=round(agreement, 4),
         model_probabilities=model_probabilities,
+        raw_fair_value=round(raw_fair_value, 4) if raw_fair_value is not None else None,
+        raw_model_probabilities=raw_model_probabilities,
         observed_outcome=_invert_binary_outcome(outcome.observed_outcome),
     )
 

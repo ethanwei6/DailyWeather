@@ -142,6 +142,9 @@ class ConsensusValue:
     model_probabilities: dict[str, float]
     model_count: int
     probability_stdev: float
+    raw_fair_value: Optional[float] = None
+    raw_model_probabilities: Optional[dict[str, float]] = None
+    raw_probability_stdev: Optional[float] = None
     observed_high_f: Optional[float] = None
     observation_source: Optional[str] = None
     observation_final: bool = False
@@ -173,6 +176,9 @@ class ScoredOutcome:
     target_date: Optional[date]
     rule_excerpt: str
     model_probabilities: dict[str, float]
+    raw_fair_value: Optional[float] = None
+    raw_model_probabilities: Optional[dict[str, float]] = None
+    raw_probability_stdev: Optional[float] = None
     entry_eligible: bool = True
     entry_filter_reason: Optional[str] = None
     observed_high_f: Optional[float] = None
